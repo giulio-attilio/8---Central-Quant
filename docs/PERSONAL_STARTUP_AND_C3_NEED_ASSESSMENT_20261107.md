@@ -418,3 +418,488 @@ Para a topologia observada de uma instância e um operador, a alternativa propor
 - Precisão do inventário: o contrato C3 enumera **19 superfícies lógicas** de escrita, não 19 processos ativos. O Render observável mostra um serviço/instância iniciado por `python main.py`; o código inicia threads, e não foi encontrada evidência de outro serviço ou processo compartilhando o Registry. A proteção de código observada é principalmente um `threading.RLock`; o teste AST verifica a colocação/contratos, não o lock físico POSIX no volume.
 - Para o uso pessoal e a topologia atualmente observada, não há evidência concreta que justifique signer/HEAD ou coordenação C3 distribuída no caminho crítico. Mantê-lo dormente é a opção proporcional; reavaliar se surgir outro processo/serviço escrevendo o mesmo Registry ou se o número de instâncias mudar. Isso não afirma ausência de writers externos não conectados, nem substitui a prova física do lock local.
 - O único bloqueio externo de deploy permanece a leitura atual do espaço persistente; última medição conhecida: 62,07 MB às 19:46:04 UTC de 2026-11-07.
+
+### Revalidação Render após continuidade — 2026-11-08 01:02 UTC
+
+- A leitura read-only do serviço `central-robos-bingx` confirmou uma instância Standard, `/data` de 2 GB, `autoDeploy=no` e SHA live `31f31c9d071398c0fd35b1167f0460020f9ce2fd` (`dep-dbnnv96c6qcc73edffm0`). Nenhuma configuração foi alterada.
+- Os logs de requisição mostram as consultas cron a `/healthz` respondendo HTTP 200 de cinco em cinco minutos até 01:00 UTC. Os logs de aplicação no mesmo período mostram o mesmo `boot_id`, PID 63 e 30 threads; memória RSS variou aproximadamente entre 663 e 751 MB. Isso demonstra resposta de liveness e continuidade do processo na janela consultada, não prontidão de trading, funcionamento de rotas autenticadas ou ausência de operações.
+- Não apareceu amostra de espaço em disco depois de `free_mb=62.07` às 19:46:04 UTC de 7/11. Às 01:02 UTC de 8/11, a folga atual ainda não podia ser inferida dos logs; permanece necessária a captura atual do Dashboard em Disk. Não implantei nem alterei dados, configuração, AWS, Render ou controles PAPER/DRY_RUN/LIVE.
+- O usuário confirmou orçamento de até US$ 5, ausência de operações abertas e segurança de breve interrupção. Essa autorização não remove o gate de espaço: o deploy segue suspenso até evidência atual do disco e confirmação do SHA exato que será publicado.
+
+### Auditoria local da autenticação HTTP — 2026-11-08 01:08 UTC
+
+- A inspeção do código confirmou três hooks globais `before_request` antes das rotas: autenticação Basic, bloqueio de métodos/flags de mutação e gate de runtime pronto. A exceção pública é apenas `GET /healthz` sem query, e ainda passa pelo gate de prontidão/drenagem; rotas desconhecidas também recebem a barreira global.
+- A resposta pública de `/healthz` é mínima (`HTTP_LIVE`/503), não expõe dados de trading e não substitui readiness operacional. Os testes exercitam acesso anônimo, senha incorreta/correta, caminho desconhecido, origem cross-site, mutação via GET, boot incompleto e health probe.
+- No HEAD `0b3eac2aa6d4b08d4f47d7bf0bc528140f32a85a`, reexecutei `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --personal-http-auth`: **240 passed em 109,83 s**. O runner bloqueia rede/DNS/HTTP de saída, subprocessos e leitura de `.env`, e usa persistência temporária. Não foram usados secrets, clientes reais ou serviços externos.
+- Essa verificação dá evidência local de autenticação das rotas, não valida a configuração de ambiente no Render nem comprova que a mesma candidata esteja publicada. O SHA live continua `31f31c9`; o deploy permanece suspenso até obter leitura atual do disco persistente e concluir preflight/custo para o SHA candidato.
+
+### Regressão de defaults PAPER e fail-closed do broker — 2026-11-08
+
+- Inspeção local confirma `ENABLE_REAL_TRADING` default `false`, `BROKER_DRY_RUN` default `true` e `FALCON_MODE` default `PAPER`. Uma configuração ausente ou malformada não herda permissão de escrita, mesmo com `EXECUTION_MODE=LIVE`; o broker só considera escrita factual quando os controles explícitos requeridos são válidos.
+- Antes desta validação, a worktree estava em `codex/personal-readiness-release-20261104`, HEAD `0b3eac2aa6d4b08d4f47d7bf0bc528140f32a85a`; somente este relatório já tinha modificação local.
+- Rodei `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --files test_trading_mode_defaults_fail_closed_v1.py`: **356 passed em 849,32 s**. O runner fornece rede bloqueada e persistência temporária; não acessou credenciais nem criou cliente de exchange. A execução comprova os defaults/contratos locais, não os valores efetivos do Render.
+- Nenhuma configuração de trading foi alterada. `ENABLE_REAL_TRADING=false`, `BROKER_DRY_RUN=true` e `FALCON_MODE=PAPER` continuam sendo os controles obrigatórios da meta; valores efetivos da produção não foram consultados por não haver operação somente de leitura do Render que os mostre sem ler secrets.
+
+### Preflight Render somente leitura — 2026-11-08 01:23 UTC
+
+- A consulta read-only confirma novamente que o serviço `central-robos-bingx` segue no SHA `31f31c9d071398c0fd35b1167f0460020f9ce2fd`, com uma instância e volume persistente de 2 GB em `/data`; auto-deploy está desligado.
+- Nenhuma nova amostra `free_mb` foi emitida após `62.07` às 19:46:04 UTC de 7/11. O valor não pode ser tratado como ocupação atual, então o preflight de reinício/publicação permanece incompleto; não acionei deploy.
+- A candidata de código cujo estado Python foi validado permanece `3bbf83a0b72e39c03d1a0750ed9cb373c3bb8e02`; os commits posteriores até o HEAD local `0b3eac2` modificam apenas a avaliação documental. A confirmação de custo até US$ 5 e ausência de operações foi recebida, mas a publicação ainda depende da confirmação atual de espaço no Dashboard.
+
+### Revisão estática da fronteira de ordens — 2026-11-08 01:26 UTC
+
+- Antes da revisão: branch `codex/personal-readiness-release-20261104`, HEAD `0b3eac2aa6d4b08d4f47d7bf0bc528140f32a85a`; a única alteração local já existente continua sendo este relatório.
+- Busca no código de runtime encontrou uma única chamada direta a `ex.create_order(...)`, em `broker.py`, dentro de `_create_order_with_reserved_attempt`. Essa fronteira exige `_broker_factual_writes_enabled()`, que só habilita escrita com `EXECUTION_MODE=LIVE`, `ENABLE_REAL_TRADING=true` e `BROKER_DRY_RUN=false`; ela recusa antes de consumir a autorização persistente de envio quando os controles não permitem escrita.
+- Chamadores identificados incluem entrada, criação de disaster stop, fechamento gerenciado e gerenciamento de posição. `execution_engine.py` delega entrada a `broker.place_market_order`; a função pública é protegida por `guard_new_live_entries`. Fechamento legado não reservado retorna `DEPRECATED_UNRESERVED_CLOSE_BLOCKED`.
+- Conclusão limitada à inspeção estática: não foi encontrado caminho de runtime em Python que chame diretamente outro `create_order`; isso não prova que os valores efetivos do Render estejam corretos, nem cobre código externo à busca ou chamadas internas da biblioteca da exchange.
+- A seleção focada `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --files test_broker_account_client_order_boundary_v1.py` passou **356 testes em 871,48 s**. O runner manteve rede bloqueada e persistência temporária; não acessou credenciais nem criou cliente real.
+- A autorização informada para até US$ 5 e a confirmação de ausência de operações foram recebidas. A consulta Render seguinte confirmou que o SHA live continua `31f31c9d071398c0fd35b1167f0460020f9ce2fd`; como a resposta de autorização não identifica um novo SHA e a candidata validada é `3bbf83a0b72e39c03d1a0750ed9cb373c3bb8e02`, nenhum deploy foi iniciado por inferência. O gate da folga atual de `/data` também continua sem evidência recente: última amostra conhecida `free_mb=62.07` em 2026-11-07 19:46:04 UTC.
+- Referências oficiais do Render consultadas em HTML nesta rodada: Deploys, Health Checks e Rollbacks. Render informa que minutos de pipeline são consumidos por deploys; volumes persistentes desabilitam zero-downtime e não são revertidos por rollback. A checagem `GET /healthz` bem-sucedida é somente liveness; não serve como prova de readiness operacional.
+
+### Revalidação do gate de disco e disponibilidade da candidata — 2026-11-08 01:47 UTC
+
+- Reconfirmei branch `codex/personal-readiness-release-20261104`, HEAD `0b3eac2aa6d4b08d4f47d7bf0bc528140f32a85a` e status: somente este relatório alterado; sem mudanças de código.
+- Render MCP read-only confirma `central-robos-bingx` no SHA `31f31c9d071398c0fd35b1167f0460020f9ce2fd`, serviço Standard com uma instância, disco `/data` de 2 GB e `autoDeploy=no`.
+- Filtragem de logs do serviço para `free_mb` até 01:47 UTC de 8/11 retornou apenas cinco amostras, todas `62.07 MB`, entre 19:06:54 e 19:46:04 UTC de 7/11. A consulta de eventos Render não encontrou `service_disk_usage_high` nem `service_disk_usage_recovered` nessa janela. Isso não mede o espaço livre de agora; não usei a amostra antiga como valor atual.
+- GitHub read-only confirma que `3bbf83a0b72e39c03d1a0750ed9cb373c3bb8e02` (`fix(paper): recover idempotency from position ledger`) existe no repositório `giulio-attilio/8---Central-Quant`; o commit é ancestral do HEAD local validado. A confirmação de até US$ 5 e interrupção segura permanece recebida. Nenhum deploy foi iniciado, pois a medição atual de `/data` ainda não está disponível.
+- O conector Render expõe configuração, deploys, logs, eventos e métricas de CPU/memória/HTTP, mas não uma operação para ler `df`/uso atual do disco. A tentativa de observação do Dashboard por UI falhou ao ativar a janela após uma nova seleção; não houve clique em configuração ou alteração do serviço. A leitura atual deve vir da página **Disk** do Dashboard.
+
+### Revalidação de autorização e fronteira HTTP — 2026-11-08 01:50 UTC
+
+- Reconfirmei branch `codex/personal-readiness-release-20261104`, HEAD `0b3eac2aa6d4b08d4f47d7bf0bc528140f32a85a`; a única modificação local continua sendo este relatório. O candidato `3bbf83a0b72e39c03d1a0750ed9cb373c3bb8e02` é ancestral do HEAD validado; os commits entre esse candidato e HEAD alteram somente documentação. A diferença entre o release Render atual `31f31c9` e o candidato abrange 11 arquivos e 976 inserções/126 remoções, portanto a publicação não é apenas um ajuste isolado.
+- Revisão local confirmou os três hooks globais `before_request` de autenticação, bloqueio de intenção de mutação via GET e prontidão de runtime; o único endpoint sem Basic Auth é `GET /healthz`, ainda sujeito ao gate de readiness/drenagem. O helper limita credenciais internas a HTTPS da própria URL Render ou loopback. A suíte HTTP-auth de 240 testes consta aprovada nesta worktree; isso não verifica os valores efetivos no Render.
+- Render read-only confirma `31f31c9` live, `autoDeploy=no`, uma instância e disco `/data` de 2 GB. A única leitura de espaço encontrada permanece `62.07 MB` em `2026-11-07 19:46:04 UTC`; não há evidência atual suficiente para liberar restart. O usuário confirmou teto de US$ 5 e ausência de operações, mas esta confirmação não nomeou o SHA; não iniciei deploy. O MCP não aceita SHA como parâmetro de deploy.
+
+### Nova consulta de logs e disponibilidade do laboratório Linux — 2026-11-08 01:54 UTC
+
+- Repeti a consulta de logs do Render para `free_mb`, `disk` e `PERSISTENT_DISK`, de 2026-11-07 13:50 UTC a 2026-11-08 01:52 UTC. `free_mb` e `DISK FORENSICS` terminam às 19:46:04 UTC de 7/11; não há eventos de disco alto/recuperado desde 7/11 00:00 UTC. Isso confirma ausência de evidência nova, não o espaço livre atual.
+- Logs de requisição recentes registram `GET /healthz` retornando `200` ao cron externo até 01:50:08 UTC de 8/11, com latência de 19 ms nessa amostra. Isso confirma somente o endpoint de liveness/readiness HTTP declarado pelo app, não o estado de trading, autenticidade de rotas privadas nem a folga do disco.
+- Repeti o comando read-only `wsl -d Ubuntu -- uname -a`; o ambiente retornou `Wsl/E_ACCESSDENIED` (exit 1). Não alterei WSL nem contornei o bloqueio; os gates físicos/POSIX continuam pendentes.
+- Nenhum deploy, escrita de produção, mudança de configuração/secrets ou controle de trading ocorreu. A worktree mantém apenas a alteração documental deste relatório; o próximo desbloqueio de deploy é uma captura atual da página Disk no Dashboard Render.
+
+### Revisão estática de CSRF e autenticação HTTP — 2026-11-08 01:56 UTC
+
+- Revalidei `main.py` na worktree atual: o hook global é registrado antes de todas as rotas, recusa `Sec-Fetch-Site: cross-site` e origens/referers cujo host não corresponda ao host solicitado, exige Basic Auth nas demais requisições, e só isenta `GET /healthz` sem query quando faltam credenciais. O hook seguinte bloqueia intenção de mutação via GET; outro devolve 503 até o runtime ficar pronto.
+- A suíte local `tests/test_personal_http_auth_gate_v1.py` contém casos para chamada cross-site mesmo com Basic válido, origem malformada, query no health probe e mutação via GET. O resultado registrado nesta worktree é 240 testes aprovados; a inspeção atual não encontrou falha que justifique novo patch.
+- Limite da conclusão: isso é evidência local do código e dos testes. Não prova valores de ambiente ou a exata versão efetivamente implantada no Render; o release live continua `31f31c9`, diferente do candidato `3bbf83a`.
+
+### Evidência atual do disco Render — 2026-11-08 02:00 UTC
+
+- O usuário enviou captura do painel Disk, mostrando capacidade de 2 GB e uso visual aproximado de 1,9 GB (cerca de 0,1 GB livre, sem precisão suficiente para calcular bytes). Isso reforça que o volume está abaixo da margem preventiva local de 256 MiB; mantenho deploy/restart suspenso até identificar o consumo e obter espaço livre medido com precisão.
+- Reconsulta Render read-only confirma serviço `central-robos-bingx`, uma instância, disco persistente `/data` de 2 GB, `autoDeploy=no`, e SHA live `31f31c9d071398c0fd35b1167f0460020f9ce2fd`. A única amostra de aplicação ainda é `free_mb=62.07` em 2026-11-07 19:46:04 UTC, anterior ao deploy atual; ela não é uma medição corrente.
+- O código do SHA live contém a rota autenticada `/disk/forensics`, que devolve o relatório de metadados coletado no startup e marcado somente leitura; ela pode ajudar a apontar arquivos/diretórios grandes, mas não garante medição atual se o relatório for anterior ao uso atual. O conector Render não oferece execução de `df`/`du` nem inspeção direta do volume.
+- Nenhum arquivo do volume foi lido, removido, truncado, compactado, transferido ou redimensionado; não houve alteração AWS/Render, deploy, nem mudança dos controles de trading. Próxima evidência necessária: `df -h /data` e uma listagem de tamanhos por diretório via Render Shell, apenas para diagnóstico, antes de decidir qualquer tratamento reversível.
+
+### Diagnóstico de tamanhos enviado pelo usuário — 2026-11-08 02:09 UTC
+
+- O usuário executou comandos somente de leitura no Render Shell. `df -h /data` retornou volume de 2.0G, 1.9G usados, 63M disponíveis (97%), montado em `/data`.
+- Os maiores arquivos observados no nível superior são `trade_lifecycle.jsonl` (504,840,558 bytes), `timeline.jsonl` (499,346,837), `history_events.jsonl` (430,978,559), `predator_paper_events.jsonl` (211,525,991), `auto_real_execution_bridge_v1_events.jsonl` (71,942,469), `decision_log.jsonl` (39,956,644) e `closed_trades.jsonl` (35,791,436). Também há `trade_registry.json`, backup latest, backups de reparo e registros auxiliares; não classificá-los como lixo pela idade/nome.
+- A inspeção estática local confirma que `trade_lifecycle.jsonl`, `history_events.jsonl`, `timeline.jsonl` e `decision_log.jsonl` recebem append e são lidos por rotas/relatórios/reconciliação. Há rotação/compactação com preview e commit específico para `history_events.jsonl`, mas o commit reescreve atomicamente sem backup e exige espaço temporário estimado mais reserva; com apenas 63M livres, não deve ser acionado. Não há autorização para remoção/reescrita dos demais históricos.
+- Conclusão: a pressão vem majoritariamente de históricos JSONL de runtime na raiz do volume, não das duas pastas pequenas listadas. Nenhuma limpeza, compactação, transferência, restauração, expansão de disco ou deploy foi feita. Próximo trabalho: mapear, em código e testes sintéticos, se existe caminho verificável para exportar/arquivar sem perda e quais consumidores dependem do histórico integral; preservar todas as fontes até haver backup restaurável e plano validado.
+
+### Avaliação local de opções de compactação/recuperação — 2026-11-08 02:09 UTC
+
+- `history_manager.py` oferece preview/commit V1 para `history_events.jsonl`; o commit exige ACK, grava temporário do tamanho estimado, reescreve a fonte por `os.replace`, e explicita `ATOMIC_REWRITE_WITHOUT_BACKUP`. O preview requer espaço estimado da nova fonte mais reserva mínima e bloqueia em JSONL malformado. Não foi executado contra produção; 63 MB livres não autorizam presumir que haverá espaço suficiente.
+- A rotação emergencial V1.2 ainda é mais destrutiva: projeta eventos críticos antigos sem o payload original (mantém hashes/recorte), pode descartar histórico bruto e cria apenas manifest/quarentena conforme necessário. `timeline_emergency_recovery.py` é in-place e sua própria documentação declara ausência deliberada de rollback local; não é uma limpeza segura a executar para resolver o espaço atual.
+- `journal_manager.py` acrescenta a `trade_lifecycle.jsonl`; `history_manager.py` acrescenta `history_events.jsonl`, `timeline.jsonl` e `decision_log.jsonl`; a busca também encontrou leitores/consumidores destes registros em reconciliação, relatórios e análises. Não foi identificado por esta revisão um mecanismo geral de retenção para os maiores arquivos.
+- Decisão: nenhuma rotina de emergência/compactação nem exclusão de backups deve ser executada. Antes de propor alteração de retenção, requer-se backup fora de `/data`, verificação de hashes e restauração em área separada, classificação dos dados recuperáveis e validação de todos os consumidores. Custo de armazenamento/transferência não foi confirmado, então não foi iniciado.
+- Verificação do repositório após registrar a avaliação: branch `codex/personal-readiness-release-20261104`, HEAD `0b3eac2aa6d4b08d4f47d7bf0bc528140f32a85a`; alteração permanece somente neste relatório, `git diff --check` passa (aviso habitual de conversão LF/CRLF). Nenhuma mutação da AWS, Render ou trading ocorreu.
+
+### Revalidação do guard de pouco espaço e opções de custo — 2026-11-08 02:22 UTC
+
+- Reexecutei no ambiente offline `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --files test_broker_real_pilot_disk_space_guard_v1.py`: **356 passed em 673,27 s**, no harness isolado com conectividade bloqueada e persistência temporária. Isso valida o comportamento local do guard, não o volume nem os env vars efetivos em produção.
+- `wsl -d Ubuntu -- uname -a` ainda retorna `Wsl/E_ACCESSDENIED`; não alterei o subsistema nem tentei contornar a restrição. A prova Linux física/POSIX continua pendente.
+- Consulta read-only à documentação/preços oficiais do Render em 2026-11-08: discos persistentes podem ser aumentados, não reduzidos; aumento não causa downtime e fica disponível em segundos; preço publicado de armazenamento persistente é US$ 0,25/GB-mês. Assim, passar o volume de 2 GB para 3 GB implicaria aproximadamente +US$ 0,25/mês (pró-rata), sujeito ao Billing real do workspace. Não alterei o volume, pois isso é uma decisão financeira recorrente.
+- Antes do registro, branch `codex/personal-readiness-release-20261104`, HEAD `0b3eac2aa6d4b08d4f47d7bf0bc528140f32a85a`; somente este relatório estava modificado. `git diff --check` passou, com aviso não-fatal de conversão LF/CRLF. Sem mudanças AWS/Render, deploy, limpeza ou controles de trading.
+
+### Verificação read-only do cron de saúde e estado Render — 2026-11-08 02:24 UTC
+
+- Render MCP read-only: serviço `central-robos-bingx` segue `live` no deploy `31f31c9d071398c0fd35b1167f0460020f9ce2fd`; uma instância, `/data` de 2 GB, `autoDeploy=no`. Nada foi alterado.
+- Logs de request de `GET /healthz` desde 2026-11-07 19:46 UTC: **80 respostas HTTP 200**, incluindo chamadas do cron-job.org e do navegador, até 2026-11-08 02:20:08 UTC. Isso confirma somente liveness HTTP no intervalo, não health operacional do trading nem espaço livre atual.
+- Custo da expansão do disco continua sem decisão: não aumentei de 2 para 3 GB; preço publicado é estimativa e o valor do workspace precisa ser confirmado no Billing. Não houve deploy, leitura de secrets, escrita em produção ou mudança nos controles PAPER/DRY_RUN/LIVE.
+
+### Listagem read-only de arquivos grandes em `/data` enviada pelo usuário — 2026-11-08 02:29 UTC
+
+- A saída de `find /data -maxdepth 1 -type f ... | sort -nr | head -30` enumera arquivos na raiz do disco com timestamps entre julho e novembro. Os maiores são quatro históricos JSONL: `trade_lifecycle.jsonl` (504,840,558 bytes), `timeline.jsonl` (499,346,837), `history_events.jsonl` (430,978,559) e `predator_paper_events.jsonl` (211,525,991). Somados, ocupam 1,646,691,945 bytes; outros arquivos grandes incluem `auto_real_execution_bridge_v1_events.jsonl` (71,942,469), `decision_log.jsonl` (39,956,644), `closed_trades.jsonl` (35,791,436), `trade_journal.jsonl` (15,344,182), `trade_registry.json` (16,285,084) e backups/artefatos do Registry.
+- Isso é consistente com a medição enviada anteriormente de 2.0 GB totais, 1.9 GB usados, 63 MB disponíveis e 97% de uso. A listagem confirma concentração nos históricos de execução; não demonstra que qualquer arquivo seja dispensável. Nomes com `backup`, `repair` ou timestamps antigos não são critério suficiente para apagar dados.
+- A sequência foi somente leitura; não pedi ao usuário para executar limpeza, truncamento, rotação, exportação ou restauração. Permanecem proibidas alterações de históricos em produção sem backup íntegro, restauração fora de produção e plano de retenção validado. Nenhuma ação AWS/Render, deploy, alteração de configuração ou controle de trading ocorreu.
+- A alternativa imediata para aliviar risco é ampliar o disco, mas é uma cobrança recorrente e capacidade não pode ser reduzida; continua aguardando decisão financeira específica. Até lá, não iniciar compactação/reescrita de logs nem deploy que dependa de espaço temporário. O caminho seguro em paralelo é continuar análise e testes locais, e preparar exportação/backup verificável sem gravar no `/data` cheio.
+
+### Auditoria das rotas locais de exportação — 2026-11-08 02:31 UTC
+
+- A inspeção do código atual mostra que `history_manager.build_export_payload()` materializa a exportação e grava `HISTORY_EXPORT_FILE` (por padrão `history_export.json`, dentro de `DATA_DIR`) antes de devolver o payload. `journal_manager.export_journal()` e `export_lifecycle()` também gravam seus arquivos de exportação no mesmo diretório de dados.
+- Portanto, `/exporthistory` não é uma forma de copiar o histórico para fora do volume; pode consumir mais espaço em `/data` e falhar com o disco quase cheio. Não acionei essas rotas nem gerei arquivos. O mesmo cuidado vale para outros endpoints de exportação até que o destino real seja comprovadamente externo ao disco e haja integridade verificável.
+- A decisão de não remover nem reescrever histórico foi mantida. Status permanece na branch `codex/personal-readiness-release-20261104`, HEAD `0b3eac2aa6d4b08d4f47d7bf0bc528140f32a85a`; nenhuma mudança de código foi feita, somente este relatório local.
+
+### Revalidação estática do interlock de espaço do broker — 2026-11-08 02:34 UTC
+
+- No código local atual, `broker_real_pilot_guard_v1_validate()` retorna `BROKER_REAL_PILOT_GUARD_NOT_APPLICABLE` sem medir o disco quando o envio factual não está habilitado; portanto a proteção é uma barreira de entrada LIVE, não um health check geral do serviço.
+- Quando o envio factual está habilitado, `reduce_only` é intencionalmente permitido antes da checagem de espaço, preservando o caminho de redução/fechamento; novas entradas exigem leitura de espaço válida e pelo menos 256 MiB livres, e falham fechadas abaixo desse limite ou se a medição falhar. A amostra do usuário (63 MB livres) fica abaixo do limiar por aproximadamente 205 MiB.
+- Após esse guard, o caminho de ordem exige token de execução; no limite da exchange, exige claim persistente de uso único antes de `create_order`, e verifica persistência/read-back do resultado. Se o resultado não puder ser persistido depois da chamada, marca reconciliação necessária. Isso é evidência estática do contrato local, não prova de disponibilidade do backend durável ou do serviço em produção.
+- `tests/test_broker_real_pilot_disk_space_guard_v1.py` cobre bloqueio abaixo do limiar, falha da medição, aprovação acima do limiar, exceção para `reduce_only` e ausência de escrita no probe. A execução offline isolada já registrada nesta rodada foi **356 testes aprovados**; não repeti os testes nesta inspeção estática. O candidato validado não está no SHA live reportado, portanto o bloqueio não pode ser considerado ativo na produção.
+- Nenhuma alteração de código, ordem, chamada externa, configuração de trading ou mudança Render foi feita. A posição continua PAPER; espaço insuficiente e release divergente mantêm o caminho LIVE bloqueado.
+
+### Monitoramento Render somente leitura — 2026-11-08 02:34 UTC
+
+- Workspace confirmado: `tea-d8gnnuojo6nc73ep3lg0` (My Workspace); serviço consultado: `central-robos-bingx`, ID `srv-d8rtuv9o3t8c73ehav5g`. A instância continua única, Standard, com volume `/data` de 2 GB e `autoDeploy=no`; SHA live segue `31f31c9d071398c0fd35b1167f0460020f9ce2fd` (`dep-dbnnv96c6qcc73edffm`). Nenhuma configuração foi alterada.
+- Logs disponíveis ainda não mostram amostra nova `free_mb`: a última é `62.07 MB` em 2026-11-07 19:46:04 UTC. O comando `df` enviado pelo usuário (2.0G total, 1.9G usados, 63M livres, 97%) continua sendo a medição mais recente disponível nesta auditoria.
+- Os logs de request mostram `/healthz` retornando HTTP 200 a cada cinco minutos até 02:30:11 UTC de 8/11; latência variou de 2 a 127 ms nas amostras visíveis. Isso é apenas liveness. As métricas às 02:34 UTC registram 1 instância, CPU média próxima de 4,4% e memória próxima de 748 MB.
+- A consulta de erros encontrou respostas HTTP 502 para `GET /` e `/healthz` em dias anteriores, a mais recente às 19:46:12 UTC de 7/11; depois dela há respostas 200 do cron em `/healthz`. A consulta não trouxe stack traces de aplicação; não atribuo causa às respostas 502. Nenhum erro HTTP 5xx posterior apareceu nas amostras consultadas.
+- O deploy e os dados permanecem inalterados. Nenhuma leitura de variáveis secretas foi feita. `GET /healthz` está respondendo, mas disk-free atual continua crítico/não medido por MCP; o candidato validado difere do release live. A expansão segue pendente de decisão financeira; não removi dados nem acionei deploy.
+
+### Testes locais de rotação de histórico e gate HTTP — 2026-11-08 02:40 UTC
+
+- Executei `python -m pytest -q tests/test_history_events_rotation_v1.py tests/test_personal_http_auth_gate_v1.py`: **206 testes passaram em 76,57 s**. Os testes de rotação usam arquivos temporários e incluem um caso que bloqueia sockets; portanto a checagem da rotina foi feita sem rede e sem tocar nos históricos de produção.
+- A primeira tentativa via `pytest -q ...` falhou na coleta (`ModuleNotFoundError: history_manager`) por diferença no caminho de importação do launcher. A execução equivalente via `python -m pytest` resolveu o problema de invocação; não houve alteração de código por causa disso.
+- Isso reforça os contratos locais de preview/commit, preservação de eventos críticos, abortos por espaço temporário insuficiente e autenticação HTTP. Não torna segura a rotação do volume Render: o teste usa dados sintéticos, e o `/data` real tem somente 63 MB livres, enquanto a compactação reescreve a fonte. Nenhum comando de rotação foi executado em produção.
+- `GET /` no código local retorna `BOT_NAME Online` depois dos hooks globais de autenticação/readiness. A rota, isoladamente, não explica um HTTP 502; sem logs de aplicação correlacionados ao instante do 502, causa permanece indeterminada. Não fiz chamada externa a essa rota.
+- Nenhuma alteração de aplicação, AWS, Render, disco, secrets ou controles de trading ocorreu. O relatório continua sendo a única alteração local conhecida; deploy permanece sem ação até divergência de release e decisão de custo do disco serem resolvidas.
+
+### Revalidação de C3, writers e serviço Render — 2026-11-08 02:52 UTC
+
+- Reconfirmei a worktree antes de registrar esta atualização: branch `codex/personal-readiness-release-20261104`, HEAD `0b3eac2aa6d4b08d4f47d7bf0bc528140f32a85a`; somente este relatório está modificado.
+- O runner offline isolado `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --registry-writers` terminou com **60 passed em 76,95 s**. A suíte combina inspeção AST das chamadas `save_registry` com fixtures sintéticas para atomicidade/coordenação; não observa processos nem dados de produção.
+- O mesmo runner com `--c3-dormant-startup` terminou com **24 passed e 3 subtests passed em 478,33 s**. Valida localmente o startup C3 default-off/fail-closed; não invoca signer real nem verifica AWS, disco físico ou checkpoint de produção.
+- Render MCP somente leitura no workspace confirmado `tea-d8gnnuojo6nc73ep3lg0`: há somente o serviço `central-robos-bingx`, ID `srv-d8rtuv9o3t8c73ehav5g`, ligado à branch `codex/personal-readiness-20261103`, em uma instância Standard, com `/data` de 2 GB e `autoDeploy=no`. O SHA live permanece `31f31c9d071398c0fd35b1167f0460020f9ce2fd` (`dep-dbnnv96c6qcc73edffm`); o código local candidato continua diferente.
+- Na janela de métricas 01:40–02:40 UTC, a contagem permaneceu em 1 instância; CPU variou aproximadamente de 4,1% a 5,4%, memória de 725 a 790 MB. A consulta de request logs filtrada para status 5xx retornou zero linhas nessa janela. Isso não mede espaço em disco nem prova disponibilidade do fluxo de trading.
+- A configuração do serviço mantém a allowlist de IP em `0.0.0.0/0`; a revisão do objeto Git correspondente ao SHA live confirma que o código contém o hook global de Basic Auth e que `GET /` retorna texto simples depois dos hooks. Isso confirma o controle no código publicado, mas não confirma valores/env efetivos nem autoriza consultar secrets. O zero de 5xx recente não explica os 502 históricos.
+- O contrato C3 lista 19 superfícies lógicas, não 19 processos/writers observados em execução. Uma instância `python main.py`, locks locais e as 60 regressões aprovadas não apresentam requisito concreto para signer/lock distribuído neste uso pessoal; mantenho C3 fora do caminho crítico e default-off. Isso não substitui evidência de processos externos não conectados nem prova de exclusão física POSIX.
+- Não houve mutação AWS/Render, deploy, leitura de valor secreto, limpeza/reescrita de históricos ou alteração de controles PAPER/DRY_RUN/LIVE. A folga real do disco continua em 63 MB conforme a medição enviada pelo usuário; expansão para 3 GB continua sendo opção financeira separada, não executada.
+
+### Continuação de health probe Render — 2026-11-08 02:54 UTC
+
+- A consulta read-only dos request logs encontrou 15 respostas `GET /healthz` HTTP 200 do cron entre 01:40:07 e 02:50:07 UTC; as latências variaram de 2 a 127 ms. A janela consultada de 5xx (01:40–02:40 UTC) não retornou linhas. Esses sinais são apenas liveness/readiness HTTP e não atestam startup de todos os bots, estado de posições, reconciliação ou folga de `/data`.
+- A busca filtrada de logs de aplicação pelos marcadores `MEMORY before_start_bots` e `MEMORY after_start_bots` retornou zero linhas no período. Isso pode significar ausência desses marcadores na release live ou nenhuma ocorrência; não prova que o runtime completou o startup. Não ampliei a leitura a logs indiscriminados para evitar coletar material possivelmente sensível.
+- Sem configuração, deploy, reinício, alteração AWS/Render ou mudança de trading. Última evidência de espaço permanece o `df` fornecido pelo usuário: 63 MB livres; não há amostra nova via MCP.
+
+### Lacuna de health check de deploy — 2026-11-08 02:56 UTC
+
+- A configuração Render lida agora mostra `healthCheckPath` vazio, logo o serviço usa TCP por padrão. No commit live `31f31c9`, `main.py` inicia o servidor HTTP em thread antes de `start_central_runtime_once()`; o hook de prontidão responde 503 até `CENTRAL_RUNTIME_READY` ficar verdadeiro e `/healthz` então responde 200. Assim, a porta TCP pode aceitar conexão enquanto os bots ainda estão carregando; o deploy pode ser considerado saudável antes da prontidão da aplicação.
+- A documentação oficial atual do Render diz que o health check padrão é TCP e que um web service pode configurar um endpoint HTTP; resposta 2xx/3xx em até cinco segundos passa, enquanto 4xx/5xx falha. Portanto `/healthz` é o caminho apropriado para readiness de deploy, sem confundi-lo com readiness de trading.
+- Mudança pendente: configurar `healthCheckPath=/healthz` no serviço `central-robos-bingx`. Não executei: o MCP Render não oferece update de `healthCheckPath`, não foi possível confirmar o saldo atual de pipeline minutes e qualquer redeploy pode interromper o serviço de instância única com disco persistente; custo zero não está provado. A captura Billing anterior não é atual. Necessária conferência da franquia/custo ou decisão financeira antes de aplicar.
+- Nenhuma alteração Render/AWS, deploy ou reinício foi feito. Esta lacuna deve ser corrigida antes de considerar um próximo deploy validado.
+
+### Revalidação de defaults de trading — 2026-11-08 02:58 UTC
+
+- Runner offline: `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --trading-mode-defaults` terminou com **9 passed em 29,48 s**. Foram bloqueados sockets/DNS/processos externos e `.env`; os dados usaram diretório temporário. Isso valida defaults e fail-closed locais, não os valores de ambiente do Render.
+- Reconfirmei a diferença de release: `31f31c9` (Render live) para candidata `3bbf83a` abrange 11 arquivos, **976 inserções e 126 remoções**, incluindo guard de espaço na entrada real, idempotência do paper executor, bounded readers e correções de persistência. É um delta substancial; não é seguro inferir que um redeploy de toda a candidata seja apenas a mudança de health-check.
+- Nenhum valor de ambiente foi consultado; nenhuma alteração, deploy ou chamada à exchange ocorreu.
+
+### Inventário de arquivos grandes em `/data` — evidência enviada pelo usuário, 2026-11-07
+
+- A listagem somente de leitura via Render Shell mostra `/data` com 2,0 GB totais, 1,9 GB usados, 63 MB livres (97%). Os quatro maiores arquivos são `trade_lifecycle.jsonl` (504.840.558 bytes), `timeline.jsonl` (499.346.837), `history_events.jsonl` (430.978.559) e `predator_paper_events.jsonl` (211.525.991), total de **1.646.691.945 bytes** (~1,53 GiB). O diretório também contém `auto_real_execution_bridge_v1_events.jsonl` (~71,9 MB), `decision_log.jsonl` (~40,0 MB), `closed_trades.jsonl` (~35,8 MB) e arquivos de Registry/backup que devem ser preservados.
+- A medição confirma pressão real de capacidade, mas não identifica quais registros podem ser descartados com segurança nem a taxa futura de crescimento. Não apague, trunque, compacte ou reescreva os JSONL/Registry/backup: o requisito é preservar histórico, e a rotação local existente é restrita a `history_events.jsonl`, faz substituição atômica sem backup e não autoriza aplicá-la nesses dados de produção. Também não grave `history_export` no mesmo volume.
+- Com apenas 63 MB livres, operações de escrita pesada podem falhar por falta de espaço. Não fiz mutações no volume, não reiniciei o serviço e não alterei variáveis. Aumentar o disco continua sendo uma decisão financeira separada; a autorização anterior de até US$ 5 para deploys não cobre aumento recorrente de armazenamento. Próximo passo seguro: manter essa evidência, evitar exportações/arquivos temporários em `/data` e decidir separadamente se aceita o custo recorrente para expandir o volume.
+
+### Revalidação de autenticação pública e candidata local — 2026-11-08 03:03 UTC
+
+- Antes da inspeção, branch `codex/personal-readiness-release-20261104`, HEAD `0b3eac2aa6d4b08d4f47d7bf0bc528140f32a85a`; o relatório era o único arquivo modificado. O release ativo continua em `31f31c9d071398c0fd35b1167f0460020f9ce2fd`. O SHA ativo é ancestral da branch local, mas a candidata contém mudanças em 11 arquivos (1.186 inserções, 126 remoções), incluindo persistência, event bus, journal, broker e paper executor; não é uma alteração isolada de autenticação.
+- Render read-only: uma instância Standard, disco de 2 GB em `/data`, allowlist `0.0.0.0/0`, `autoDeploy=no` e `healthCheckPath` vazio. A superfície é publicamente roteável, mas `git show` do SHA ativo confirma hooks globais de Basic Auth para as rotas; somente `GET /healthz` sem query é isento para health check, e o gate de readiness ainda o bloqueia antes da prontidão do runtime.
+- A consulta read-only de request logs encontrou respostas HTTP 401 em rotas como `/`, `/can_open_trade`, `/shadowhealth` e `/executive/policy/health`, incluindo uma amostra de 2026-11-08 02:09 UTC. Isso é evidência de negação sem autenticação, não prova que os valores de configuração estão corretos nem valida login autenticado. Nenhum valor de secret/environment foi consultado.
+- Revalidei `tests/test_personal_http_auth_gate_v1.py`: **160 passed em 25,82 s**. Runner offline isolado para `test_broker_real_pilot_disk_space_guard_v1.py`, `test_history_eventbus_smoke.py`, `test_lifecycle_bounded_tail_reader_v2.py`, `test_paper_executor_integrated_idempotency_v1.py` e `test_registry_v2_paper_runtime_integration.py`: **356 passed em 755,14 s**, com rede bloqueada e persistência temporária.
+- A autenticação global já está no release ativo; não há correção de autenticação nova a publicar nesta etapa. As regressões candidatas passaram localmente, mas o deploy continua pendente de custo zero comprovado e de revisão do delta completo. Nenhuma escrita em Render/AWS, deploy, acesso a secret, limpeza de `/data` ou mudança nos controles de trading ocorreu.
+- Conferência adicional no código do SHA ativo: `broker.py` não contém o guard `PERSISTENT_DISK_FREE_SPACE` presente na candidata. Mesmo nessa candidata, o guard bloqueia novas entradas do piloto LIVE; ele não interrompe o crescimento dos logs PAPER nem libera capacidade. Portanto não trato esse teste como resolução do disco a 97%, nem como motivo suficiente para publicar todo o delta de 11 arquivos sem o preflight de custo.
+
+### Confirmação de preço e expansão do disco — 2026-11-08
+
+- A referência oficial de preços do Render informa SSD persistente a **US$ 0,25 por GB/mês** ([pricing](https://render.com/pricing)). A página oficial de discos diz que o volume pode ser aumentado, mas não reduzido; o aumento de capacidade não causa downtime ([persistent disks](https://render.com/docs/disks)). Assim, passar de 2 GB para 3 GB acrescentaria aproximadamente **US$ 0,25/mês recorrentes**, sujeito à cobrança/prorrateio da conta.
+- Esse aumento é apenas folga imediata, não corrige o crescimento contínuo dos JSONL. Com a medição enviada pelo usuário (63 MB livres), ele manteria o histórico sem limpeza, mas permanece uma decisão financeira e não foi executado. A autorização antiga de até US$ 5 para deploy não cobre esse custo recorrente.
+- A URL Markdown `/docs/disks.md` não foi disponibilizada pelo leitor web (tipo de conteúdo não suportado); a página HTML oficial foi lida diretamente. Nenhuma alteração no Render ou nos dados de produção foi feita.
+
+### Auditoria local dos escritores dos quatro maiores JSONL — 2026-11-08
+
+- `trade_lifecycle.jsonl`: `journal_manager.append_lifecycle_event()` chama append deduplicado; `load_lifecycle_events()` lê a cauda do arquivo. Não há arquivamento integrado nessa API.
+- `timeline.jsonl`: `history_manager` espelha nele a maior parte dos eventos aceitos, enquanto várias rotinas de validação, recuperação e identidade referenciam diretamente esse nome de arquivo. Mover segmentos sem adaptar os leitores pode fazer a linha do tempo ficar incompleta.
+- `history_events.jsonl`: é o log canônico acrescentado por `_append_history_event_once()` e lido, entre outros, por `history_manager`, `real_pnl_r_mapper`, `predator_daily_summary` e ferramentas de evidência. Há rotação/rewrite explícito somente para esse arquivo, mas a emergência reescreve o arquivo e pode descartar registros antigos; ela não é uma cópia de arquivo e não atende ao requisito de preservação.
+- `predator_paper_events.jsonl`: `predator_daily_summary.append_predator_event()` sempre acrescenta; a leitura automática usa uma cauda limitada e reporta cobertura parcial quando truncada por limites. Isso não equivale a arquivamento histórico recuperável.
+- Conclusão: os quatro logs têm escritores e consumidores distintos; não existe política comum que arquive dados e mantenha todas as consultas/reconciliações completas. Uma solução durável exigiria formato/manifesto de segmentos, gravação atômica, verificação de hashes e adaptação dos leitores/validadores; não executei rotação, exportação, teste contra `/data` ou alteração de produção. Próxima contenção imediata permanece a folga de capacidade, sujeita à decisão financeira acima.
+
+### Suítes offline ampliadas — 2026-11-08
+
+- No mesmo HEAD `0b3eac2aa6d4b08d4f47d7bf0bc528140f32a85a`, o runner isolado terminou `--personal-execution-safety` com **402 passed em 635,03 s**, cobrindo preflight, proteção inicial, sizing de fill, gestão, leitura/reconciliação de posições, fechamento e rotas de emergência.
+- `--personal-lifecycle-completeness`: **843 passed em 638,81 s**, cobrindo cancelamento após falha de stop, stop de emergência, ownership, reconciliação e fechamento. `--persistence-locks`: **39 passed em 319,81 s**, cobrindo escrita durável, serialização de reset, locks e drenagem. `--c3-dormant-startup`: **24 passed e 3 subtests passed em 452,49 s**, verificando localmente o startup C3 default-off/fail-closed.
+- As quatro rodadas usaram `tests/run_falcon_pilot_minimal_offline.py`, que bloqueia rede externa/subprocessos e leitura de `.env`, desabilita o autostart e redireciona persistência para diretório temporário. Os conjuntos se sobrepõem e suas contagens não devem ser somadas como casos únicos. Esses resultados não comprovam a configuração ou runtime do Render, chamadas reais à exchange, fills, stops físicos, posições, nem durabilidade física Linux/produção.
+- Não houve chamadas externas, acesso a secrets, mutação AWS/Render, alteração de dados de produção ou mudança de controles PAPER/DRY_RUN/LIVE nesta rodada.
+
+### Rechecagem Render read-only e métricas — 2026-11-08 03:59 UTC
+
+- A listagem read-only reconfirmou workspace `My Workspace` (`tea-d8gnnuojo6nc73ep3lg0`), serviço único `central-robos-bingx` (`srv-d8rtuv9o3t8c73ehav5g`), `autoDeploy=no`, uma instância Standard e disco `/data` de 2 GB. Deploy mais recente/ativo: `dep-dbnnv96c6qcc73edffm0`, status `live`, commit `31f31c9d071398c0fd35b1167f0460020f9ce2fd`.
+- Métricas de aproximadamente 02:59–03:59 UTC mantiveram uma instância; CPU ficou perto de 0,041–0,052 unidade de CPU e memória entre ~728–799 MB. O MCP não oferece métrica de espaço livre no disco. Portanto **63 MB livres/97% continua sendo a última medição direta**, fornecida pelo usuário via Shell em 2026-11-07; não inferi uma medição atual a partir de CPU/memória.
+- Logs somente de leitura filtrados por `GET /healthz` encontraram 10 respostas HTTP 200 do cron entre 03:10 e 03:55 UTC, com latência de 3–6 ms. No `main.py` do SHA live `31f31c9`, o hook global responde 503 até `CENTRAL_RUNTIME_READY`; essa flag é definida após `start_enabled_bots()` e uma checagem de que cada bot configurado como habilitado está em `LOADED_BOTS` e `BOT_THREADS_STARTED`. Assim, aqueles 200s corroboram que o gate de startup passou e as threads dos bots habilitados foram marcadas como iniciadas nesses instantes. Não provam que as threads permaneceram vivas/funcionais depois, nem posição, fill, stop físico, reconciliação, prontidão de trading ou espaço no disco.
+- A busca estritamente filtrada de logs de aplicação por `MEMORY before_start_bots`, `MEMORY after_start_bots` e nível error não retornou itens entre 02:50 e 04:00 UTC. Isso não prova ausência de reinícios/erros fora dos filtros nem ausência de writers paralelos.
+- Runner local `--trading-mode-defaults`, reexecutado no HEAD `0b3eac2aa6d4b08d4f47d7bf0bc528140f32a85a`: **9 passed em 28,60 s**, offline, com persistência temporária e `.env`/rede bloqueados. A suíte prova defaults e fail-closed do código, não os valores efetivos do ambiente Render. Não li variáveis de ambiente; uma checagem manual restrita às três chaves não secretas continua pendente.
+- Nenhuma variável de ambiente/secret foi lida. Nenhuma alteração, deploy, restart, acesso a disco via shell ou operação em AWS/Render foi feita.
+
+### Validação local adicional — throttle de market data — 2026-11-08 04:06 UTC
+
+- No mesmo HEAD `0b3eac2aa6d4b08d4f47d7bf0bc528140f32a85a`, executei `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --market-data-throttle`: **93 passed em 12,40 s**.
+- O runner é local/offline; esse resultado valida apenas o comportamento coberto pelos testes de throttle e não demonstra limites atuais da exchange nem estado do Render.
+- Antes da rodada, não havia outro processo desse runner em execução. Nenhum arquivo de dados de produção foi acessado; nenhum recurso externo, variável/secret, deploy ou controle de trading foi alterado.
+- Conferi os testes incluídos na seleção: reconhecem `100410`/HTTP 429 como throttle, evitam retry e sleep, compartilham cooldown entre clientes públicos/broker e chamadas concorrentes, e convertem throttle do Predator em aviso sem apagar erro fatal independente. Os módulos de implementação correspondentes são idênticos entre HEAD local e o SHA `31f31c9` previamente identificado como release ativo; isso não substitui nova verificação do deploy nem confirma comportamento real da exchange.
+
+### Falha de persistência dos históricos — inspeção local — 2026-11-08 04:10 UTC
+
+- `history_manager._append_history_event_once()` tenta gravar o evento canônico antes de marcar UID nas caches; se o append retornar falha, devolve `False/False` e deixa a identidade elegível para retry. `journal_manager._append_deduplicated_jsonl()` segue a mesma ordem para lifecycle/journal, retornando `ok:false` sem reservar UID quando o append falha.
+- Os testes `test_failed_primary_append_does_not_poison_same_process_retry`, `test_event_bus_append_failure_does_not_poison_same_process_retry` e `test_failed_lifecycle_append_does_not_poison_dedup_cache` cobrem falhas de escrita simuladas e retry. Isso reduz risco de deduplicação silenciosamente descartar um evento após falha transitória.
+- Limite: não simulei o volume de produção cheio nem provei que todos os chamadores de `log_event()` bloqueiam a operação associada quando `ok:false`; mirrors auxiliares podem falhar mesmo se o evento canônico tiver sido salvo. Nenhuma escrita foi feita no Render; não trate a salvaguarda local como garantia contra ENOSPC em produção.
+
+### Confirmação Render read-only — 2026-11-08 04:12 UTC
+
+- Workspace `My Workspace` (`tea-d8gnnuojo6nc73ep3lg0`) e serviço `central-robos-bingx` (`srv-d8rtuv9o3t8c73ehav5g`) confirmados pela conta Central Quant. Continua uma instância Standard com disco persistente `/data` de 2 GB, `autoDeploy=no`, `healthCheckPath` vazio e allowlist de IP `0.0.0.0/0`.
+- Deploy ativo: `dep-dbnnv96c6qcc73edffm0`, status `live`, SHA `31f31c9d071398c0fd35b1167f0460020f9ce2fd` (`fix(startup): abort incomplete bot worker sets`), iniciado às 19:44:36 UTC e concluído às 19:46:12 UTC de 2026-11-07.
+- Consulta de métricas entre 03:11 e 04:11 UTC de 2026-11-08 mostra uma instância constante; CPU entre ~0,041 e 0,052 unidade e memória entre ~727 e 789 MB. A latência registrada para respostas 200 variou entre ~3 e 231 ms. Isso não mede `/data` livre nem desempenho de rotas autenticadas/trading.
+- Logs de requisição mostram 30 respostas `GET /healthz` HTTP 200 do cron entre 01:45 e 04:10 UTC, com intervalos aproximados de cinco minutos. A consulta de logs de aplicação com nível `error` desde o deploy retornou zero entradas. `healthz` 200 é somente evidência de liveness/readiness HTTP configurada no código, não prova de saúde de posições, fills, stops, reconciliação ou operação segura.
+- Nenhuma chamada de escrita, deploy, restart, leitura de variáveis/secrets ou acesso ao disco foi realizada. O inventário enviado pelo usuário (97%, 63 MB livres) continua sendo a última medição direta de armazenamento; o MCP de Render não expõe espaço livre do disco.
+
+### Continuação local e inventário detalhado do disco — 2026-11-08
+
+- O usuário enviou nova saída somente de leitura de `find /data -maxdepth 1 -type f ... | sort -nr | head -30`. Os maiores arquivos continuam sendo `trade_lifecycle.jsonl` (~505 MB), `timeline.jsonl` (~499 MB), `history_events.jsonl` (~431 MB), `predator_paper_events.jsonl` (~212 MB), `auto_real_execution_bridge_v1_events.jsonl` (~71,9 MB) e `decision_log.jsonl` (~40 MB). As datas de modificação mais recentes exibidas são 2026-11-07 11:04. Isso detalha o consumo, mas não concede autorização para apagar, truncar, arquivar destrutivamente ou reescrever qualquer dado.
+- O `df` fornecido anteriormente reportou 2,0 GB totais, 1,9 GB usados, 63 MB livres e 97%. A listagem confirma que grande parte do volume é histórico append-only; não há base suficiente para classificar os registros antigos como descartáveis. Manter originais intactos continua sendo a opção segura até haver política de retenção e cópia verificada fora do volume.
+- Tentei apenas iniciar a distribuição Ubuntu/WSL para executar uma verificação Linux local e isolada; o comando retornou `Wsl/ E_ACCESSDENIED`. Não tentei contornar a política nem executar a suíte num ambiente de produção. Neste checkout não existe `c3_linux_lab.py`; os testes de locks já registrados foram executados no runner offline Windows, mas não provam semântica física POSIX/Linux.
+- Consequência operacional: 97% de ocupação, com 63 MB livres na última medição, é risco concreto de falha de novas gravações; a saúde HTTP não elimina esse risco. Não execute deploy/restart nem manutenção que reescreva os históricos enquanto o volume não tiver folga suficiente e plano de recuperação validado. Aumentar o disco ou adotar arquivamento com cópia verificada são opções distintas; qualquer aumento pago exige decisão financeira específica, e arquivar/remover requer política e validação antes de tocar nos originais.
+- Nenhuma escrita foi feita no Render/AWS, nenhum dado do `/data` foi lido além das saídas enviadas pelo usuário, nenhum secret foi consultado e os controles de trading não foram alterados.
+
+### Revalidação local do gate HTTP pessoal — 2026-11-08
+
+- No checkout `0b3eac2aa6d4b08d4f47d7bf0bc528140f32a85a`, o runner offline `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --personal-http-auth` terminou com **240 passed em 104,25 s**.
+- O hook global em `main.py` protege rotas conhecidas, aliases e caminhos desconhecidos; falha fechado se usuário/senha não estiverem configurados. A única exceção sem credenciais é `GET /healthz` sem query string, depois de rejeitar origem cruzada; a rota só informa readiness HTTP do runtime, não estado de trading. O próximo hook ainda bloqueia até `CENTRAL_RUNTIME_READY` e durante drain. O contrato do teste cobre esses limites.
+- Comparei `main.py` e `personal_http_auth.py` no HEAD local com o commit `31f31c9d071398c0fd35b1167f0460020f9ce2fd`, previamente observado como deploy live no Render; ambos os arquivos são idênticos nesse SHA. A comparação é de conteúdo versionado, não verifica valores efetivos das variáveis no serviço.
+- Não li usuário/senha nem outros secrets e não fiz requisição de autenticação ao endpoint público. Resultado local não substitui confirmar manualmente que o segredo está configurado no ambiente Render nem demonstra resistência a tentativa de senha, configuração de proxy ou prontidão de trading.
+- Nenhuma alteração de código, AWS, Render, deploy, restart ou controle de trading ocorreu. WSL segue indisponível para esta sessão (`Wsl/ E_ACCESSDENIED`); portanto a validação física Linux/POSIX permanece pendente.
+
+### Revalidação HTTP e estimativa oficial de armazenamento — 2026-11-08
+
+- Reexecutei a suíte offline `--personal-http-auth`: **240 passed em 104,25 s** no HEAD `0b3eac2aa6d4b08d4f47d7bf0bc528140f32a85a`. Os arquivos versionados `main.py` e `personal_http_auth.py` coincidem com o SHA Render `31f31c9d071398c0fd35b1167f0460020f9ce2fd`. A configuração efetiva de credenciais não foi consultada.
+- Na documentação oficial Render consultada em 2026-11-08, Persistent Disks custam **US$ 0,25 por GB/mês**; aumentar um disco existente não causa downtime e o espaço adicional fica disponível após alguns segundos. Assim, uma mudança de 2 GB para 4 GB estima acréscimo de **US$ 0,50/mês**, prorateado; confirmar o valor exato exibido no Dashboard antes de salvar. Fonte: https://render.com/docs/disks (pricing table: https://render.com/pricing).
+- A expansão para 4 GB é a contenção não destrutiva recomendada para recuperar margem imediata sem apagar históricos; não resolve a taxa de crescimento a longo prazo, que ainda precisa ser medida e tratada com política de retenção/arquivamento verificado. Não alterei o disco: o acréscimo é recorrente e a decisão financeira ainda cabe ao usuário.
+- A recomendação anterior para evitar deploy/restart durante 97% de uso continua válida até haver folga, backup e rollback; o aumento do volume em si, segundo Render, não causa downtime. Nenhuma ação externa foi executada.
+
+### Salvaguarda local para gravação PAPER com disco insuficiente — 2026-11-08
+
+- A listagem mais recente enviada pelo usuário mantém os quatro maiores históricos em `trade_lifecycle.jsonl` (504.840.558 bytes), `timeline.jsonl` (499.346.837), `history_events.jsonl` (430.978.559) e `predator_paper_events.jsonl` (211.525.991), somando 1.646.691.945 bytes. Os sete maiores listados somam aproximadamente 1,79 GB. A última medição direta continua sendo 97% usado e 63 MB livres; os timestamps dos arquivos não demonstram o espaço livre atual.
+- Corrigi localmente `broker.place_market_order`: quando envio real está desabilitado, antes de gerar preview ele verifica de forma somente leitura se o diretório persistente tem pelo menos 256 MiB livres. Medição indisponível ou folga menor retorna `PAPER_PERSISTENCE_BLOCKED`, sem tentar ordem nem produzir preview que pareça bem-sucedido. O caminho de fechamento LIVE reduce-only não é afetado por esse novo ramo, mas trading permanece PAPER/Dry Run e não foi testado com ordens reais.
+- Também corrigi o fail-open em I/O: o broker agora exige sucesso tanto do log de execução quanto do log de auditoria para retornar uma prévia PAPER válida; se qualquer append falhar, altera o resultado para `PAPER_PERSISTENCE_BLOCKED`. A seleção offline `--broker-paper-disk-guard` passou **47 testes em 6,47 s**, incluindo falha do medidor, folga baixa e falha simulada de cada writer de log. A suíte ampliada `--personal-safety-no-ccxt`, repetida após as mudanças, passou **267 testes em 636,53 s**. O harness bloqueia rede/subprocessos e usa persistência temporária; isso valida apenas o código local, não `/data` nem as configurações efetivas do Render.
+- Alterações locais ainda não publicadas: `broker.py`, `tests/test_broker_real_pilot_disk_space_guard_v1.py`, `tests/test_broker_account_client_order_boundary_v1.py`, `tests/run_falcon_pilot_minimal_offline.py` e este relatório. Nenhuma limpeza, reescrita, backup externo, expansão de disco, escrita AWS/Render, deploy ou mudança dos controles de trading foi executada. Publicação continua pendente de liberar margem no volume e confirmar custo; expansão de 2 GB para 4 GB é despesa recorrente estimada em US$ 0,50/mês e aguarda decisão financeira.
+
+### Revalidação Render somente leitura — 2026-11-08 04:50 UTC
+
+- Confirmei novamente o workspace `My Workspace` (`tea-d8gnnuojo6nc73ep3lg0`) pela conexão Central Quant e consultei o serviço `central-robos-bingx` (`srv-d8rtuv9o3t8c73ehav5g`). Estado: uma instância Standard, disco `/data` de 2 GB, auto-deploy desligado, allowlist `0.0.0.0/0` e `healthCheckPath` vazio.
+- O deploy mais recente continua `dep-dbnnv96c6qcc73edffm0`, status `live`, SHA `31f31c9d071398c0fd35b1167f0460020f9ce2fd`. Os quatro deploys consultados não mostram outro deploy em andamento.
+- Entre 03:50 e 04:50 UTC houve 13 respostas `GET /healthz` com HTTP 200, aproximadamente a cada cinco minutos, em 3–231 ms. Nas métricas com resolução de cinco minutos, houve uma instância constante, CPU de ~0,042–0,048 unidade e memória de ~708–791 MB. O conector não retornou métrica de espaço livre de `/data`; a última leitura direta continua a saída anterior do usuário (63 MB livres, 97%).
+- Como `healthCheckPath` está vazio, a documentação atual do Render indica que o serviço usa verificação TCP padrão; HTTP checks só são usados quando um caminho é configurado. `/healthz` respondendo 200 no cron não prova que o deploy gate esteja conferindo readiness HTTP nem que trading/posição/reconciliação estejam saudáveis. Fontes consultadas: [Render deploys](https://render.com/docs/deploys) e [Render health checks](https://render.com/docs/health-checks).
+- Não consultei logs de aplicação nem variáveis de ambiente/secrets. Nenhuma escrita, restart, deploy, alteração de configuração, AWS ou mudança de trading foi realizada.
+
+### Revisão de eventos Render — 2026-11-08 04:52 UTC
+
+- A consulta somente de leitura aos eventos do serviço entre 2026-11-01 e 2026-11-08 retornou 20 falhas `server_failed` em 2026-11-07, de 11:24 a 14:56 UTC, todas com motivo de health probe TCP em `10.26.32.129:10000` expirada (`i/o timeout`). Todas antecederam o deploy live do SHA `31f31c9`, iniciado às 19:44 UTC; não apareceu falha de instância posterior a esse deploy na janela consultada.
+- Não foram retornados eventos `service_disk_usage_high` nem `service_disk_usage_recovered` nesse intervalo. Isso significa apenas que não há tais eventos na resposta da consulta; não é medição de espaço e não contradiz a última leitura direta de 97%/63 MB.
+- O evento de deploy informa sucesso, mas a combinação de TCP-only, endpoint HTTP não configurado e ausência de métrica de disco mantém limites claros: sucesso do deploy/health probe não prova persistência saudável nem prontidão de trading. Nenhuma ação externa foi feita.
+
+### Revalidação da suíte de segurança de execução — 2026-11-08
+
+- No mesmo checkout, executei `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --personal-execution-safety`: **402 passed em 714,82 s**.
+- A seleção cobre os gates de preflight e contenção, entrada gerenciada, fill/stop, posição, fechamento e reconciliação sob os simuladores offline do runner. O resultado apoia a validação do código local; não executa ordens, não usa APIs externas e não demonstra comportamento em produção ou durabilidade física POSIX.
+- As mudanças de proteção PAPER por espaço insuficiente e falha de persistência continuam locais e não publicadas. A nova listagem `/data` enviada pelo usuário confirma novamente os tamanhos dos históricos, mas não altera a conclusão: não apagar, truncar ou compactar arquivos sem backup/restauração verificados e política aprovada.
+
+### Regressão complementar de lifecycle — 2026-11-08
+
+- Executei `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --personal-lifecycle-completeness`: **843 passed em 610,59 s**. Inclui cancelamento/timeout de entrada e fechamento, stop inicial, contenção de falhas de disaster-stop, reconciliação de posição e fechamento e risco fail-closed.
+- O runner bloqueou rede e subprocessos, negou abertura de `.env` e direcionou os dados para diretório temporário. Junto com a seleção `--personal-execution-safety` (402 passed), são 1.245 execuções aprovadas, com possíveis sobreposições entre as seleções — não 1.245 testes únicos.
+- Isso amplia a evidência local para os fluxos de lifecycle, mas não prova integração com a BingX, configuração efetiva no Render, durabilidade física Linux/POSIX ou prontidão para trading real. Nenhuma ordem, credencial, serviço externo ou controle de trading foi usado/alterado.
+
+### Reconsulta Render read-only — 2026-11-08 05:33 UTC
+
+- Confirmei novamente o workspace `My Workspace` (`tea-d8gnnuojo6nc73ep3lg0`) e o serviço `central-robos-bingx` (`srv-d8rtuv9o3t8c73ehav5g`). Configuração observada: uma instância Standard, `/data` de 2 GB, branch Render `codex/personal-readiness-20261103`, `autoDeploy=no`, `healthCheckPath` vazio e allowlist `0.0.0.0/0`.
+- O deploy ativo segue `dep-dbnnv96c6qcc73edffm0`, SHA `31f31c9d071398c0fd35b1167f0460020f9ce2fd`, status `live`. Isso não corresponde ao branch local `codex/personal-readiness-release-20261104`; o worktree tem alterações não commitadas, portanto a correção PAPER não está publicada.
+- Métricas de 04:33 a 05:33 UTC mantiveram uma instância. Houve uma resposta HTTP 200 em cada amostra de cinco minutos; não vieram logs de request 500/502/503 na janela consultada. p95 HTTP registrado variou de ~4 a 113 ms; CPU ~0,042–0,047 unidade; memória ~706–775 MB. Não consultei logs de aplicação nem variáveis/secrets.
+- O conector não expõe espaço livre do `/data`; portanto, os 63 MB/97% continuam sendo a última medida direta compartilhada pelo usuário, não uma confirmação do estado neste horário. O health check continua TCP, pois o path HTTP está vazio; o cron `/healthz` 200 é observação separada. A documentação oficial recuperada em HTML confirma que TCP é o padrão e que HTTP health check é configurado separadamente, com GET 2xx/3xx até cinco segundos: https://render.com/docs/health-checks.
+- Nenhuma alteração, escrita, restart, deploy, leitura de secret ou mudança de trading foi realizada. Os documentos oficiais de deploy e health check foram abertos em HTML; as URLs Markdown retornaram content-type incompatível no leitor. O deploy continua sem alteração e qualquer publicação consumiria minutos de pipeline, cujo saldo atual não foi verificado nesta consulta.
+
+### Revalidação Render e commit local — 2026-11-08 05:41 UTC
+
+- A chamada somente de leitura ao Render confirmou o serviço `central-robos-bingx` (`srv-d8rtuv9o3t8c73ehav5g`): uma instância Standard, disco persistente `/data` de 2 GB, `autoDeploy=no`, branch `codex/personal-readiness-20261103`, allowlist `0.0.0.0/0` e `healthCheckPath` vazio. O deploy live continua no SHA `31f31c9d071398c0fd35b1167f0460020f9ce2fd`. O conector não fornece uso livre do disco; os 63 MB/97% são a última medição direta enviada pelo usuário, não um valor revalidado nesta consulta.
+- O guard local de persistência PAPER e testes associados foram commitados em `e49acbcd1e1a18c4d9b6c128ac55fdd2c4c48a2e` (`fix(broker): fail closed on paper disk persistence`). A branch está quatro commits à frente de `origin`; esse commit não foi enviado nem implantado. Este relatório continua como modificação local não commitada.
+- Não houve alteração no Render/AWS, resize, push, deploy, restart, limpeza ou reescrita de históricos; nenhum secret foi lido. A expansão 2→4 GB permanece recomendação não executada; requer decisão financeira pelo custo recorrente estimado de US$ 0,50/mês e porque a capacidade não pode ser reduzida depois.
+
+### Revalidação local do guard de persistência — 2026-11-08 05:44 UTC
+
+- No HEAD `e49acbcd1e1a18c4d9b6c128ac55fdd2c4c48a2e`, reexecutei o seletor offline `--broker-paper-disk-guard`: **47 passed em 5,51 s**. O harness usa dados temporários e bloqueia rotas de rede/subprocessos; isso confirma o guard local, não a proteção do release Render `31f31c9`.
+- Revisei estaticamente a sequência dos três hooks globais em `main.py`: autenticação antes de cada rota, bloqueio de métodos/query GET mutáveis e bloqueio de readiness enquanto o runtime não estiver pronto. `/healthz` permanece a única exceção de autenticação, restrita a GET sem query e ainda sujeita ao gate de readiness/drain. Não consultei valores de variáveis, credenciais ou secrets; nenhum arquivo de autenticação foi alterado nesta revisão.
+- Nenhum ajuste foi feito em código nesta etapa. O relatório segue modificado localmente; branch `codex/personal-readiness-release-20261104` permanece quatro commits à frente da origem e sem push/deploy.
+
+### Monitoramento Render somente de leitura — 2026-11-08 05:45 UTC
+
+- No serviço `central-robos-bingx`, a consulta de 05:14–05:45 UTC confirmou uma instância constante; CPU ~0,042–0,045 unidade e memória ~683–775 MB. Métricas de `/healthz` mostram uma chamada por intervalo de cinco minutos, com p95 amostrado em ~3–102 ms. A consulta de request logs filtrada por HTTP 500/502/503 retornou vazia nessa janela.
+- Uma consulta separada aos request logs filtrados especificamente para `/healthz` falhou com HTTP 503 do backend de logs (`log retrieval is currently unavailable`). Por isso, os contadores/latência não são tratados como prova de que cada chamada foi HTTP 200. Nenhum log de aplicação ou valor de secret foi solicitado.
+- A configuração vista continua com `healthCheckPath` vazio, portanto o check de plataforma segue TCP; métricas recentes não medem espaço livre em `/data`. Nenhuma alteração, restart ou deploy foi realizado.
+
+### Revalidação offline do bloqueio de persistência PAPER — 2026-11-08 05:49 UTC
+
+- Reexecutei `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe tests/run_falcon_pilot_minimal_offline.py --broker-paper-disk-guard`: **47 passed em 4,41 s**. O comando `python` genérico apontava para o alias WindowsApps e não pôde iniciar; usei o ambiente offline já existente, sem instalar dependências.
+- Revisão do código confirma que a guarda bloqueia prévias PAPER/VERIFY quando o espaço persistente é menor que o mínimo ou não pode ser medido, e marca o resultado como `PAPER_PERSISTENCE_BLOCKED` se a gravação do log de execução ou auditoria falhar. Essa proteção está no commit local `e49acbcd`, não no deploy Render observado (`31f31c9`).
+- Nenhuma chamada de rede, alteração de código de runtime, secret, dado de produção, configuração Render/AWS, push, deploy, restart ou controle de trading foi realizada nesta validação.
+
+### Comparação do gate HTTP com release ativo — 2026-11-08 05:53 UTC
+
+- Comparei `main.py` e `personal_http_auth.py` do release Render observado (`31f31c9d071398c0fd35b1167f0460020f9ce2fd`) com o HEAD local `e49acbcd`; os dois arquivos são idênticos. A revisão estática confirma hook global de autenticação antes das rotas, rejeição de mutações por GET e readiness fail-closed; a exceção pública limita-se a `GET /healthz` sem query, com resposta mínima `HTTP_LIVE` quando o runtime está pronto e não está drenando.
+- A seleção offline `--personal-http-auth` passou: **240 testes em 109,16 s**. O teste usa as credenciais de fixture; não consulta nem prova os valores configurados no Render. Assim, isso confirma paridade do código do gate no release identificado, mas não confirma autenticação externa real, nem que as variáveis do serviço estejam configuradas corretamente.
+- Nenhum secret/valor de variável foi acessado, e não houve chamada externa, escrita, push, deploy, restart, mudança de acesso ou alteração de trading. A configuração de rede observada anteriormente permanece pública (`0.0.0.0/0`); o gate de aplicação é a proteção relevante e requer validação operacional sem expor credenciais.
+
+### Revalidação de startup e estado Render — 2026-11-08 06:01 UTC
+
+- No HEAD local `e49acbcd1e1a18c4d9b6c128ac55fdd2c4c48a2e`, executei `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --persistence-locks`: **39 passed em 310,85 s**. A seleção abrange escrita atômica durável, serialização do reset, locks locais fail-closed e o contrato de drain/startup. Foi local, sem subir servidor ou bots; fixtures temporárias e barreiras offline conforme o runner.
+- Inspeção somente de leitura do Render às 05:55 UTC: serviço `central-robos-bingx`, uma instância Standard, disco `/data` de 2 GB, `autoDeploy=no`, `healthCheckPath` vazio e allowlist `0.0.0.0/0`. O release ativo segue `31f31c9d071398c0fd35b1167f0460020f9ce2fd`. Nenhum evento de serviço foi retornado para 2026-11-08 00:00–05:55 UTC; isso não prova que os processos de bot estejam saudáveis.
+- A consulta filtrada aos logs de aplicação para `BOT STARTUP` falhou com HTTP 503 do backend Loki (`log retrieval is currently unavailable`). Não infiro sucesso nem falha do boot sem esses logs. Nenhuma variável/secrets ou conteúdo geral de log foi consultado.
+- Não houve alteração em runtime, dados de produção, Render/AWS, restart, push/deploy ou controles PAPER. A evidência de disco continua sendo a última leitura direta do usuário: 97% usado e 63 MB livres; recomenda-se manter bloqueada qualquer operação que possa consumir espaço temporário até aumentar a folga ou obter uma recuperação segura.
+
+### Métricas HTTP agregadas do serviço — 2026-11-08 06:02 UTC
+
+- Métricas Render de 05:00–06:02 UTC, agregadas por código HTTP, reportam uma resposta `200` em cada amostra de cinco minutos e `401 = 0`; latência HTTP para o host `central-robos-bingx.onrender.com` apareceu em 10 amostras, entre ~3,1 ms e 112,9 ms. A contagem é agregada por status, sem identificação segura da rota.
+- A consulta adicional filtrada por host e `/healthz` não retornou pontos, embora a contagem agregada tivesse respostas 200. Portanto, não atribuo essas respostas ao cron/`/healthz` nem as uso como prova de inicialização saudável dos bots. Os logs de aplicação continuam indisponíveis por HTTP 503 e eventos Render do período retornaram vazios.
+- Nenhuma solicitação externa direta ao endpoint, acesso a logs gerais, segredo ou escrita foi feita; a consulta foi somente a métricas Render.
+
+### Reavaliação da pressão de disco e guarda do executor PAPER integrado — 2026-11-08
+
+- Saída de shell do usuário em produção: `/data` tem 2,0 GB, 1,9 GB usados, 63 MB livres (97%). Os 28 arquivos listados somam ~1,96 GB; os seis maiores (`trade_lifecycle.jsonl`, `timeline.jsonl`, `history_events.jsonl`, `predator_paper_events.jsonl`, `auto_real_execution_bridge_v1_events.jsonl`, `decision_log.jsonl`) somam ~1,76 GB. Essa leitura é fornecida pelo usuário e não foi reconsultada pelo agente.
+- A auditoria local encontrou que `broker.execute_order` verificava o mínimo de 256 MiB, mas `execution_engine.py` encaminha modo PAPER a `paper_executor_integrated.execute_paper_from_engine`, que grava o ledger integrado diretamente em `CENTRAL_DATA_DIR` sem a mesma verificação. Portanto, a medição de 63 MB ficava abaixo do mínimo no broker, mas o caminho integrado ainda poderia tentar abrir uma posição PAPER.
+- Correção local em `paper_executor_integrated.py`: medição read-only do espaço livre, fail-closed em erro/menos de 256 MiB, antes do processamento persistente e rechecagem imediatamente antes da substituição atômica do ledger. A recusa não tenta gravar log no disco sem espaço e não afeta LIVE, fechamento de posições ou chama exchange.
+- Novos casos em `tests/test_paper_executor_integrated_idempotency_v1.py` cobrem abaixo do limite sem escrita de estado/log, queda de espaço entre a validação inicial e o write, falha de medição e exatamente o limite. O modo dedicado do runner offline foi adicionado a `tests/run_falcon_pilot_minimal_offline.py`.
+- Validação final: `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --paper-integrated-disk-guard` — **9 passed em 0,96 s**; `--broker-paper-disk-guard` — **47 passed em 6,69 s**. Runner bloqueia rede/subprocessos, nega leitura de `.env` e usa diretório temporário.
+- A listagem de arquivos não autoriza apagar, truncar, arquivar ou reescrever históricos; compactação ainda não foi executada. Sem resize, restart ou leitura de secrets.
+- Commit local validado `2dc6119fb5e0114f7a64c6d31f3e2e14fc2f3711` (`fix(paper): guard integrated entries on low disk`); o relatório permanece fora do commit para preservar o arquivo de trabalho anterior. Branch `codex/personal-readiness-release-20261104` está 5 commits à frente da origem.
+- A consulta read-only de deploys Render confirmou que o release live continua `31f31c9d071398c0fd35b1167f0460020f9ce2fd` (`dep-dbnnv96c6qcc73edffm0`). Portanto, a nova correção e os guards locais ainda não estão ativos em produção. Nenhum push, deploy ou restart foi feito; custo de publicação não está confirmado como zero.
+
+### Revisão das rotinas de rotação e estado Render — 2026-11-08
+
+- Revisei localmente as rotinas `preview_history_events_rotation`/`commit_history_events_rotation` e a variante de emergência em `history_manager.py`. Elas reescrevem `history_events.jsonl`; não abrangem os maiores arquivos `trade_lifecycle.jsonl`, `timeline.jsonl` e `predator_paper_events.jsonl`, portanto não resolveriam por si só a pressão total de `/data`.
+- A rotação normal requer espaço livre estimado para o arquivo de saída mais reserva e avisa que a reescrita é feita sem backup. A variante de emergência também não cria backup grande e pode converter payloads críticos antigos em projeções com hash, sem preservar o payload bruto. É uma operação destrutiva de histórico e não foi executada, tanto pela falta de recuperação/backup verificado quanto pela restrição desta meta contra reescrita histórica em massa.
+- Nova inspeção Render somente de leitura confirmou uma instância Standard, `/data` de 2 GB e `autoDeploy=no`; o deploy ativo permanece `31f31c9d071398c0fd35b1167f0460020f9ce2fd` (`dep-dbnnv96c6qcc73edffm0`). O conector não mede o espaço livre; 63 MB/97% continua sendo a medição de Shell enviada pelo usuário, não uma leitura atual.
+- Nenhum arquivo de produção foi lido ou alterado, nenhuma rotação/limpeza foi executada e nenhuma variável ou secret foi consultada. A correção de disk guard segue local e não publicada.
+
+### Redimensionamento de `/data` e revalidação PAPER — 2026-11-08 12:31 UTC
+
+- Render MCP confirmou o evento `disk_updated` do serviço `central-robos-bingx` (`srv-d8rtuv9o3t8c73ehav5g`): `/data` passou de 2 GB para 4 GB em 2026-11-08 12:28:23 UTC. A captura do usuário mostrou “Updating disk size to 4 GB”; a API read-only confirmou a configuração de 4 GB. Custo informado e autorizado pelo usuário: incremento de US$ 0,50/mês. Não houve alteração de conteúdo do disco, deploy ou restart associado no evento retornado.
+- A última medição direta de filesystem continua sendo anterior ao resize: 2,0 GB, 1,9 GB usados, 63 MB livres, 97%, em 2026-11-08 12:22:34 UTC. Falta uma nova leitura `df -h /data` para confirmar o tamanho e espaço visível pelo processo após o aumento.
+- O deploy atual permanece no SHA `31f31c9d071398c0fd35b1167f0460020f9ce2fd`; o guard de persistência PAPER presente na branch local ainda não está publicado. Consulta read-only de application logs falhou com HTTP 503 (`log retrieval is currently unavailable`), portanto não foi possível verificar erros recentes de ENOSPC nem comportamento de startup nessa consulta.
+- Revalidação local no HEAD `6be5d8109993bf3c5ecd83f90c367b55fe3fa2d6`, usando `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py`: `--paper-lifecycle-disk-failures` **5 passed**; `--paper-integrated-disk-guard` **9 passed**; `--broker-paper-disk-guard` **47 passed**. São testes locais com fixtures temporárias; não comprovam que os guards estejam no Render ativo nem atestam a capacidade efetiva do filesystem pós-resize.
+- Históricos não foram removidos, truncados, compactados ou reescritos. Controles de trading mantidos sem alterações. A publicação da branch continua pendente de decisão de custo específica, pois o custo de pipeline/deploy não foi comprovado como zero.
+- Revalidei a seleção offline mais ampla `--personal-execution-safety` no mesmo HEAD `6be5d8109993bf3c5ecd83f90c367b55fe3fa2d6`: **402 passed em 615,66 s**. Ela abrange preflight fail-closed, entrada/cancelamento/fill, stop inicial/disaster, posições, close/reconciliação, risco LIVE e autenticação das rotas relacionadas. Resultado exclusivamente local/simulado; não valida a integração da exchange, configuração de secrets no Render nem o release ativo `31f31c9`.
+
+### Nova consulta Render somente de leitura — 2026-11-08 12:44 UTC
+
+- O serviço `central-robos-bingx` continua com `/data` configurado para 4 GB, uma instância, `autoDeploy=no`; o deploy ativo permanece `31f31c9d071398c0fd35b1167f0460020f9ce2fd` (`dep-dbnnv96c6qcc73edffm0`).
+- O backend de logs respondeu nesta consulta. Filtro de application logs dos últimos sete dias por `ENOSPC`, `No space left on device` ou `PAPER_PERSISTENCE_BLOCKED` retornou zero registros. Isso não mede espaço livre, não substitui `df -h /data` e não demonstra saúde geral ou prontidão de trading.
+- Ainda falta leitura pós-resize do filesystem pelo Render Shell. Não houve restart, deploy, alteração de variável, acesso a secret ou operação nos históricos/dados.
+
+### Revalidação offline de C3 dormente e defaults PAPER — 2026-11-08
+
+- No branch `codex/personal-readiness-release-20261104`, HEAD `6be5d8109993bf3c5ecd83f90c367b55fe3fa2d6`, executei `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --c3-dormant-startup`: **24 passed, 3 subtests passed em 419,39 s**. A seleção testa startup local com coordenação C3 dormente; não inicializa/ativa C3 nem comprova integração externa.
+- Executei em seguida `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --trading-mode-defaults`: **9 passed em 25,53 s**, verificando defaults fail-closed/PAPER em fixtures locais.
+- O runner é offline e os resultados são evidência de código local apenas. Não foram lidos secrets, chamados serviços externos, alterados controles de trading, nem feitas escritas/deploy/restart no Render ou AWS.
+- O checkout foi revalidado antes do registro: HEAD inalterado e única modificação no relatório; `git diff --check` passou (com o aviso normal de conversão LF/CRLF do Windows). O guard local de persistência PAPER continua não publicado no release Render observado. Continua pendente somente a leitura manual pós-resize `df -h /data` para confirmar espaço livre visível ao processo; não executar limpeza ou restauração de snapshot.
+
+### Verificação atual do disco Render e regressão de persistência — 2026-11-08 12:59 UTC
+
+- Inspeção Render somente de leitura confirmou serviço `central-robos-bingx` (`srv-d8rtuv9o3t8c73ehav5g`), uma instância Standard e disco `/data` configurado para 4 GB; `autoDeploy=no`, branch configurada `codex/personal-readiness-20261103` e health check HTTP não configurado. Aumentar o tamanho é irreversível para redução, conforme a interface Render; nenhum restore foi executado.
+- A lista de deploys continua apontando como live o SHA `31f31c9d071398c0fd35b1167f0460020f9ce2fd` (`dep-dbnnv96c6qcc73edffm0`). O HEAD local `6be5d8109993bf3c5ecd83f90c367b55fe3fa2d6` é diferente; os guards locais de persistência PAPER ainda não estão no release de produção. Não houve deploy.
+- Depois de revalidar branch/HEAD/status, executei `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --persistence-locks`: **39 passed em 315,38 s**. Essa seleção cobre persistência atômica/locks e os contratos de startup/drain em testes locais; não inicia bots, não lê o disco Render e não prova durabilidade física Linux.
+- A captura do usuário mostra a interface processando o aumento para 4 GB; a configuração da API confirma 4 GB. A medição do filesystem pós-resize ainda depende de o usuário executar `df -h /data` no Render Shell. Não apagar/truncar/compactar históricos nem restaurar snapshot; não foram acessados secrets, alteradas variáveis ou trading, ou feitas escritas externas.
+- `git diff --check` passou. HEAD e branch permanecem inalterados; a única alteração local é este relatório. Aviso LF/CRLF é conversão normal do checkout Windows.
+
+### Auditoria atual de writers e escopo de release — 2026-11-08 13:01 UTC
+
+- No HEAD `6be5d8109993bf3c5ecd83f90c367b55fe3fa2d6`, executei a seleção offline `--registry-writers`: **60 passed em 57,90 s**. Ela audita superfícies de escrita do Registry no código e contratos sintéticos; não enumera processos externos nem mede simultaneidade real em produção.
+- O código atual instala o coordenador C3 em modo dormente e informa `runtime_activation_allowed=False`; Render está configurado para uma instância. A evidência atual continua sem demonstrar requisito do uso pessoal para signer/lock distribuído; manter C3 fora do caminho crítico é a decisão proporcional, sem alegar que writers externos impossíveis foram excluídos.
+- A comparação do release live `31f31c9` ao HEAD local tem 15 arquivos: 14 arquivos de código/testes, mais relatório de evidências; 1.766 inserções e 145 remoções no total. Portanto, não é seguro tratar um deploy como publicação isolada do guard de disco. Push/deploy não feito: custo zero ainda não comprovado.
+- Inspeções Render deste turno foram somente leitura: disco `/data` configurado para 4 GB, uma instância, `autoDeploy=no`; deploy live permanece `31f31c9`. O espaço livre efetivo ainda precisa ser medido no Shell com `df -h /data` após o resize. Nenhum arquivo de produção foi consultado, secret foi lido ou histórico foi alterado.
+
+### Serialização e durabilidade do estado PAPER compartilhado — 2026-11-08 13:10 UTC
+
+- A revisão do código identificou três caminhos que atualizam `paper_integrated_positions.json`: executor PAPER, lifecycle e outcome evaluator. Os dois primeiros tinham locks independentes e o avaliador não tinha lock; isso permitia que uma gravação baseada em leitura antiga sobrescrevesse um fechamento concorrente dentro do mesmo processo.
+- Correção local: novo módulo `paper_state_storage.py` com um `RLock` compartilhado pelos três escritores e um escritor JSON único que usa temporário único no mesmo diretório, `fsync` do conteúdo, `os.replace` e `fsync` do diretório em POSIX. O lock serializa threads de uma única instância; não afirma coordenação entre processos/instâncias.
+- O avaliador agora lê estritamente o ledger e as estatísticas mutáveis, falha sem sobrescrever JSON inválido, comunica falhas de persistência e permite retry para reparar o caso em que o ledger foi marcado mas a estatística não foi gravada.
+- Testes no runner offline atual: `--paper-integrated-disk-guard` **28 passed em 1,36 s** (inclui persistência/`fsync`, estado corrompido, retry e corridas simuladas entrada↔lifecycle e lifecycle↔outcome); `--paper-lifecycle-disk-failures` **5 passed em 0,45 s**; `--paper-lifecycle-integration` **110 passed, 1 deselected em 1,99 s**. Dados usam temporários e a suíte não envia ordens nem acessa serviços externos.
+- Limitação: execução Windows e simulação de falha de `fsync` não comprovam semântica física do volume Linux/Render. A mudança está somente na worktree, ainda não commitada/publicada; não foi testada no release live. A única alteração anterior do usuário no repositório continua preservada, sem edição de históricos.
+- Branch/HEAD conferidos antes do registro: `codex/personal-readiness-release-20261104` / `6be5d8109993bf3c5ecd83f90c367b55fe3fa2d6`; apenas os arquivos listados na worktree estão modificados ou não rastreados. `git diff --check` passou, com aviso de conversão LF/CRLF normal do Windows.
+
+### Confirmação do resize e regressão de leitura JSON — 2026-11-08 13:24 UTC
+
+- A captura do Dashboard mostra a notificação de atualização do disco para 4 GB. A consulta Render somente de leitura confirmou `disk_updated` de 2 para 4 GB às 12:28:23 UTC e a configuração atual de `/data` em 4 GB. O Render documenta que aumentar o disco não causa downtime e que o espaço adicional fica disponível em segundos; ainda falta a confirmação direta no filesystem com `df -h /data`.
+- Durante revisão dos ajustes PAPER locais, corrigi a implementação de `_read_json` em `outcome_evaluator.py`: a função havia ficado retornando `None` para arquivo existente, pois seu bloco de leitura estava inalcançável após `return` em outra função. A leitura tolerante agora restaura o comportamento de usar o default em erro; a leitura de estado mutável continua estrita em `_read_state_json`.
+- Validação: `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --outcome-evaluator-closed-identity` — **356 passed em 659,75 s**; `git diff --check` passou, com avisos normais de conversão LF/CRLF.
+- A alteração é local e não commitada/publicada. Nenhum deploy, restart, leitura de secret, acesso/escrita em dados de produção, limpeza/restauração de snapshot ou alteração de controles de trading foi feito. HEAD permanece `6be5d8109993bf3c5ecd83f90c367b55fe3fa2d6`; falta somente a leitura manual de `df -h /data` para comprovar espaço utilizável pós-resize.
+
+### Revalidação de locks e limite de WSL — 2026-11-08 13:31 UTC
+
+- Reexecutei no mesmo HEAD a seleção offline `--persistence-locks`: **39 passed em 292,55 s**. O harness usa estado de teste temporário; resultado válido para os contratos cobertos no Windows, não para durabilidade física POSIX/Linux.
+- A tentativa `wsl -d Ubuntu -- uname -a` falhou com `Wsl/E_ACCESSDENIED`; nenhum laboratório Linux foi executado e não trato isso como teste aprovado.
+- Branch/HEAD/status preservados; `git diff --check` passou. Nenhum teste chamou serviço externo, nenhum dado/secreto de produção foi lido ou alterado, e PAPER/LIVE permaneceu inalterado. A verificação manual pós-resize ainda é `df -h /data` no Shell do Render.
+
+### Retry idempotente do log do avaliador PAPER — 2026-11-08 13:33 UTC
+
+- A revisão confirmou que o avaliador podia registrar `PAPER_OUTCOME_EVALUATED` antes de persistir posições/estatísticas; falha parcial seguida de retry podia duplicar a linha de auditoria. Não havia outro leitor operacional além do endpoint de leitura do próprio avaliador.
+- Correção local em `outcome_evaluator.py`: persiste primeiro o ledger de posições, registra eventos com ID determinístico da identidade de fechamento e verifica IDs existentes (incluindo derivação para eventos legados) antes de anexar; erro no log é reportado como persistência parcial e permite retry sem duplicação. Testes cobrem falha na persistência do ledger, falha do log, retry após estatística falhar e ID estável.
+- Runner offline `--paper-integrated-disk-guard`: **29 passed em 1,52 s**; `git diff --check` passou. Nenhuma chamada externa ou escrita em produção foi feita.
+- Branch/HEAD permanecem `codex/personal-readiness-release-20261104` / `6be5d8109993bf3c5ecd83f90c367b55fe3fa2d6`; alterações locais seguem sem commit/deploy. WSL continua bloqueado por `Wsl/E_ACCESSDENIED`; a capacidade pós-resize do filesystem ainda depende da saída manual de `df -h /data`.
+
+### Regressão PAPER e suíte ampla de segurança — 2026-11-08 13:45 UTC
+
+- Após corrigir o retry idempotente do log, executei a seleção focal `--paper-integrated-disk-guard`: **29 passed em 1,52 s**.
+- Em seguida executei `--personal-execution-safety` no runner offline atual: **402 passed em 650,29 s**. Os testes usam fixtures/estado temporário, bloqueiam dependências externas segundo o harness e não enviam ordens; comprovam apenas comportamento do código local, não operação real da exchange ou do Render.
+- `git diff --check` passou na última verificação. Nenhum recurso externo foi alterado. A integração de billing do Render não oferece consulta de consumo de minutos nesta sessão; custo zero de build/deploy continua não confirmado, então nada foi publicado.
+
+### Auditoria de escritores do ledger integrado PAPER — 2026-11-08 13:46 UTC
+
+- Busca local por `paper_integrated_positions.json`/`PAPER_POSITIONS_FILE` encontrou três caminhos de escrita de estado: `execute_paper_from_engine` em `paper_executor_integrated.py`, `update_paper_position_price`/`_update_paper_position_price_locked` em `paper_lifecycle.py` e `evaluate_closed_paper_trades` em `outcome_evaluator.py`. Os três agora serializam o read/modify/write com o mesmo `PAPER_STATE_LOCK` de processo e usam o gravador atômico compartilhado.
+- `execution_pipeline_status.py`, rotas de status e funções de health identificadas pela busca apenas leem o ledger. Isso sustenta o lock compartilhado para concorrência de threads da instância única atual; não exclui processos/writers externos nem oferece coordenação distribuída. Assim, a evidência continua sem justificar colocar C3 distribuído no caminho crítico.
+- Nenhuma alteração de código adicional nesta auditoria. Branch/HEAD/status conferidos; o conjunto de arquivos locais modificados permanece preservado e `git diff --check` passou.
+
+### Revalidação de lifecycle e defaults de trading — 2026-11-08 13:58 UTC
+
+- Executei `--trading-mode-defaults`: **9 passed em 27,76 s**, confirmando os defaults locais PAPER/fail-closed em fixtures.
+- Executei `--personal-lifecycle-completeness`: **843 passed em 607,79 s** no mesmo checkout, cobrindo os fluxos locais de lifecycle/fechamento/reconciliação selecionados pelo runner offline. Não substitui validação com exchange nem prova de operação real.
+- WSL permanece sem acesso (`Wsl/E_ACCESSDENIED`) e o ambiente não expõe Docker/Podman; não há nesta máquina uma via disponível para validar semântica física Linux. A medição manual pós-resize `df -h /data` ainda falta.
+- Nenhuma chamada externa, escrita em produção, commit, push, deploy ou alteração de controles de trading. Branch/HEAD e arquivos modificados preservados; `git diff --check` passou.
+
+### Revalidação das rotas HTTP públicas — 2026-11-08 14:01 UTC
+
+- Runner offline `--personal-http-auth`: **240 passed em 94,05 s**, cobrindo gate de autenticação, rejeição de mutações via GET e rotas sensíveis relacionadas. Testes usam credenciais de fixture; nenhum valor configurado no Render foi lido.
+- Comparação local do SHA Render `31f31c9d071398c0fd35b1167f0460020f9ce2fd` com o HEAD `6be5d8109993bf3c5ecd83f90c367b55fe3fa2d6` não encontrou diferença em `main.py` nem `personal_http_auth.py`. A lista read-only do Render confirma `31f31c9` como deploy live mais recente nesta consulta.
+- Isso confirma paridade desses arquivos e os testes locais do gate, não configuração real das credenciais nem a autenticação em execução. O backend de billing não está disponível para confirmar custo de uma publicação; nada foi enviado/deployado. Sem leitura de secrets e sem alterações em produção ou nos controles PAPER.
+
+### Confirmação da configuração do disco após a captura do Dashboard — 2026-11-08 14:03 UTC
+
+- A captura mais recente do usuário mostra o Dashboard processando “Updating disk size to 4 GB”. Consulta Render somente de leitura ao serviço `srv-d8rtuv9o3t8c73ehav5g` confirmou `mountPath=/data`, `sizeGB=4`, uma instância, plano Standard e `autoDeploy=no`.
+- Isso confirma a configuração declarada no Render, mas não a capacidade montada que o processo enxerga. A única leitura de filesystem enviada pelo usuário ainda é anterior ao resize: 2,0 GB, 1,9 GB usados e 63 MB livres. Falta executar novamente `df -h /data` no Shell do Render.
+- Não executar “Restore” de snapshot: substituiria o conteúdo do disco. Nenhum deploy, restart, alteração de variáveis, acesso a secrets ou modificação de dados foi feita nesta checagem.
+
+### Regressão local após revalidação do worktree — 2026-11-08 14:04 UTC
+
+- Após conferir branch `codex/personal-readiness-release-20261104`, HEAD `6be5d8109993bf3c5ecd83f90c367b55fe3fa2d6` e status, executei no runner offline atual: `--paper-lifecycle-disk-failures` (**5 passed em 0,47 s**) e `--paper-integrated-disk-guard` (**29 passed em 1,27 s**).
+- O harness bloqueia rede, subprocessos e leitura de `.env`, e usa dados temporários. `git diff --check` passou; avisos LF/CRLF são do checkout Windows. Isso valida as regressões locais selecionadas, não o filesystem Linux/Render nem o release de produção.
+- Nenhuma chamada externa foi feita pelos testes, nenhum arquivo de produção foi lido/escrito, e PAPER permaneceu inalterado.
+- Consulta Render somente de leitura feita às 14:04 UTC retornou como último deploy `live` o SHA `31f31c9d071398c0fd35b1167f0460020f9ce2fd` (`dep-dbnnv96c6qcc73edffm0`); portanto, as correções locais do ledger PAPER ainda não estão no serviço ativo. Não iniciei push ou deploy: o custo para publicar permanece sem confirmação de zero.
+
+### Regressão offline complementar — 2026-11-08 14:05 UTC
+
+- Revalidei branch/HEAD/status antes da execução; no runner offline, `--paper-lifecycle-integration` passou com **110 passed, 1 deselected em 2,53 s**, e `--broker-paper-disk-guard` passou com **47 passed em 4,11 s**.
+- Esses resultados complementam a cobertura de lifecycle e do guard do broker PAPER com fixtures temporárias. Rede e `.env` continuam bloqueados pelo runner; não são teste de exchange, da montagem física Linux, nem da versão que está no Render.
+- Não houve deploy, operação real, alteração de configuração ou leitura de secret.
+
+### Tentativa atual do laboratório Linux local — 2026-11-08 14:06 UTC
+
+- `wsl -d Ubuntu -- uname -a` voltou a falhar neste ambiente do agente com `Wsl/E_ACCESSDENIED`; `docker` e `podman` também não estão no PATH. Portanto, não foi possível executar o laboratório Linux nesta sessão, e nenhum teste Windows está sendo contado como substituto de semântica física Linux.
+- O bloqueio não impede regressões offline Windows já concluídas. Para fechar essa evidência, é necessário um executor Linux/WSL acessível ou validar comportamento no Render sem escrever dados de trading; a leitura pós-resize do filesystem continua sendo `df -h /data` no Shell.
+- Branch/HEAD/status foram conferidos antes deste registro; nenhum estado de trading ou dado externo foi alterado.
+
+### Divergência entre API e Dashboard do disco — 2026-11-08 14:08 UTC
+
+- Nova leitura visual somente de leitura na página `.../disks` do serviço `central-robos-bingx` mostrou `Disk Usage: Size 2 GB` e campo de configuração `Size 2 GB`. Em duas consultas MCP read-only ao mesmo serviço, `serviceDetails.disk.sizeGB` retornou `4`.
+- A tela pode estar desatualizada, mas isso não foi demonstrado; portanto a evidência é conflitante. Não considerar o resize efetivo nem o filesystem expandido até atualizar a tela e, principalmente, receber `df -h /data` executado na instância. Nenhum botão Edit, Restore ou Delete foi acionado.
+- Tentei abrir os endpoints públicos via ferramenta web; ela não conseguiu acessá-los. Sem verificação HTTP de produção nesta tentativa. Não acessei credenciais, secrets ou dados de trading.
+
+### Confirmação do evento Render e comportamento documentado — 2026-11-08 14:09 UTC
+
+- A consulta de eventos do serviço retornou `disk_updated` para o disk `dsk-d932t3svikkc73bf2ih0`, de 2 GB para 4 GB, timestamp `2026-11-08T12:28:23.525078Z`. O serviço continua com uma instância; não há evento de reinício posterior ao resize entre os eventos retornados.
+- Consultei a documentação oficial atual do Render em `https://render.com/docs/disks`: o aumento de tamanho não causa downtime e o espaço adicional fica disponível em poucos segundos (linhas 136–138). A API/evento são evidência de que a configuração mudou; a tela visual que ainda diz 2 GB parece desatualizada, mas isso é inferência, não confirmação do filesystem.
+- Permanece necessário executar `df -h /data` no Shell da instância. Não foi acionado restore, edição do disco ou alteração de serviço.

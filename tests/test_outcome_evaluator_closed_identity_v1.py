@@ -105,6 +105,108 @@ def test_same_trade_id_distinct_lifecycles_are_evaluated_independently(
     assert len(result["stats"]["evaluated_closed_executions"]) == 2
 
 
+def test_corrupt_positions_state_fails_closed_without_replacing_file(evaluator):
+    evaluator.PAPER_POSITIONS_FILE.write_text("{invalid", encoding="utf-8")
+
+    result = evaluator.evaluate_closed_paper_trades()
+
+    assert result["ok"] is False
+    assert result["status"] == "OUTCOME_STATE_INVALID"
+    assert evaluator.PAPER_POSITIONS_FILE.read_text(encoding="utf-8") == "{invalid"
+    assert not evaluator.OUTCOME_STATS_FILE.exists()
+
+
+def test_invalid_stats_schema_fails_closed_without_resetting_dedup_state(evaluator):
+    _write_positions(evaluator, [_closed(lifecycle_id="LC-INVALID-STATS")])
+    evaluator.OUTCOME_STATS_FILE.write_text("[]", encoding="utf-8")
+
+    result = evaluator.evaluate_closed_paper_trades()
+
+    assert result["ok"] is False
+    assert result["status"] == "OUTCOME_STATE_INVALID"
+    assert evaluator.OUTCOME_STATS_FILE.read_text(encoding="utf-8") == "[]"
+    assert not evaluator.OUTCOME_LOG_FILE.exists()
+
+
+def test_stats_write_failure_is_reported_and_retry_repairs_partial_evaluation(
+    evaluator, monkeypatch
+):
+    _write_positions(evaluator, [_closed(lifecycle_id="LC-STATS-RETRY")])
+    original_write = evaluator._write_json
+
+    def fail_stats_once(path, payload):
+        if path == evaluator.OUTCOME_STATS_FILE:
+            monkeypatch.setattr(evaluator, "_write_json", original_write)
+            return False
+        return original_write(path, payload)
+
+    monkeypatch.setattr(evaluator, "_write_json", fail_stats_once)
+    partial = evaluator.evaluate_closed_paper_trades()
+
+    assert partial["ok"] is False
+    assert partial["status"] == "OUTCOME_PERSISTENCE_PARTIAL"
+    assert json.loads(evaluator.PAPER_POSITIONS_FILE.read_text(encoding="utf-8"))[0]["outcome_evaluated"]
+    assert not evaluator.OUTCOME_STATS_FILE.exists()
+
+    retry = evaluator.evaluate_closed_paper_trades()
+
+    assert retry["ok"] is True
+    assert retry["evaluated_count"] == 1
+    assert retry["stats"]["global"]["trades"] == 1
+    events = [
+        json.loads(line)
+        for line in evaluator.OUTCOME_LOG_FILE.read_text("utf-8").splitlines()
+    ]
+    assert len(events) == 1
+    assert events[0]["event_id"] == evaluator._outcome_event_id(
+        events[0]["outcome"]
+    )
+    assert evaluator.evaluate_closed_paper_trades()["evaluated_count"] == 0
+
+
+def test_positions_write_failure_is_not_reported_as_success(evaluator, monkeypatch):
+    _write_positions(evaluator, [_closed(lifecycle_id="LC-POSITIONS-FAIL")])
+    monkeypatch.setattr(evaluator, "_write_json", lambda _path, _payload: False)
+
+    result = evaluator.evaluate_closed_paper_trades()
+
+    assert result["ok"] is False
+    assert result["status"] == "OUTCOME_PERSISTENCE_FAILED"
+    assert result["stage"] == "paper_positions"
+    assert not evaluator.OUTCOME_STATS_FILE.exists()
+    assert not evaluator.OUTCOME_LOG_FILE.exists()
+
+
+def test_outcome_log_failure_is_reported_and_retry_finishes_once(
+    evaluator, monkeypatch
+):
+    _write_positions(evaluator, [_closed(lifecycle_id="LC-LOG-RETRY")])
+    original_append = evaluator._append_jsonl
+
+    def fail_log_once(path, payload):
+        monkeypatch.setattr(evaluator, "_append_jsonl", original_append)
+        raise OSError("simulated outcome log failure")
+
+    monkeypatch.setattr(evaluator, "_append_jsonl", fail_log_once)
+    partial = evaluator.evaluate_closed_paper_trades()
+
+    assert partial["ok"] is False
+    assert partial["status"] == "OUTCOME_PERSISTENCE_PARTIAL"
+    assert partial["stage"] == "outcome_log"
+    assert not evaluator.OUTCOME_STATS_FILE.exists()
+
+    retry = evaluator.evaluate_closed_paper_trades()
+
+    assert retry["ok"] is True
+    assert retry["evaluated_count"] == 1
+    assert retry["stats"]["global"]["trades"] == 1
+    events = [
+        json.loads(line)
+        for line in evaluator.OUTCOME_LOG_FILE.read_text("utf-8").splitlines()
+    ]
+    assert len(events) == 1
+
+
 def test_same_execution_retry_by_client_and_order_is_idempotent(evaluator):
     first = _closed(
         lifecycle_id="LC-SAME",

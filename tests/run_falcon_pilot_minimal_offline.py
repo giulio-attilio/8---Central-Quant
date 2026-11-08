@@ -215,7 +215,10 @@ if __name__ == "__main__":
             "test_broker_account_client_order_boundary_v1.py",
         )
     elif sys.argv[1:] == ["--paper-integrated-disk-guard"]:
-        cases = ("test_paper_executor_integrated_idempotency_v1.py",)
+        cases = (
+            "test_paper_executor_integrated_idempotency_v1.py",
+            "test_outcome_evaluator_closed_identity_v1.py",
+        )
     elif sys.argv[1:] == ["--paper-lifecycle-disk-failures"]:
         cases = ("test_timeline_single_writer.py",)
         filters = ["-k", "paper_lifecycle"]

@@ -16,12 +16,13 @@
 import os
 import json
 import shutil
-import threading
 import time
 import hashlib
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional
+
+from paper_state_storage import PAPER_STATE_LOCK, write_json_atomically
 
 
 VERSION = "2026-07-04-PAPER-EXECUTOR-INTEGRATED-V2"
@@ -36,7 +37,7 @@ PAPER_SEEN_FILE = DATA_DIR / "paper_integrated_seen.json"
 PAPER_EXECUTION_ENABLED = os.getenv("CENTRAL_PAPER_EXECUTION_ENABLED", "false").lower() == "true"
 REAL_EXECUTION_ENABLED = os.getenv("CENTRAL_REAL_EXECUTION_ENABLED", "false").lower() == "true"
 PAPER_MIN_FREE_DISK_BYTES = 256 * 1024 * 1024
-_PAPER_EXECUTION_LOCK = threading.RLock()
+_PAPER_EXECUTION_LOCK = PAPER_STATE_LOCK
 
 
 def _paper_persistence_guard() -> Dict[str, Any]:
@@ -82,22 +83,8 @@ def _read_state_json(path: Path, default: Any) -> Any:
 
 
 def _write_json(path: Path, payload: Any) -> bool:
-    """Atomically replace one PAPER state file; report failures to the caller."""
-    temp_path = path.with_name(path.name + ".tmp")
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temp_path.replace(path)
-        return True
-    except Exception:
-        try:
-            temp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        return False
+    """Durably replace one PAPER state file; report failures to the caller."""
+    return write_json_atomically(path, payload)
 
 
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:

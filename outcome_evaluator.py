@@ -13,10 +13,13 @@
 
 import os
 import json
+import hashlib
 import time
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional
+
+from paper_state_storage import PAPER_STATE_LOCK, write_json_atomically
 
 try:
     from trade_registry import (
@@ -59,13 +62,58 @@ def _read_json(path: Path, default: Any) -> Any:
         return default
 
 
-def _write_json(path: Path, payload: Any) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+def _read_state_json(path: Path, default: Any) -> Any:
+    """Read mutable PAPER state strictly so corruption is never treated as empty."""
+    if not path.exists():
+        return default
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json(path: Path, payload: Any) -> bool:
+    return write_json_atomically(path, payload)
 
 
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _outcome_event_id(outcome: Dict[str, Any]) -> str:
+    identity = str(
+        outcome.get("closed_execution_key") or outcome.get("trade_id") or ""
+    ).strip()
+    if not identity:
+        raise ValueError("closed outcome is missing a stable identity")
+    source = f"{VERSION}|PAPER_OUTCOME_EVALUATED|{identity}"
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _existing_outcome_event_ids(path: Path) -> set[str]:
+    """Read event IDs once per evaluation, deriving IDs for legacy rows too."""
+    if not path.exists():
+        return set()
+    event_ids = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(event, dict):
+                continue
+            event_id = event.get("event_id")
+            if isinstance(event_id, str) and event_id:
+                event_ids.add(event_id)
+                continue
+            outcome = event.get("outcome")
+            if event.get("event") == "PAPER_OUTCOME_EVALUATED" and isinstance(
+                outcome, dict
+            ):
+                try:
+                    event_ids.add(_outcome_event_id(outcome))
+                except Exception:
+                    continue
+    return event_ids
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -506,7 +554,7 @@ def outcome_evaluator_health() -> Dict[str, Any]:
     }
 
 
-def evaluate_closed_paper_trades(force: bool = False) -> Dict[str, Any]:
+def _evaluate_closed_paper_trades_locked(force: bool = False) -> Dict[str, Any]:
     if not OUTCOME_EVALUATOR_ENABLED:
         return {
             "ok": False,
@@ -515,8 +563,7 @@ def evaluate_closed_paper_trades(force: bool = False) -> Dict[str, Any]:
             "version": VERSION,
         }
 
-    positions = _read_json(PAPER_POSITIONS_FILE, [])
-    stats = _read_json(OUTCOME_STATS_FILE, {
+    default_stats = {
         "version": VERSION,
         "updated_at": None,
         "global": _empty_bucket(),
@@ -527,19 +574,25 @@ def evaluate_closed_paper_trades(force: bool = False) -> Dict[str, Any]:
         "evaluated_trade_ids": [],
         "evaluated_closed_execution_keys": [],
         "evaluated_closed_executions": [],
-    })
-    if not isinstance(stats, dict):
-        stats = {
+    }
+    try:
+        positions = _read_state_json(PAPER_POSITIONS_FILE, [])
+        stats = _read_state_json(OUTCOME_STATS_FILE, default_stats)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "OUTCOME_STATE_INVALID",
+            "error_type": type(exc).__name__,
+            "generated_at": _now_br(),
             "version": VERSION,
-            "updated_at": None,
-            "global": _empty_bucket(),
-            "by_bot": {},
-            "by_setup": {},
-            "by_symbol": {},
-            "by_side": {},
-            "evaluated_trade_ids": [],
-            "evaluated_closed_execution_keys": [],
-            "evaluated_closed_executions": [],
+        }
+    if not isinstance(positions, list) or not isinstance(stats, dict):
+        return {
+            "ok": False,
+            "status": "OUTCOME_STATE_INVALID",
+            "error_type": "InvalidStateSchema",
+            "generated_at": _now_br(),
+            "version": VERSION,
         }
 
     evaluated_ids = set(str(x) for x in stats.get("evaluated_trade_ids", []))
@@ -549,6 +602,7 @@ def evaluate_closed_paper_trades(force: bool = False) -> Dict[str, Any]:
         if x is not None
     )
     evaluated_now = []
+    pending_outcome_events = []
     skipped = []
     legacy_ambiguous_trade_ids = _legacy_marker_ambiguous_trade_ids(
         positions, stats
@@ -583,9 +637,10 @@ def evaluate_closed_paper_trades(force: bool = False) -> Dict[str, Any]:
             )
             continue
 
-        already_evaluated = bool(pos.get("outcome_evaluated")) or (
-            evaluation_state.get("status") == "ALREADY_EVALUATED"
-        )
+        # The stats ledger is the source of truth for completed aggregation.
+        # A position-only marker can result from a prior partial write; allow a
+        # retry to rebuild stats instead of treating that partial state as done.
+        already_evaluated = evaluation_state.get("status") == "ALREADY_EVALUATED"
         if already_evaluated and not force:
             skipped.append(
                 {
@@ -660,12 +715,46 @@ def evaluate_closed_paper_trades(force: bool = False) -> Dict[str, Any]:
             "epoch": time.time(),
             "outcome": outcome,
         }
-        _append_jsonl(OUTCOME_LOG_FILE, event)
+        event["event_id"] = _outcome_event_id(outcome)
+        pending_outcome_events.append(event)
         evaluated_now.append(outcome)
 
     stats["updated_at"] = _now_br()
-    _write_json(PAPER_POSITIONS_FILE, positions)
-    _write_json(OUTCOME_STATS_FILE, stats)
+    if not _write_json(PAPER_POSITIONS_FILE, positions):
+        return {
+            "ok": False,
+            "status": "OUTCOME_PERSISTENCE_FAILED",
+            "stage": "paper_positions",
+            "generated_at": _now_br(),
+            "version": VERSION,
+        }
+    if pending_outcome_events:
+        try:
+            existing_event_ids = _existing_outcome_event_ids(OUTCOME_LOG_FILE)
+            for event in pending_outcome_events:
+                if event["event_id"] in existing_event_ids:
+                    continue
+                _append_jsonl(OUTCOME_LOG_FILE, event)
+                existing_event_ids.add(event["event_id"])
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "OUTCOME_PERSISTENCE_PARTIAL",
+                "stage": "outcome_log",
+                "positions_persisted": True,
+                "error_type": type(exc).__name__,
+                "generated_at": _now_br(),
+                "version": VERSION,
+            }
+    if not _write_json(OUTCOME_STATS_FILE, stats):
+        return {
+            "ok": False,
+            "status": "OUTCOME_PERSISTENCE_PARTIAL",
+            "stage": "outcome_stats",
+            "positions_persisted": True,
+            "generated_at": _now_br(),
+            "version": VERSION,
+        }
 
     return {
         "ok": True,
@@ -678,6 +767,12 @@ def evaluate_closed_paper_trades(force: bool = False) -> Dict[str, Any]:
         "skipped": skipped[:50],
         "stats": stats,
     }
+
+
+def evaluate_closed_paper_trades(force: bool = False) -> Dict[str, Any]:
+    """Serialize evaluation with the other writers of the PAPER positions ledger."""
+    with PAPER_STATE_LOCK:
+        return _evaluate_closed_paper_trades_locked(force=force)
 
 
 def get_outcome_stats() -> Dict[str, Any]:

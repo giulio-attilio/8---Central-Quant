@@ -18,11 +18,11 @@
 import os
 import json
 import time
-import tempfile
-import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional
+
+from paper_state_storage import PAPER_STATE_LOCK, write_json_atomically
 
 
 VERSION = "2026-07-05-PAPER-LIFECYCLE-V1.1-PRICE-RECORDER"
@@ -38,7 +38,7 @@ PAPER_LIFECYCLE_ENABLED = os.getenv("CENTRAL_PAPER_LIFECYCLE_ENABLED", "true").l
 PAPER_LIFECYCLE_HISTORY_ENABLED = os.getenv("CENTRAL_PAPER_LIFECYCLE_HISTORY_ENABLED", "true").lower() in {
     "1", "true", "yes", "sim", "on"
 }
-_PAPER_LIFECYCLE_LOCK = threading.RLock()
+_PAPER_LIFECYCLE_LOCK = PAPER_STATE_LOCK
 
 
 def _now_br() -> str:
@@ -68,29 +68,8 @@ def _read_positions_for_update() -> tuple[Optional[list], Optional[str]]:
 
 
 def _write_json(path: Path, payload: Any) -> bool:
-    """Atomically replace JSON, retaining the old file if preparation fails."""
-    temp_path = None
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-        with tempfile.NamedTemporaryFile(
-            mode="wb", prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent), delete=False
-        ) as handle:
-            temp_path = Path(handle.name)
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temp_path), str(path))
-        temp_path = None
-        return True
-    except Exception:
-        return False
-    finally:
-        if temp_path is not None:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+    """Durably replace JSON; report failures to the caller."""
+    return write_json_atomically(path, payload)
 
 
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> bool:

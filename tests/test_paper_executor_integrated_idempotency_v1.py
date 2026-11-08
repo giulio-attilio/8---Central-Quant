@@ -12,6 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import paper_executor_integrated as paper_executor
+import paper_lifecycle
+import outcome_evaluator
+import paper_state_storage
 
 
 class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
@@ -220,6 +223,203 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertTrue(result["allowed"])
         self.assertEqual(result["status"], "PAPER_PERSISTENCE_READY")
         self.assertEqual(result["free_bytes"], paper_executor.PAPER_MIN_FREE_DISK_BYTES)
+
+    def test_atomic_state_write_fsyncs_file_replaces_then_syncs_directory(self):
+        target = self.root / "durable.json"
+        events = []
+        original_fsync = paper_executor.os.fsync
+        original_replace = paper_executor.os.replace
+
+        def record_fsync(fd):
+            events.append("file_fsync")
+            return original_fsync(fd)
+
+        def record_replace(source, destination):
+            events.append("replace")
+            return original_replace(source, destination)
+
+        with (
+            mock.patch.object(paper_executor.os, "fsync", side_effect=record_fsync),
+            mock.patch.object(paper_executor.os, "replace", side_effect=record_replace),
+            mock.patch.object(
+                paper_state_storage,
+                "_fsync_directory",
+                side_effect=lambda _directory: events.append("directory_fsync"),
+            ),
+        ):
+            persisted = paper_executor._write_json(target, {"value": "new"})
+
+        self.assertTrue(persisted)
+        self.assertEqual(events, ["file_fsync", "replace", "directory_fsync"])
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"value": "new"})
+        self.assertEqual(list(self.root.glob(".*.tmp")), [])
+
+    def test_file_fsync_failure_preserves_existing_state(self):
+        target = self.root / "durable.json"
+        target.write_text('{"value":"old"}', encoding="utf-8")
+
+        with mock.patch.object(paper_executor.os, "fsync", side_effect=OSError("fsync failed")):
+            persisted = paper_executor._write_json(target, {"value": "new"})
+
+        self.assertFalse(persisted)
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"value": "old"})
+        self.assertEqual(list(self.root.glob(".*.tmp")), [])
+
+    def test_directory_fsync_failure_reports_ambiguous_persistence(self):
+        target = self.root / "durable.json"
+
+        with mock.patch.object(
+            paper_state_storage,
+            "_fsync_directory",
+            side_effect=OSError("directory fsync failed"),
+        ):
+            persisted = paper_executor._write_json(target, {"value": "new"})
+
+        self.assertFalse(persisted)
+        # Replace already occurred: caller must fail closed, and retries must
+        # discover the committed idempotency key in the canonical ledger.
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"value": "new"})
+
+    def test_directory_fsync_closes_directory_descriptor_after_failure(self):
+        with (
+            mock.patch.object(paper_state_storage.os, "name", "posix"),
+            mock.patch.object(paper_state_storage.os, "open", return_value=37) as open_directory,
+            mock.patch.object(paper_state_storage.os, "fsync", side_effect=OSError("sync failed")),
+            mock.patch.object(paper_state_storage.os, "close") as close_directory,
+        ):
+            with self.assertRaises(OSError):
+                paper_state_storage._fsync_directory(self.root)
+
+        open_directory.assert_called_once_with(
+            str(self.root),
+            paper_state_storage.os.O_RDONLY | getattr(paper_state_storage.os, "O_DIRECTORY", 0),
+        )
+        close_directory.assert_called_once_with(37)
+
+    def test_all_paper_position_writers_share_the_same_process_lock(self):
+        self.assertIs(paper_executor._PAPER_EXECUTION_LOCK, paper_state_storage.PAPER_STATE_LOCK)
+        self.assertIs(paper_lifecycle._PAPER_LIFECYCLE_LOCK, paper_state_storage.PAPER_STATE_LOCK)
+        self.assertIs(outcome_evaluator.PAPER_STATE_LOCK, paper_state_storage.PAPER_STATE_LOCK)
+
+    def test_lifecycle_update_waits_for_concurrent_paper_entry_and_closes_new_position(self):
+        paper_lifecycle.PAPER_POSITIONS_FILE = self.positions_file
+        paper_lifecycle.PAPER_LIFECYCLE_LOG_FILE = self.root / "lifecycle.jsonl"
+        paper_lifecycle.PAPER_LIFECYCLE_HISTORY_ENABLED = False
+        paper_lifecycle.PAPER_LIFECYCLE_ENABLED = True
+        position_read = threading.Event()
+        release_entry = threading.Event()
+        lifecycle_requested_lock = threading.Event()
+        original_read = paper_executor._read_state_json
+        shared_lock = paper_state_storage.PAPER_STATE_LOCK
+
+        def pause_after_positions_read(path, default):
+            value = original_read(path, default)
+            if Path(path) == self.positions_file:
+                position_read.set()
+                if not release_entry.wait(timeout=5):
+                    raise TimeoutError("test did not release paper entry")
+            return value
+
+        class ObservedSharedLock:
+            def __enter__(self):
+                lifecycle_requested_lock.set()
+                shared_lock.acquire()
+                return self
+
+            def __exit__(self, _exc_type, _exc, _tb):
+                shared_lock.release()
+
+        with (
+            mock.patch.object(paper_executor, "_read_state_json", side_effect=pause_after_positions_read),
+            mock.patch.object(paper_lifecycle, "_PAPER_LIFECYCLE_LOCK", ObservedSharedLock()),
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                entry_future = pool.submit(
+                    paper_executor.execute_paper_from_engine,
+                    {"plan": self._plan("paper-cross-writer-v1")},
+                )
+                self.assertTrue(position_read.wait(timeout=3))
+                lifecycle_future = pool.submit(
+                    paper_lifecycle.update_paper_position_price,
+                    symbol="BTCUSDT",
+                    price=90.0,
+                    close=True,
+                    close_reason="TEST_CLOSE",
+                )
+                self.assertTrue(lifecycle_requested_lock.wait(timeout=3))
+                release_entry.set()
+                entry_result = entry_future.result(timeout=5)
+                lifecycle_result = lifecycle_future.result(timeout=5)
+
+        self.assertTrue(entry_result["ok"])
+        self.assertTrue(lifecycle_result["ok"])
+        positions = self._positions()
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0]["status"], "CLOSED")
+
+    def test_outcome_read_modify_write_cannot_overwrite_concurrent_lifecycle_close(self):
+        initial = paper_executor.execute_paper_from_engine(
+            {"plan": self._plan("paper-outcome-lifecycle-race-v1")}
+        )
+        self.assertTrue(initial["ok"])
+
+        outcome_evaluator.PAPER_POSITIONS_FILE = self.positions_file
+        outcome_evaluator.OUTCOME_STATS_FILE = self.root / "outcome_stats.json"
+        outcome_evaluator.OUTCOME_LOG_FILE = self.root / "outcome.jsonl"
+        outcome_evaluator.OUTCOME_EVALUATOR_ENABLED = True
+        paper_lifecycle.PAPER_POSITIONS_FILE = self.positions_file
+        paper_lifecycle.PAPER_LIFECYCLE_LOG_FILE = self.root / "lifecycle.jsonl"
+        paper_lifecycle.PAPER_LIFECYCLE_HISTORY_ENABLED = False
+        paper_lifecycle.PAPER_LIFECYCLE_ENABLED = True
+
+        position_read = threading.Event()
+        release_evaluation = threading.Event()
+        lifecycle_requested_lock = threading.Event()
+        original_read = outcome_evaluator._read_state_json
+        shared_lock = paper_state_storage.PAPER_STATE_LOCK
+
+        def pause_after_positions_read(path, default):
+            value = original_read(path, default)
+            if Path(path) == self.positions_file:
+                position_read.set()
+                if not release_evaluation.wait(timeout=5):
+                    raise TimeoutError("test did not release outcome evaluation")
+            return value
+
+        class ObservedSharedLock:
+            def __enter__(self):
+                lifecycle_requested_lock.set()
+                shared_lock.acquire()
+                return self
+
+            def __exit__(self, _exc_type, _exc, _tb):
+                shared_lock.release()
+
+        with (
+            mock.patch.object(outcome_evaluator, "_read_state_json", side_effect=pause_after_positions_read),
+            mock.patch.object(paper_lifecycle, "_PAPER_LIFECYCLE_LOCK", ObservedSharedLock()),
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                evaluation_future = pool.submit(outcome_evaluator.evaluate_closed_paper_trades)
+                self.assertTrue(position_read.wait(timeout=3))
+                lifecycle_future = pool.submit(
+                    paper_lifecycle.update_paper_position_price,
+                    symbol="BTCUSDT",
+                    price=90.0,
+                    close=True,
+                    close_reason="TEST_CLOSE",
+                )
+                self.assertTrue(lifecycle_requested_lock.wait(timeout=3))
+                release_evaluation.set()
+                evaluation_result = evaluation_future.result(timeout=5)
+                lifecycle_result = lifecycle_future.result(timeout=5)
+
+        self.assertTrue(evaluation_result["ok"])
+        self.assertEqual(evaluation_result["evaluated_count"], 0)
+        self.assertTrue(lifecycle_result["ok"])
+        positions = self._positions()
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0]["status"], "CLOSED")
 
 
 if __name__ == "__main__":
