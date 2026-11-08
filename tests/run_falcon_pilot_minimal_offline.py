@@ -214,6 +214,8 @@ if __name__ == "__main__":
             "test_broker_order_constraints_fail_closed_v1.py",
             "test_broker_account_client_order_boundary_v1.py",
         )
+    elif sys.argv[1:] == ["--paper-integrated-disk-guard"]:
+        cases = ("test_paper_executor_integrated_idempotency_v1.py",)
     elif sys.argv[1:] == ["--static-runtime"]:
         cases = ("test_static_operational_runtime_v1.py",)
     elif sys.argv[1:] == ["--predator-auto-closed-sync"]:
@@ -324,6 +326,8 @@ if __name__ == "__main__":
         filters = []
     elif sys.argv[1:] == ["--broker-paper-disk-guard"]:
         filters = []
+    elif sys.argv[1:] == ["--paper-integrated-disk-guard"]:
+        filters = []
     elif sys.argv[1:] == ["--static-runtime"]:
         filters = []
     elif sys.argv[1:] == ["--predator-auto-closed-sync"]:
@@ -358,7 +362,11 @@ if __name__ == "__main__":
     # The unittest-based C3 startup integration tests use pytest's trace-option
     # lookup in pytest's unittest adapter, so keep the built-in debugging
     # plugin registered for this focused mode (the option remains false).
-    if sys.argv[1:] not in (["--c3-dormant-startup"], ["--can-open-risk"]):
+    if sys.argv[1:] not in (
+        ["--c3-dormant-startup"],
+        ["--can-open-risk"],
+        ["--paper-integrated-disk-guard"],
+    ):
         pytest_args.extend(["-p", "no:debugging"])
     raise SystemExit(
         pytest.main(

@@ -15,6 +15,7 @@
 
 import os
 import json
+import shutil
 import threading
 import time
 import hashlib
@@ -34,7 +35,30 @@ PAPER_SEEN_FILE = DATA_DIR / "paper_integrated_seen.json"
 
 PAPER_EXECUTION_ENABLED = os.getenv("CENTRAL_PAPER_EXECUTION_ENABLED", "false").lower() == "true"
 REAL_EXECUTION_ENABLED = os.getenv("CENTRAL_REAL_EXECUTION_ENABLED", "false").lower() == "true"
+PAPER_MIN_FREE_DISK_BYTES = 256 * 1024 * 1024
 _PAPER_EXECUTION_LOCK = threading.RLock()
+
+
+def _paper_persistence_guard() -> Dict[str, Any]:
+    """Fail closed when persistent storage cannot safely accept a PAPER entry."""
+    try:
+        free_bytes = int(shutil.disk_usage(DATA_DIR).free)
+    except Exception as exc:
+        return {
+            "allowed": False,
+            "status": "PAPER_PERSISTENCE_BLOCKED",
+            "free_bytes": None,
+            "minimum_free_bytes": PAPER_MIN_FREE_DISK_BYTES,
+            "error_type": type(exc).__name__,
+        }
+    allowed = free_bytes >= PAPER_MIN_FREE_DISK_BYTES
+    return {
+        "allowed": allowed,
+        "status": "PAPER_PERSISTENCE_READY" if allowed else "PAPER_PERSISTENCE_BLOCKED",
+        "free_bytes": free_bytes,
+        "minimum_free_bytes": PAPER_MIN_FREE_DISK_BYTES,
+        "error_type": None,
+    }
 
 
 def _now_br() -> str:
@@ -249,6 +273,23 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
         _append_jsonl(PAPER_LOG_FILE, {"event": "PAPER_INVALID_PLAN", "payload": result})
         return {"ok": False, "payload": result}
 
+    persistence = _paper_persistence_guard()
+    if not persistence["allowed"]:
+        result = {
+            "ok": False,
+            "status": "PAPER_PERSISTENCE_BLOCKED",
+            "reason": "espaço persistente insuficiente ou indisponível; nova posição PAPER bloqueada",
+            "version": VERSION,
+            "generated_at": _now_br(),
+            "idempotency_key": normalized["idempotency_key"],
+            "persistence": persistence,
+            "errors": ["PAPER_PERSISTENT_DISK_BELOW_MINIMUM_OR_UNAVAILABLE"],
+            "warnings": validation["warnings"],
+            "exchange_executor_called": False,
+            "paper_executor_called": True,
+        }
+        return {"ok": False, "payload": result}
+
     idem = normalized["idempotency_key"]
     trade_id = _build_trade_id(plan)
 
@@ -355,6 +396,23 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
             return {"ok": False, "payload": result}
 
         positions.append(position)
+        # Recheck immediately before the atomic position-ledger replacement.
+        persistence = _paper_persistence_guard()
+        if not persistence["allowed"]:
+            result = {
+                "ok": False,
+                "status": "PAPER_PERSISTENCE_BLOCKED",
+                "reason": "espaço persistente caiu abaixo do mínimo antes da gravação",
+                "version": VERSION,
+                "generated_at": _now_br(),
+                "idempotency_key": idem,
+                "persistence": persistence,
+                "errors": ["PAPER_PERSISTENT_DISK_BELOW_MINIMUM_OR_UNAVAILABLE"],
+                "warnings": validation["warnings"],
+                "exchange_executor_called": False,
+                "paper_executor_called": True,
+            }
+            return {"ok": False, "payload": result}
         if not _write_json(PAPER_POSITIONS_FILE, positions):
             result = {
                 "ok": False,

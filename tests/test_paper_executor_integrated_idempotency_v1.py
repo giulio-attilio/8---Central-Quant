@@ -28,6 +28,17 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
             mock.patch.object(paper_executor, "PAPER_LOG_FILE", self.log_file),
             mock.patch.object(paper_executor, "PAPER_EXECUTION_ENABLED", True),
             mock.patch.object(paper_executor, "REAL_EXECUTION_ENABLED", False),
+            mock.patch.object(
+                paper_executor,
+                "_paper_persistence_guard",
+                return_value={
+                    "allowed": True,
+                    "status": "PAPER_PERSISTENCE_READY",
+                    "free_bytes": 512 * 1024 * 1024,
+                    "minimum_free_bytes": paper_executor.PAPER_MIN_FREE_DISK_BYTES,
+                    "error_type": None,
+                },
+            ),
         ]
         for patcher in self.patches:
             patcher.start()
@@ -134,6 +145,81 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertEqual(result["payload"]["status"], "PAPER_INVALID_PLAN")
         self.assertFalse(self.positions_file.exists())
         self.assertFalse(self.seen_file.exists())
+
+    def test_low_persistent_disk_blocks_integrated_paper_without_writing_state_or_log(self):
+        with mock.patch.object(
+            paper_executor,
+            "_paper_persistence_guard",
+            return_value={
+                "allowed": False,
+                "status": "PAPER_PERSISTENCE_BLOCKED",
+                "free_bytes": 63 * 1024 * 1024,
+                "minimum_free_bytes": paper_executor.PAPER_MIN_FREE_DISK_BYTES,
+                "error_type": None,
+            },
+        ):
+            result = paper_executor.execute_paper_from_engine({"plan": self._plan()})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["payload"]["status"], "PAPER_PERSISTENCE_BLOCKED")
+        self.assertEqual(result["payload"]["persistence"]["free_bytes"], 63 * 1024 * 1024)
+        self.assertFalse(result["payload"]["exchange_executor_called"])
+        self.assertFalse(self.positions_file.exists())
+        self.assertFalse(self.seen_file.exists())
+        self.assertFalse(self.log_file.exists())
+
+    def test_disk_drop_before_position_write_blocks_without_committing_position(self):
+        ready = {
+            "allowed": True,
+            "status": "PAPER_PERSISTENCE_READY",
+            "free_bytes": 512 * 1024 * 1024,
+            "minimum_free_bytes": paper_executor.PAPER_MIN_FREE_DISK_BYTES,
+            "error_type": None,
+        }
+        low = {
+            "allowed": False,
+            "status": "PAPER_PERSISTENCE_BLOCKED",
+            "free_bytes": 63 * 1024 * 1024,
+            "minimum_free_bytes": paper_executor.PAPER_MIN_FREE_DISK_BYTES,
+            "error_type": None,
+        }
+        with mock.patch.object(
+            paper_executor,
+            "_paper_persistence_guard",
+            side_effect=[ready, low],
+        ):
+            result = paper_executor.execute_paper_from_engine({"plan": self._plan()})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["payload"]["status"], "PAPER_PERSISTENCE_BLOCKED")
+        self.assertEqual(result["payload"]["persistence"]["free_bytes"], 63 * 1024 * 1024)
+        self.assertFalse(self.positions_file.exists())
+        self.assertFalse(self.seen_file.exists())
+        self.assertFalse(self.log_file.exists())
+
+    def test_persistent_disk_measurement_error_blocks_integrated_paper(self):
+        self.patches[-1].stop()
+        with mock.patch.object(
+            paper_executor.shutil,
+            "disk_usage",
+            side_effect=OSError("disk unavailable"),
+        ):
+            result = paper_executor._paper_persistence_guard()
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["status"], "PAPER_PERSISTENCE_BLOCKED")
+        self.assertIsNone(result["free_bytes"])
+        self.assertEqual(result["error_type"], "OSError")
+
+    def test_persistent_disk_measurement_accepts_space_at_minimum(self):
+        self.patches[-1].stop()
+        usage = type("Usage", (), {"free": paper_executor.PAPER_MIN_FREE_DISK_BYTES})()
+        with mock.patch.object(paper_executor.shutil, "disk_usage", return_value=usage):
+            result = paper_executor._paper_persistence_guard()
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["status"], "PAPER_PERSISTENCE_READY")
+        self.assertEqual(result["free_bytes"], paper_executor.PAPER_MIN_FREE_DISK_BYTES)
 
 
 if __name__ == "__main__":
