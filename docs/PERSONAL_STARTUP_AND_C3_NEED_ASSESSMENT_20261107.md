@@ -948,3 +948,9 @@ Para a topologia observada de uma instância e um operador, a alternativa propor
 - A suíte local offline `--personal-http-auth` passou: **240 passed em 131,58 s**. Ela cobre o gate HTTP, autenticação e rotas/reconciliação selecionadas com credenciais sintéticas; não substitui uma tentativa externa sem credenciais nem prova a configuração de secrets no Render.
 - Nos dados Render consultados entre 12:30 e 15:43 UTC, a contagem de instâncias permaneceu em 1; memória ficou aproximadamente entre 0,69 e 0,80 GB, CPU entre 0,04 e 0,06 vCPU, e as chamadas do cron a `/healthz` responderam HTTP 200 entre 14:05 e 15:40 UTC. Isso indica que o probe e o gate de runtime-ready responderam naquele intervalo; não demonstra prontidão de trading, saúde de cada writer ou persistência física.
 - Ainda é necessário consultar no Shell da instância `df -h /data` para confirmar o filesystem após resize. Não houve deploy, restart, restore de snapshot, limpeza, alteração AWS ou operação de trading.
+
+### Atualização do checkpoint local — 2026-11-08
+
+- As alterações locais de persistência do outcome evaluator, seus dois testes e as anotações correspondentes foram salvas no commit `4970901fd52de0fc976acc021fe322dc42077703` (`fix(paper): fsync outcome event log`). A branch está dois commits à frente de `origin/codex/personal-readiness-release-20261104`; nada foi enviado ao GitHub ou ao Render.
+- Após o commit, `--paper-integrated-disk-guard` passou novamente: **31 passed em 2,53 s**. `--personal-http-auth` passou nesta retomada: **240 passed em 131,58 s**. Os testes são offline e usam dados/credenciais sintéticos; não comprovam filesystem físico Linux nem configuração efetiva dos secrets no Render.
+- A verificação pós-resize pelo comando `df -h /data` continua pendente. O commit é local e não implica publicação nem prontidão para trading.
