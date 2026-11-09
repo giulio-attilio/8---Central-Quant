@@ -49596,6 +49596,55 @@ def _ppla_v1_validate_open_position(position, registry_match=None):
     return {"missing_fields": missing, "age_hours": age_h, "warnings": warnings, "reasons": reasons}
 
 
+def _ppla_v1_closed_candidate_index(registry_closed):
+    """Index CLOSED rows by the exact identity edges used by canonical merge."""
+    index = {}
+    for trade in registry_closed or []:
+        if not isinstance(trade, dict):
+            continue
+        identity = _closed_trade_identity_state_v1(trade)
+        identity = identity if isinstance(identity, dict) else {}
+        keys = set()
+        canonical_key = str(identity.get("canonical_key") or "")
+        if canonical_key:
+            keys.add(("canonical", canonical_key))
+        merge_tokens = identity.get("merge_tokens")
+        if isinstance(merge_tokens, (list, tuple, set, frozenset)):
+            keys.update(
+                ("merge", str(token))
+                for token in merge_tokens
+                if str(token or "")
+            )
+        for key in keys:
+            index.setdefault(key, []).append(trade)
+    return index
+
+
+def _ppla_v1_closed_identity_candidates(index, trade):
+    """Return only rows sharing a canonical key or typed merge token."""
+    if not isinstance(index, dict) or not isinstance(trade, dict):
+        return []
+    identity = _closed_trade_identity_state_v1(trade)
+    identity = identity if isinstance(identity, dict) else {}
+    keys = set()
+    canonical_key = str(identity.get("canonical_key") or "")
+    if canonical_key:
+        keys.add(("canonical", canonical_key))
+    merge_tokens = identity.get("merge_tokens")
+    if isinstance(merge_tokens, (list, tuple, set, frozenset)):
+        keys.update(
+            ("merge", str(token))
+            for token in merge_tokens
+            if str(token or "")
+        )
+    candidates = {}
+    for key in keys:
+        for candidate in index.get(key, ()):
+            if isinstance(candidate, dict):
+                candidates.setdefault(id(candidate), candidate)
+    return list(candidates.values())
+
+
 @request_cached_predator_audit("predator_paper_lifecycle_audit")
 @observe_predator_audit("predator_paper_lifecycle_audit")
 def predator_paper_lifecycle_audit_v1_status(include_samples=True, limit=1500, use_cache=False):
@@ -49700,6 +49749,13 @@ def predator_paper_lifecycle_audit_v1_status(include_samples=True, limit=1500, u
             trade_id = _ppla_v1_get_trade_id(trade)
             key = str(trade_id or _ppla_v1_trade_key(trade))
             closed_by_key.setdefault(key, []).append(trade)
+    candidate_index_builder = globals().get("_ppla_v1_closed_candidate_index")
+    candidate_lookup = globals().get("_ppla_v1_closed_identity_candidates")
+    closed_identity_index = (
+        candidate_index_builder(registry_closed)
+        if callable(candidate_index_builder) and callable(candidate_lookup)
+        else None
+    )
     missing_registry_closed = []
     for ev in closed_events:
         ev_key = _ppla_v1_closed_key_from_event(ev)
@@ -49709,11 +49765,16 @@ def predator_paper_lifecycle_audit_v1_status(include_samples=True, limit=1500, u
             closed_builder(ev) if callable(closed_builder) else None
         )
         if isinstance(event_trade, dict):
+            candidate_rows = (
+                candidate_lookup(closed_identity_index, event_trade)
+                if closed_identity_index is not None and callable(candidate_lookup)
+                else registry_closed
+            )
             matched = any(
                 _closed_trade_records_equivalent_v1(
                     event_trade, registry_trade
                 )
-                for registry_trade in registry_closed
+                for registry_trade in candidate_rows
                 if isinstance(registry_trade, dict)
             )
         else:
@@ -50344,12 +50405,26 @@ def _pprsf_v1_recalculate_lifecycle_counts_from_registry(registry):
         if _ppla_v1_get_trade_id(item) not in module_by_id and _ppla_v1_trade_key(item) not in module_keys
     )
     closed_events, _ = _ppla_v1_get_closed_paper_events(limit=2000)
+    candidate_index_builder = globals().get("_ppla_v1_closed_candidate_index")
+    candidate_lookup = globals().get("_ppla_v1_closed_identity_candidates")
+    closed_identity_index = (
+        candidate_index_builder(registry_closed)
+        if callable(candidate_index_builder) and callable(candidate_lookup)
+        else None
+    )
     missing_closed = 0
     for event in closed_events:
         event_trade = _pprsf_v1_build_closed_trade_from_event(event)
+        candidate_rows = (
+            candidate_lookup(closed_identity_index, event_trade)
+            if closed_identity_index is not None
+            and callable(candidate_lookup)
+            and isinstance(event_trade, dict)
+            else registry_closed
+        )
         if not isinstance(event_trade, dict) or not any(
             _closed_trade_records_equivalent_v1(event_trade, existing)
-            for existing in registry_closed
+            for existing in candidate_rows
             if isinstance(existing, dict)
         ):
             missing_closed += 1
@@ -68481,6 +68556,13 @@ def _pacs_v1_event_safety(event):
 def _pacs_v1_plan_closed_repairs(registry, closed_events):
     open_trades = _pprsf_v1_open_dict(registry)
     closed_trades = _pprsf_v1_closed_list(registry)
+    candidate_index_builder = globals().get("_ppla_v1_closed_candidate_index")
+    candidate_lookup = globals().get("_ppla_v1_closed_identity_candidates")
+    closed_identity_index = (
+        candidate_index_builder(closed_trades)
+        if callable(candidate_index_builder) and callable(candidate_lookup)
+        else None
+    )
     candidate_items = []
     skipped = []
     for event in closed_events or []:
@@ -68612,9 +68694,14 @@ def _pacs_v1_plan_closed_repairs(registry, closed_events):
             ),
         )[0]
         trade_id = str(trade.get("trade_id") or "")
+        existing_candidates = (
+            candidate_lookup(closed_identity_index, trade)
+            if closed_identity_index is not None and callable(candidate_lookup)
+            else closed_trades
+        )
         existing_relations = [
             _closed_trade_record_relation_v1(trade, existing)
-            for existing in closed_trades
+            for existing in existing_candidates
             if isinstance(existing, dict)
         ]
         if "CONFLICT" in existing_relations:

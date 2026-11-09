@@ -225,6 +225,8 @@ def _harness(
         "_pacs_v1_bool",
         "_pacs_v1_explicit_trade_id",
         "_pacs_v1_event_safety",
+        "_ppla_v1_closed_candidate_index",
+        "_ppla_v1_closed_identity_candidates",
         "_closed_trade_record_relation_v1",
         "_closed_trade_records_equivalent_v1",
         "_pacs_v1_plan_closed_repairs",
@@ -408,3 +410,130 @@ def test_required_endpoint_and_health_fields_are_exposed():
         "predator_auto_closed_sync_reason",
     ):
         assert field in source
+
+
+def test_closed_identity_candidate_index_matches_exhaustive_canonical_scan():
+    tree = ast.parse(MAIN.read_text(encoding="utf-8"))
+    names = {
+        "_ppla_v1_closed_candidate_index",
+        "_ppla_v1_closed_identity_candidates",
+    }
+    functions = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    assert {node.name for node in functions} == names
+    module = ast.Module(body=functions, type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {
+        "_closed_trade_identity_state_v1": _canonical_closed_trade_identity_state,
+    }
+    exec(compile(module, "main.py", "exec"), namespace)
+
+    registry_rows = [
+        {
+            "trade_id": f"PREDATOR-{index}",
+            "lifecycle_id": f"life-{index}",
+            "bot": "PREDATOR",
+            "setup": "SMART_PREDATOR",
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "qty": 1.0,
+            "entry": 100.0,
+            "exit_price": 101.0,
+            "closed_at": f"2026-11-01 00:{index % 60:02d}:00",
+            "status": "CLOSED",
+            "registry_mode": "PAPER",
+            "execution_mode": "PAPER",
+        }
+        for index in range(60)
+    ]
+    index = namespace["_ppla_v1_closed_candidate_index"](registry_rows)
+
+    probes = []
+    # Exact/copy-equivalent records should be found in a small identity bucket.
+    for row in registry_rows[::10]:
+        probe = dict(row)
+        probe["metadata"] = {"audit_source": "synthetic"}
+        probes.append(probe)
+    # Shared strong identity with divergent facts remains a candidate, but the
+    # canonical merge must still reject it as equivalent.
+    for row in registry_rows[1:60:10]:
+        probe = dict(row, symbol="ETHUSDT")
+        probes.append(probe)
+    # Unrelated records must not match by a reused trade_id alone.
+    probes.append({
+        "trade_id": "PREDATOR-1",
+        "lifecycle_id": "unrelated-life",
+        "bot": "PREDATOR",
+        "setup": "SMART_PREDATOR",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "qty": 1.0,
+        "entry": 100.0,
+        "exit_price": 101.0,
+        "closed_at": "2026-11-01 00:01:00",
+        "status": "CLOSED",
+        "registry_mode": "PAPER",
+        "execution_mode": "PAPER",
+    })
+
+    def equivalent(left, right):
+        result = _canonical_merge_closed_trade_records([left, right])
+        return bool(
+            (result.get("diagnostics") or {}).get("safe_to_commit") is True
+            and len(result.get("records") or []) == 1
+        )
+
+    exhaustive_comparisons = 0
+    indexed_comparisons = 0
+    for probe in probes:
+        candidates = namespace["_ppla_v1_closed_identity_candidates"](
+            index, probe
+        )
+        exhaustive_comparisons += len(registry_rows)
+        indexed_comparisons += len(candidates)
+        expected = any(equivalent(probe, row) for row in registry_rows)
+        actual = any(equivalent(probe, row) for row in candidates)
+        assert actual is expected
+
+    assert indexed_comparisons < exhaustive_comparisons // 20
+
+
+def test_sync_plan_skips_exhaustive_registry_relation_scan(tmp_path):
+    unrelated_closed_rows = [
+        {
+            "trade_id": f"OLD-{index}",
+            "lifecycle_id": f"old-life-{index}",
+            "bot": "PREDATOR",
+            "setup": "SMART_PREDATOR",
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "qty": 1.0,
+            "entry": 100.0,
+            "exit_price": 101.0,
+            "closed_at": f"2026-10-01 00:{index % 60:02d}:00",
+            "status": "CLOSED",
+            "registry_mode": "PAPER",
+            "execution_mode": "PAPER",
+        }
+        for index in range(500)
+    ]
+    ns, registry, _ = _harness(
+        tmp_path,
+        events=[_event("NEW-PAPER-CLOSE")],
+        existing_closed=unrelated_closed_rows,
+    )
+    calls = {"relation": 0}
+    canonical_relation = ns["_closed_trade_record_relation_v1"]
+
+    def count_relation(left, right):
+        calls["relation"] += 1
+        return canonical_relation(left, right)
+
+    ns["_closed_trade_record_relation_v1"] = count_relation
+    plan = ns["_pacs_v1_plan_closed_repairs"](
+        registry, [_event("NEW-PAPER-CLOSE")]
+    )
+    assert len(plan["planned"]) == 1
+    assert calls["relation"] == 0
