@@ -32,6 +32,7 @@ _LOOPBACK_SERVER_ONLY = sys.argv[1:] in (
     ["--drain-only"],
     ["--drain-regression"],
     ["--extra"],
+    ["--telegram-notification-policy"],
 )
 
 
@@ -239,6 +240,8 @@ if __name__ == "__main__":
         )
     elif sys.argv[1:] == ["--learning-cursor-guard"]:
         cases = ("test_executive_policy_learning_cursor_guard_v1.py",)
+    elif sys.argv[1:] == ["--telegram-notification-policy"]:
+        cases = ("test_telegram_notification_policy.py",)
     elif sys.argv[1:] == ["--persistence-locks"]:
         cases = (
             "test_trade_registry_atomic_durable_write_v1.py",
@@ -246,6 +249,8 @@ if __name__ == "__main__":
             "test_runtime_file_lock_fail_closed_v1.py",
             "test_main_runtime_drain_contract_v1.py",
         )
+    elif sys.argv[1:] == ["--registry-startup-admission"]:
+        cases = ("test_main_runtime_drain_contract_v1.py",)
     elif sys.argv[1:] == ["--personal-execution-safety"]:
         cases = (
             "test_falcon_real_pilot_preflight_fail_closed_v1.py",
@@ -353,8 +358,12 @@ if __name__ == "__main__":
         filters = []
     elif sys.argv[1:] == ["--learning-cursor-guard"]:
         filters = []
+    elif sys.argv[1:] == ["--telegram-notification-policy"]:
+        filters = []
     elif sys.argv[1:] == ["--persistence-locks"]:
         filters = []
+    elif sys.argv[1:] == ["--registry-startup-admission"]:
+        filters = ["-k", "persistent_registry_startup_admission_requires_mount_file_and_schema"]
     elif sys.argv[1:] == ["--personal-execution-safety"]:
         filters = []
     elif sys.argv[1:] == ["--personal-lifecycle-completeness"]:

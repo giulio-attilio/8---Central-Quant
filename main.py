@@ -34274,7 +34274,25 @@ def _central_persistent_registry_startup_admission_v1():
     except Exception:
         return {"ok": False, "status": "PERSISTENT_REGISTRY_PATH_INVALID"}
     if not active_text.startswith("/data/"):
+        try:
+            environment = getattr(os, "environ", {})
+            render_runtime = (
+                str(environment.get("RENDER", "")).strip().lower() == "true"
+                or bool(environment.get("RENDER_SERVICE_ID"))
+            )
+        except Exception:
+            return {"ok": False, "status": "RENDER_RUNTIME_IDENTITY_UNAVAILABLE"}
+        if render_runtime:
+            return {"ok": False, "status": "PERSISTENT_REGISTRY_PATH_NOT_PERSISTENT"}
         return {"ok": True, "status": "NON_PERSISTENT_PATH_NOT_GATED"}
+
+    try:
+        persistent_root = Path("/data").resolve()
+        active = active.resolve()
+        active.relative_to(persistent_root)
+        active_text = str(active).replace("\\", "/")
+    except Exception:
+        return {"ok": False, "status": "PERSISTENT_REGISTRY_PATH_OUTSIDE_DATA"}
 
     if os.name != "nt":
         try:
@@ -34314,7 +34332,11 @@ def start_central_runtime_once():
             else "PERSISTENT_REGISTRY_STARTUP_BLOCKED"
         )
         raise RuntimeError(f"CENTRAL_RUNTIME_STARTUP_BLOCKED:{reason}")
-    print("CENTRAL RUNTIME PHASE: registry_admission_passed", flush=True)
+    print(
+        "CENTRAL RUNTIME PHASE: registry_admission_passed "
+        f"status={admission.get('status')}",
+        flush=True,
+    )
 
     with CENTRAL_RUNTIME_LOCK:
         if CENTRAL_RUNTIME_STARTED:

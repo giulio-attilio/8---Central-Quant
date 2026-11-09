@@ -1,0 +1,202 @@
+# Revalidação de prontidão pessoal — 2026-11-09
+
+## Escopo e checkout
+
+- Serviço pessoal Central Quant/Falcon, um operador e uma conta; sem recursos comerciais.
+- Checkout: `codex/personal-readiness-release-20261104`, HEAD `c5aa9998d46dce6ab2f9472a82fccb014160c58b`.
+- Estado preexistente preservado: `docs/PERSONAL_STARTUP_AND_C3_NEED_ASSESSMENT_20261107.md` modificado e `wheelhouse/` não rastreado. Nenhum deles foi editado ou removido.
+- `git diff --check` estava limpo na revalidação. Nenhuma alteração de trading ou produção foi feita.
+
+## Evidências locais
+
+Executadas com seleções explícitas do runner offline, que bloqueia conexões de rede de saída, subprocessos e leitura de arquivos `.env`, salvo a suíte de ciclo de completude informada pelo usuário. Para seleções que precisam inicializar servidor de teste (`--extra` e `--telegram-notification-policy`), somente bind/listen em `127.0.0.1` é permitido; chamadas `connect` continuam bloqueadas.
+
+| Seleção | Resultado | Duração |
+|---|---:|---:|
+| `--personal-lifecycle-completeness` (informado pelo usuário) | 843 aprovados | 490,02 s |
+| `--c3-dormant-startup` | 24 aprovados, 3 subtestes aprovados | 504,85 s |
+| `--personal-http-auth` | 240 aprovados | 115,50 s |
+| `--personal-execution-safety` | 402 aprovados | 651,03 s |
+| `--trading-mode-defaults` | 9 aprovados | 26,99 s |
+| `--registry-lock-audit` | 1 aprovado, 59 selecionados fora | 56,95 s |
+| `--registry-writers` | 60 aprovados | 50,25 s |
+| `test_timeline_emergency_recovery.py::test_startup_integration_order_is_strictly_early` | 1 aprovado, 52 selecionados fora | 0,44 s |
+| `--paper-integrated-disk-guard` | 31 aprovados | 1,82 s |
+| `--static-runtime` | 30 aprovados | 338,37 s |
+| `--stop-readback` | 12 aprovados | 36,29 s |
+| `--paper-lifecycle-disk-failures` | 5 aprovados, 26 fora da seleção | 0,93 s |
+| `--paper-lifecycle-integration` | 110 aprovados, 1 excluído por depender de subprocesso | 6,25 s |
+| `--persistence-locks` | 39 aprovados | 439,17 s |
+| `--entry-fill-stop` | 37 aprovados | 6,53 s |
+| `--close-reconciliation` | 110 aprovados | 39,00 s |
+| `--initial-stop-containment` | 79 aprovados | 61,10 s |
+| `--personal-safety-no-ccxt` | 267 aprovados | 839,66 s |
+| `--market-data-throttle` | 93 aprovados | 14,12 s |
+| `--broker-paper-disk-guard` | 47 aprovados | 3,13 s |
+| `--finite-numeric` | 16 aprovados | 1,06 s |
+| `--initial-stop-cancel` | 85 aprovados | 43,39 s |
+| `--extra` | 934 aprovados, 1 pulado, 1 excluído por depender de subprocesso | 1.220,39 s |
+| `--drain-regression` | 174 aprovados | 338,45 s |
+| `--registry-sync` | 32 aprovados | 24,27 s |
+| `--can-open-risk` | 10 aprovados, 67 fora da seleção | 166,88 s |
+| `--predator-auto-closed-sync` | 19 aprovados | 84,20 s |
+| `--learning-cursor-guard` | 12 aprovados | 0,51 s |
+| `--telegram-notification-policy` | 73 aprovados | 199,73 s |
+| Seleção-base (sem argumentos) | 355 aprovados, 1 falhou | 908,80 s |
+
+Revalidação adicional em 2026-11-09, em novo ambiente virtual temporário. O ambiente anterior indicado pelo usuário já não existia; `ccxt==4.5.88` foi instalado exclusivamente dos wheels locais com `pip --no-index --find-links wheelhouse`, sem rede. O pytest já estava instalado no Python base, então o ambiente de teste o reutilizou sem alterar a instalação global:
+
+| Seleção | Resultado | Duração |
+|---|---:|---:|
+| `--stop-readback` | 12 aprovados | 74,43 s |
+| `--market-data-throttle` | 93 aprovados | 51,87 s |
+| `--broker-paper-disk-guard` | 47 aprovados | 14,83 s |
+| `--personal-http-auth` (reexecução) | 240 aprovados | 304,88 s |
+
+Esses testes passaram pelo runner que bloqueia chamadas de rede; não consultaram a BingX. A instalação local de dependências comprova apenas disponibilidade para teste, não conectividade ou prontidão operacional.
+
+A falha isolada foi `test_preflight_deadline_returns_without_waiting_for_blocked_collector`: no conjunto completo, mediu 0,510247 s frente ao limite de 0,5 s. Reexecutei o mesmo teste isoladamente sob o mesmo bloqueio de rede e ele passou (`1 passed` em 17,99 s); o módulo completo de preflight também passou (`56 passed` em 18,64 s). Isso é compatível com flutuação de agendamento sob carga, mas não prova a causa. Mantive o limite e o código inalterados; o resultado da seleção-base permanece registrado como falha, não como suíte verde.
+
+O `ccxt==4.5.88` está instalado no ambiente virtual temporário usado pelos testes; a consulta anterior que retornou “Package(s) not found” usou o Python global. O wheel compatível também existe em `wheelhouse/`. O teste `--stop-readback` foi executado pelo runner offline, sem chamada à corretora.
+
+O harness `tests/helpers/personal_registry_process_restart_probe_v1.py` foi executado diretamente no Windows e novamente no WSL2. Em ambos: `writer_process=PASS`, `fresh_reader_process=PASS`, marcador sintético lido por processo novo e limpeza do diretório temporário confirmada. Na execução WSL, o probe foi iniciado dentro de `unshare --user --map-root-user --net` (sem root), além de bloquear sockets no pai e nos filhos; o diretório temporário ficou no filesystem Linux do WSL. Isso comprova restart/consistência no ambiente local Linux isolado, mas não é prova do filesystem/disco persistente do Render, nem do comportamento exato de produção.
+
+Esses resultados são evidência de código/testes locais; não substituem teste de integração no Render, prova de durabilidade Linux em produção, nem ciclo com corretora.
+
+## Render — estado somente leitura
+
+- Workspace `tea-d8gnnuojo6nc73ep3lg0`; serviço `central-robos-bingx`, ID `srv-d8rtuv9o3t8c73ehav5g`.
+- Configuração observada: uma instância Standard, disco persistente `/data` de 4 GB, `python main.py`, auto-deploy desligado, ingresso `0.0.0.0/0`, subdomínio público e health-check do Dashboard vazio.
+- Último deploy consultado: `31f31c9d071398c0fd35b1167f0460020f9ce2fd`, status `live`; branch configurada no serviço: `codex/personal-readiness-20261103`.
+- Nova consulta somente de leitura ao histórico de deploys confirma que o release mais recente continua `31f31c9d071398c0fd35b1167f0460020f9ce2fd`, status `live`; `c5aa9998d46dce6ab2f9472a82fccb014160c58b` não aparece entre os cinco deploys mais recentes e não está publicado.
+- O código exato de `31f31c9` contém os hooks globais de Basic Auth, bloqueio de mutações por GET e prontidão de startup. A autenticação não deve ser descrita como ausente na release ativa. A helper `personal_http_auth.py` e os testes dedicados não diferem entre `31f31c9` e `c5aa999`.
+- A captura de Billing enviada pelo usuário mostrava 24,08/25 GB de banda incluída e 4/1.000 minutos de pipeline. Como a banda estava próxima do limite e não há leitura atual de faturamento, custo zero de um novo deploy não está comprovado. Nenhum deploy foi iniciado.
+- Consulta somente de leitura aos logs de aplicação retornou eventos recentes `STATIC_OPERATIONAL_RUNTIME_BLOCKED` para `predator_heavy_watchdog_audit`, `central_daily_historical_report` e tarefas históricas semelhantes, com razão `STATIC_OPERATIONAL_RUNTIME` (registros recebidos até 2026-11-09 17:51 UTC). O código local confirma que essa política suspende tarefas históricas em segundo plano; isso não equivale a erro de execução de ordens nem prova prontidão. Ainda é necessário confirmar se a suspensão é intencional para este serviço e se os controles automáticos essenciais continuam ativos. Não alterar a variável de política sem essa revisão.
+- Métricas Render consultadas em modo somente leitura em 2026-11-09, aproximadamente 17:34–18:34 UTC: uma instância em todos os pontos amostrados, CPU aproximadamente 5%, memória entre 0,66 e 0,77 GB e contagem agregada de respostas HTTP 200 nos intervalos. A agregação não identifica quais rotas responderam e não comprova runtime pronto, estado PAPER, nem entrada/fill/fechamento corretos.
+- Conferência somente leitura de Render em 2026-11-09 21:10 UTC: serviço `central-robos-bingx` segue no deploy `31f31c9d071398c0fd35b1167f0460020f9ce2fd` (`live`), uma instância, disco `/data` de 4 GB, `autoDeploy=no`, e allowlist `0.0.0.0/0`. Acesso aberto na rede não é evidência de acesso sem autenticação.
+- Teste HTTP externo sem credenciais, em 2026-11-09 21:13 UTC: `GET /`, `/trades` e `/execution_engine/health` retornaram `401` com `WWW-Authenticate: Basic`; `GET /healthz` retornou `200 {"ok":true,"status":"HTTP_LIVE"}` na repetição após erro de transporte inicial. Isso verifica a barreira HTTP no momento da consulta para as rotas amostradas e a exceção de liveness esperada; não é varredura de todas as rotas, teste de força bruta nem certificação completa de segurança.
+- Teste externo complementar, sem credenciais, às 21:16 UTC: `GET /healthz?probe=1`, `/HEALTHZ` e `/missing-route` retornaram `401` com desafio Basic. A exceção pública não foi reproduzida por query string, variação de caixa ou rota desconhecida.
+- Repetição local da suíte `--personal-http-auth`, runner com rede bloqueada: 240 aprovados em 304,88 s. Isso valida a lógica local; a amostragem HTTP externa acima valida somente as rotas efetivamente consultadas.
+- Comparação do código: entre `31f31c9` ativo e `c5aa999` local não há delta em `personal_http_auth.py`; o gate de autenticação está presente em ambas as versões. A diferença de `main.py` inclui propagação de `CENTRAL_DATA_DIR` e ajustes do índice de identidade do lifecycle PAPER, não uma nova implementação do gate HTTP.
+- Saída adicional do Render Shell fornecida pelo usuário: `trade_registry.json`, 16.285.084 bytes, modificado em `2026-11-07 11:03:49 UTC`, com 69 registros abertos, todos classificados como `PAPER`. O usuário confirmou que não há ordens/operações em andamento. Isso é uma confirmação do usuário sobre ordens, e uma leitura manual do Registry com timestamp de 7 de novembro; não demonstra estado atual da corretora, nem que o Registry esteja atualizado, nem que as 69 posições simuladas devam ser fechadas. Os controles foram informados como `ENABLE_REAL_TRADING=false`, `BROKER_DRY_RUN=true`, `FALCON_MODE=paper`; não foram verificados independentemente via integração.
+
+## Delta relevante entre produção e candidato local
+
+- `c5aa999` é descendente do SHA ativo, mas não está implantado.
+- O delta local inclui a propagação explícita de `CENTRAL_DATA_DIR` resolvido por `main.py` para os módulos PAPER que leem essa variável, além de gravação PAPER atômica/durável e coordenação compartilhada por lock nos módulos correspondentes.
+- Inspeção de fluxo no checkout: os bots gravam posições PAPER no Registry por `trade_registry.register_open_trade`; o executor PAPER integrado do Execution Engine mantém ledger e cache de idempotência próprios (`paper_integrated_positions.json` e `paper_integrated_seen.json`). A ausência desses dois arquivos não autoriza copiar/importar os 69 registros PAPER do Registry para o executor: são autoridades/formatos separados, sem prova de equivalência de identidade. O ajuste de diretório alinha arquivos futuros do executor a `/data`, mas não migra nem fecha posições do Registry.
+- O teste estrutural offline confirmou que o candidato exporta o diretório resolvido antes da inicialização de recuperação, dos escritores de startup e da importação do executor PAPER.
+- O usuário informou que não encontrou `CENTRAL_DATA_DIR` em Render → Environment. O código exato ativo confirma que `paper_executor_integrated.py`, `paper_lifecycle.py` e `outcome_evaluator.py` leem essa variável e usam como fallback `/opt/render/project/src/data`; `main.py` resolve `/data` internamente, mas o SHA ativo não exporta o valor para esses módulos. Isso cria divergência de caminhos; a consulta posterior confirmou ausência dos quatro arquivos canônicos listados abaixo em ambos os diretórios, mas ainda não a ausência de posições no Registry principal.
+- Saída do Render Shell fornecida pelo usuário nesta conversa: `paper_integrated_positions.json`, `paper_integrated_seen.json`, `paper_integrated_executor_log.jsonl` e `paper_lifecycle_log.jsonl` ausentes tanto em `/opt/render/project/src/data` quanto em `/data`. Isso comprova apenas ausência desses quatro arquivos nesses diretórios no momento da consulta; não prova que o Registry principal esteja sem trades abertos nem exclui eventual caminho sobrescrito por `TRADE_REGISTRY_FILE`.
+- Não mover, copiar, apagar nem migrar dados em `/data` como parte desta auditoria. Antes de trocar o caminho, conferir presença/tamanho/quantidade de registros PAPER em `/opt/render/project/src/data` e `/data`, sem imprimir conteúdo. Qualquer mudança de release deve preservar a inicialização PAPER e ser verificada contra o disco persistente.
+
+## C3 — necessidade para uso pessoal
+
+- A configuração observada permanece em uma instância e um serviço com disco exclusivo; `main.py` é o comando de startup.
+- A inspeção estática local não encontrou criação de processos filhos (`multiprocessing`, `subprocess`, `Popen` ou `os.fork`) no caminho principal auditado; o Registry usa lock compartilhado em processo. A auditoria offline de writers passou 60 testes e o lock-audit passou.
+- A suíte de integração de startup C3 dormente passou. Isso não demonstra HEAD/assinatura/checkpoint de produção.
+- Não há evidência concreta atual de requisito distribuído para um operador/uma conta. Manter signer/lease/C3 distribuído dormente e fora do caminho crítico; reavaliar se a topologia passar a ter múltiplos processos/instâncias ou armazenamento compartilhado.
+
+## Limites e bloqueios restantes
+
+1. A barreira HTTP está atualmente confirmada por leitura de código, suíte dedicada (240 aprovados) e amostragem externa sem credenciais (401 em três rotas privadas). O acesso de rede segue aberto e `/healthz` é público, deliberadamente mínimo. Isso não substitui auditoria de todas as rotas nem revisão de segredos configurados; nenhum segredo foi consultado.
+2. O usuário informou via Render Shell `ENABLE_REAL_TRADING=false`, `BROKER_DRY_RUN=true`, `FALCON_MODE=paper`; nenhum segredo foi consultado e nenhum controle foi alterado. A última leitura manual do Registry contou 69 registros abertos todos `PAPER`, com arquivo modificado em 7 de novembro. O usuário afirma não haver ordens/operações; falta esclarecer se essas 69 posições PAPER são apenas simulações históricas/ativas e se devem permanecer abertas. Não tratar “sem ordens reais” como “Registry PAPER vazio”.
+3. O candidato local ainda não corresponde ao release ativo. Os quatro arquivos do Paper Executor/Lifecycle estão ausentes nos dois caminhos consultados, mas o Registry principal contém os 69 registros PAPER citados acima. Não trocar o caminho nem inicializar/migrar esses arquivos até avaliar a relação entre os ledgers e confirmar qual estado PAPER se espera preservar.
+4. A regra geral da meta é não publicar quando houver custo possível/incerto. A autorização financeira específica posterior, registrada no aditivo abaixo, permite somente o deploy de `c5aa999` até US$ 5; permanece necessária confirmação operacional recente de que não há ordens/operações e de que a interrupção é segura.
+5. Restam verificações de integração/runtime de entrada, fill, posição, disaster-stop, fechamento e reconciliação. As suítes locais cobrem contratos e falhas simuladas; não são evidência de operação real nem autorizam LIVE.
+6. A política estática também bloqueia `predator_auto_closed_sync_v1_tick`, além de relatórios/resumos históricos, aprendizado automático e snapshots históricos pesados. O loop do watchdog continua chamando `central_watchdog_status()` e enviando alertas; o bloqueio é no complemento de auditoria/reparo PAPER pesado, não no loop de alerta nem diretamente na execução de ordens. O reparo só comita se os dados de fechamento forem inequívocos e os interlocks PAPER/armazenamento passarem, usa lock e limita a 3 registros por ciclo; o endpoint manual usa `automatic=False` e commit exige ACK. A política pode proteger recursos, então não é seguro desligá-la globalmente sem medir custo/uso. Falta decidir operacionalmente se a reconciliação automática pesada é indispensável; sua ausência é um limite de reconciliação de dados, não evidência de falha do executor.
+
+## Segurança de trading
+
+Não alterar `ENABLE_REAL_TRADING`, `BROKER_DRY_RUN` ou `FALCON_MODE`; não rear-mar LIVE nem emitir ordens reais. Esta revalidação não ativa C3, não lê segredos, não consulta endpoints de trading e não modifica AWS, Render ou o disco.
+
+## Aditivo — reexecução local e autorização específica (2026-11-09)
+
+- Checkout reconferido antes dos testes: branch `codex/personal-readiness-release-20261104`, HEAD `c5aa9998d46dce6ab2f9472a82fccb014160c58b`. Permaneceram intactos os arquivos modificados e não rastreados listados no início deste relatório.
+- O ambiente `C:\Users\giuli\AppData\Local\Temp\cq-ccxt-test-fe081ad323ad47159e14d4d333ae4ea2` informado num comando anterior já não continha `Scripts\python.exe`. O venv funcional foi localizado em `C:\Users\giuli\AppData\Local\Temp\cq-offline-tests-20261109\Scripts\python.exe`; nele, `pip show ccxt` confirmou a versão 4.5.88. A instalação é temporária e não alterou o Python global.
+- Reexecução pelo runner offline no checkout acima: `--personal-lifecycle-completeness`: 843 aprovados em 584,24 s; `--entry-fill-stop`: 37 aprovados em 2,20 s; `--close-reconciliation`: 110 aprovados em 20,97 s; `--persistence-locks`: 39 aprovados em 321,96 s. O runner bloqueia rede de saída. Esses resultados são locais, não provam comportamento no disco Render ou com a corretora.
+- Reexecução adicional do gate estático: `--static-runtime`: 30 aprovados em 376,70 s, usando o mesmo runner com rede bloqueada. O teste confirma a política local de suspensão e os guardas do loop; não confirma que todas as tarefas operacionais essenciais estão corretamente habilitadas em produção.
+- Reexecução adicional do gate HTTP: `--personal-http-auth`: 240 aprovados em 107,69 s, pelo runner com rede bloqueada. A inspeção estática complementar confirma que o hook de autenticação é global; isto não amplia a amostragem de rotas observada externamente nem comprova a configuração atual de credenciais no serviço.
+- `git diff --check` passou depois dos testes; não houve alterações de código causadas pela execução.
+- Consulta somente de leitura ao Render repetida após os testes: serviço `central-robos-bingx`, uma instância Standard, disco `/data` de 4 GB, auto-deploy desligado; o deploy mais recente continua sendo `31f31c9d071398c0fd35b1167f0460020f9ce2fd` (`live`).
+- Auditoria local da política `CENTRAL_STATIC_OPERATIONAL_RUNTIME_ENABLED`: o modo estático não encerra `central_watchdog_loop`, que continua calculando status e alertando, mas impede a auditoria/reparo automático de fechamentos PAPER via `predator_auto_closed_sync_v1_tick`; também suprime relatório diário histórico, resumo diário TrendPro e refresh automático do Learning. A rota manual de auto-close sync não desliga a política; ela calcula preview e requer POST/ACK para commit. Não alterei a variável nem executei o reparo, pois isso pode gravar o Registry.
+- O usuário autorizou uma exceção financeira de até US$ 5 para publicar exatamente `c5aa9998d46dce6ab2f9472a82fccb014160c58b`. Esta autorização específica resolve o bloqueio financeiro somente para esse deploy; não altera a regra geral de custo nem autoriza outro SHA.
+- O deploy ainda não foi iniciado. Aguarda confirmação operacional atual de que não há posições, ordens ou operações em andamento e de que a breve interrupção da instância com disco persistente é segura. Rollback de código conhecido: `31f31c9`; os dados em `/data` não serão revertidos pelo rollback de código.
+
+## Aditivo — confirmação operacional e bloqueio do painel (2026-11-09)
+
+- Correção do item 4 dos limites e da última linha do aditivo anterior: o usuário confirmou explicitamente “Sim, sem operações” e que a interrupção breve é segura, além de autorizar até US$ 5 para publicar exatamente `c5aa9998d46dce6ab2f9472a82fccb014160c58b`. Não falta autorização financeira nem confirmação operacional para esse alvo.
+- Nova leitura somente de leitura via Render MCP confirmou o serviço `central-robos-bingx` ainda no deploy `31f31c9d071398c0fd35b1167f0460020f9ce2fd` (`live`), com auto-deploy desligado, uma instância e disco persistente `/data` de 4 GB. Os cinco deploys mais recentes não incluem `c5aa999`.
+- A seleção da aba autenticada do Render no Chrome falhou pelo controle de interface; o navegador também negou abrir o painel no browser integrado por uma permissão salva que bloqueia esse acesso. Nenhuma submissão de deploy ocorreu. Não foi usada rota alternativa nem contornada a política do navegador.
+- Próxima ação externa: o usuário deve publicar manualmente o SHA completo no Dashboard: **Manual Deploy → Deploy a specific commit**, conferir o SHA retornado e confirmar **Deploy commit**. Após isso, a verificação de status/SHA poderá ser feita por leitura somente no Render MCP. O rollback de código conhecido continua `31f31c9`; rollback de código não reverte `/data`.
+- Probe hermético adicional da função `_resolve_central_data_dir` no `main.py`: 4/4 casos passaram (prioridade de `CENTRAL_DATA_DIR`, fallback a `DATA_DIR`, montagem `/data` detectada e fallback local quando `/data` não existe). Conexões de rede foram substituídas por falha imediata e nenhuma escrita foi feita; fixtures usaram apenas diretório temporário.
+- Em 2026-11-09, GitHub Central Quant (consulta somente de leitura) retornou o commit remoto exato `c5aa9998d46dce6ab2f9472a82fccb014160c58b`, título `perf(predator): index closed lifecycle audit candidates`. Isso confirma que o objeto existe no repositório conectado; não comprova que esteja selecionável ou implantado no Render. Render continua em `31f31c9` na leitura contemporânea.
+- Verificação GitHub somente de leitura do SHA `c5aa9998d46dce6ab2f9472a82fccb014160c58b`: status combinado sem statuses e endpoint de check-runs com `total_count=0`; não existe CI remoto publicado para este commit.
+- Reexecução da suíte específica `--predator-auto-closed-sync` com `tests/run_falcon_pilot_minimal_offline.py`, executada a partir da raiz do checkout: `19 passed` em 103,11 s, rede bloqueada pelo runner. Uma tentativa anterior fora da raiz falhou por resolução relativa de `main.py` (`FileNotFoundError`); repetida na raiz, a suíte passou. Nenhuma falha de teste de aplicação foi observada na repetição correta.
+
+## Aditivo — revalidação de autenticação e estado Render (2026-11-09)
+
+- Reexecução de `tests/run_falcon_pilot_minimal_offline.py --personal-http-auth` no HEAD acima, pelo venv temporário `cq-offline-tests-20261109`: `240 passed` em 139,37 s. O runner bloqueia chamadas de rede. Não foram consultados endpoints da corretora nem valores de credenciais.
+- Revisão do código: `central_personal_http_auth_before_request` é um hook Flask global declarado antes das rotas; a exceção pública segue limitada a `GET /healthz` sem query, e as demais rotas passam pelos hooks globais de autenticação, bloqueio de mutação via GET e prontidão runtime. A suíte também contém a asserção estrutural de ordenação dos hooks antes das rotas. Isso continua sendo evidência de código/teste, não auditoria dinâmica de toda rota no Render.
+- Nova leitura somente de leitura via Render MCP: serviço `central-robos-bingx`, branch `codex/personal-readiness-20261103`, auto-deploy desligado, uma instância Standard e disco persistente `/data` de 4 GB; deploy mais recente ainda `31f31c9d071398c0fd35b1167f0460020f9ce2fd` (`live`). Sem alterações externas nesta consulta.
+- O SHA autorizado `c5aa9998d46dce6ab2f9472a82fccb014160c58b` ainda depende de seleção/confirmação manual no Dashboard porque a interface de navegador disponível negou acesso ao painel. Não contornei essa barreira e nenhum deploy foi iniciado.
+- O comando anterior do usuário apontava para um venv temporário já ausente (`cq-ccxt-test-fe081ad...`). O executável ainda existente para testes locais é `C:\Users\giuli\AppData\Local\Temp\cq-offline-tests-20261109\Scripts\python.exe`; isso não altera a instalação Python global.
+- Amostra dinâmica somente de leitura dos logs de requisição Render, 2026-11-09 21:13–21:17 UTC, enquanto o release mais recente consultado permanecia `31f31c9`: sem credenciais, `GET /`, `/trades`, `/execution_engine/health`, `/healthz?probe=1`, `/HEALTHZ` e `/missing-route` receberam HTTP 401. As amostras são evidência da barreira global nesses caminhos/variantes, não de cobertura exaustiva de cada rota nem de autenticação bem-sucedida.
+- Em conjunto, a suite local de 240 testes e esses 401 em produção sustentam a autenticação pública básica no release atual. Ainda falta provar rotação/validade controlada das credenciais sem expor valores e validar comportamento autenticado seguro; nenhum segredo foi lido.
+- Janela de liveness: 12 respostas `GET /healthz` HTTP 200 entre 2026-11-09 21:25 e 22:20 UTC, em intervalos aproximados de cinco minutos. A consulta de eventos Render de 2026-11-08 22:23 a 2026-11-09 22:23 UTC retornou lista vazia. Isto sustenta disponibilidade/listener durante essa janela, não saúde de trading ou ausência de incidentes fora da janela.
+- Leitura atual de deploy continuou em `31f31c9d071398c0fd35b1167f0460020f9ce2fd`; `c5aa9998d46dce6ab2f9472a82fccb014160c58b` não aparece no Render. O auto-deploy permanece desligado.
+- Logs do boot de `31f31c9`, às 2026-11-07 19:46 UTC, registram sete módulos habilitados como carregados (TrendPro, Donkey, Cobra, Meme, Predator, Turtle e Falcon) e, para cada um, `BOT STARTUP WORKERS BEGIN` seguido de `BOT STARTUP WORKERS COMPLETE`. Isso identifica o conjunto daquele boot, não confirma saúde contínua de cada worker, credenciais, modo de execução em runtime ou permissão de LIVE. Não lemos variáveis de ambiente nem secrets.
+- Revisão de dados para o delta `c5aa999`: `paper_executor_integrated.py`, `paper_lifecycle.py` e `outcome_evaluator.py` compartilham `paper_integrated_positions.json` e o lock em processo. O Registry PAPER (inclusive o caminho Turtle/V2) usa o backend/schema distinto `trade_registry.json`/WAL. O delta não importa nem migra os registros do Registry; a mudança em `main.py` apenas propaga o diretório selecionado como `CENTRAL_DATA_DIR` para os módulos importados.
+- Conforme a saída de Shell fornecida pelo usuário, os quatro arquivos PAPER integrados estavam ausentes tanto no caminho do código quanto em `/data`, enquanto o Registry tinha 69 registros abertos `PAPER`. A publicação não deveria sobrescrever o Registry, mas o Paper Executor/Lifecycle integrado pode começar com ledger vazio e distinto; portanto ainda não há reconciliação entre as 69 linhas existentes e esse subsistema. Não inicializar/migrar dados nem tratar `/paper_lifecycle/positions` como visão completa do Registry sem decidir essa semântica.
+- Refinamento da auditoria estática: no Falcon, `execute_signal_if_allowed()` retorna pela ramificação `PAPER` sem chamar `run_execution_engine`; o fluxo de sinal aceito persiste via posição/Registry Falcon. O executor integrado só escreve quando o Execution Engine recebe uma chamada `mode=PAPER` e sua flag independente `CENTRAL_PAPER_EXECUTION_ENABLED` está habilitada; o ciclo PAPER também expõe rota de atualização manual autenticada. Não encontrei inicialização/importação dos 69 registros para os arquivos integrados no startup. Logo, publicar o path para `/data` não deve, por si só, criar um ledger PAPER vazio nem alterar o Registry; os dois estados seguem separados até uma chamada explícita ao outro executor.
+- Reexecução offline dirigida do delta de persistência PAPER: `--paper-integrated-disk-guard`: `31 passed` em 3,94 s; `--paper-lifecycle-disk-failures`: `5 passed, 26 deselected` em 1,02 s. Ambos executados pelo runner que bloqueia rede; fixtures de escrita são temporários. Não foi exercitada a instância Render nem consultada a corretora.
+- Reexecução da seleção ampla `--personal-execution-safety` no mesmo HEAD e venv: `402 passed` em 811,02 s. Inclui preflight fail-closed, cancelamento/entrada/fill/stop, gerenciamento Falcon, contratos de writer, leitura de stop, reconciliação de fechamento/posição e rotas de disaster stop. Executada pelo runner offline, sem chamada à corretora, sem operações reais e sem mudança de controles. Evidência local somente; não substitui a validação dinâmica do release implantado.
+
+## Monitoramento Render — 2026-11-09 22:52 UTC (somente leitura)
+
+- Workspace conferido como `My Workspace`; serviço exato `central-robos-bingx` (`srv-d8rtuv9o3t8c73ehav5g`), repo `giulio-attilio/8---Central-Quant`, branch `codex/personal-readiness-20261103`. Estado atual: deploy `31f31c9d071398c0fd35b1167f0460020f9ce2fd` (`live`), auto-deploy desligado, uma instância Standard, disco `/data` de 4 GB. `c5aa999` ainda não foi publicado.
+- Configuração exposta pelo inventário Render: ingress público `0.0.0.0/0` e nenhum `healthCheckPath` HTTP configurado. Métricas de 21:52–22:53 UTC mostram uma instância, CPU em ~4,6–4,9% de 1 vCPU e memória ~709–779 MB de limite 2 GiB. As métricas HTTP registram respostas 200 periódicas de health check/cron; não demonstram prontidão de trading.
+- Consulta de requests entre 19:00–22:52 UTC encontrou seis `GET` sem autenticação em rotas diversas (`/`, `/trades`, `/execution_engine/health`, `/healthz?probe=1`, `/HEALTHZ`, `/missing-route`), todos 401. Isso demonstra a barreira para essas amostras específicas, não todas as rotas nem autenticação válida. A consulta de erros trouxe 502 antigos de 2026-11-07 ligados à janela de deploy; não foi observada amostra posterior nessa consulta.
+- Custo: a documentação atual do Render informa que deploy consome pipeline minutes; serviço com disco persistente não tem zero-downtime; a opção Dashboard para SHA específico desliga auto-deploy. A publicação exata de `c5aa999` permanece pendente de ação manual no Dashboard, dentro da exceção financeira já autorizada pelo usuário (até US$ 5). Reconfirmar ausência de operações imediatamente antes do clique. A última leitura continua em `31f31c9`; rollback de código conhecido `31f31c9` não reverte `/data`.
+
+## Revalidação do inventário de writers e startup — 2026-11-09
+
+- No mesmo HEAD `c5aa999`, `--registry-writers` terminou com `60 passed` em 68,87 s pelo runner offline. É evidência de contratos locais de escritores/RMW, não de que 19 writers estejam ativos no Render nem de ausência de escritores externos.
+- Inspeção do `main.py`: startup de bots é guardado por `CENTRAL_RUNTIME_LOCK`/`CENTRAL_RUNTIME_STARTED`; todos os módulos habilitados são importados antes de iniciar threads e qualquer import/hook incompleto aborta o startup; readiness só sobe após conclusão dos starters habilitados. O processo também usa `fcntl.flock` em arquivos sob `CENTRAL_DATA_DIR` para lideranças de loops específicos quando múltiplos processos disputarem o mesmo volume. Isso não equivale a um lease distribuído nem prova proteção de todos os writers contra outros serviços.
+- A topologia Render observada segue uma única instância no serviço Central e um disco local `/data`; o código inicia várias threads no mesmo processo. Para esse desenho pessoal, coordenação distribuída C3 continua sem necessidade concreta demonstrada; manter C3 dormente é proporcional. A existência de 19 entradas no inventário C3 é contrato da implementação, não contagem de processos ativos.
+- O C3 não foi ativado e o Registry não foi lido, migrado ou reescrito nesta revalidação.
+- Auditoria do runner `tests/run_falcon_pilot_minimal_offline.py`: substitui sockets/conexões externas, DNS, HTTP/urllib e subprocessos por falha; bloqueia leitura de `.env`; desliga autostart do runtime e direciona os stores para `TemporaryDirectory`. Para as duas seleções que precisam de servidor de teste, só permite bind em `127.0.0.1`; `connect` permanece bloqueado. A seleção `--personal-execution-safety` e `--registry-writers` não são exceções de loopback. Isso valida a alegação de isolamento usada nos resultados acima; a alteração preexistente de 5 linhas no runner foi preservada.
+
+## Aditivo — deploy `c5aa999` e verificações subsequentes (2026-11-09)
+
+- O Render confirmou o deploy manual do SHA exato `c5aa9998d46dce6ab2f9472a82fccb014160c58b` no serviço `central-robos-bingx`, estado `live`, duração 1 min 26 s. O deploy anterior `31f31c9` foi substituído. O custo efetivo ainda não foi consultado; havia autorização específica do usuário até US$ 5 para este SHA.
+- Probe público somente leitura de `GET /healthz`: HTTP 200, corpo `{"ok":true,"status":"HTTP_LIVE"}`. Isso verifica listener/liveness HTTP, não readiness de trading, reconciliação ou corretora.
+- Logs do boot do novo release registram `BOT STARTUP WORKERS COMPLETE` para Turtle e Falcon. Também registram bloqueio intencional `STATIC_OPERATIONAL_RUNTIME_BLOCKED` para `predator_heavy_watchdog_audit`; o loop principal do watchdog permanece, mas a auditoria/reconciliação pesada de fechamentos PAPER não roda automaticamente sob essa política. Nenhuma variável de ambiente foi alterada nem segredo consultado.
+- No HEAD implantado, o runner hermético `tests/run_falcon_pilot_minimal_offline.py --predator-auto-closed-sync` terminou com `19 passed` em 100,49 s; `--static-runtime` terminou com `30 passed` em 378,01 s. Ambos executaram com bloqueio de rede e fixtures locais/temporárias. Os testes validam contratos e lógica local, não a reconciliação do Registry de produção.
+- `git diff --check` terminou sem erros. Permanecem preservados o arquivo modificado `docs/PERSONAL_STARTUP_AND_C3_NEED_ASSESSMENT_20261107.md`, a alteração preexistente de cinco linhas no runner e o diretório não rastreado `wheelhouse/`.
+- Próximo bloqueio: decidir com evidência operacional e de custo se a reconciliação automática pesada deve permanecer bloqueada; não desligar `CENTRAL_STATIC_OPERATIONAL_RUNTIME_ENABLED` sem essa revisão. Permanecem também sem comprovação dinâmica os ciclos completos de entrada/fill/posição/stop/fechamento/reconciliação no release publicado e a correspondência do PAPER ledger integrado com as 69 linhas PAPER abertas reportadas do Registry. Não ativar C3 nem LIVE.
+
+## Aditivo — revalidação de autenticação e instância do deploy (2026-11-09 23:16 UTC)
+
+- GETs sem credenciais no serviço público retornaram: `/healthz` = 200 (`HTTP_LIVE`); `/`, `/trades` e `/execution_engine/health` = 401 (`PRIVATE_HTTP_AUTH_REQUIRED`). Nenhuma rota de escrita foi chamada.
+- Na instância pós-deploy `srv-d8rtuv9o3t8c73ehav5g-48r68`, os logs mostram `STATIC OPERATIONAL RUNTIME enabled=True`, `historical_background_tasks=False` e `predator_heavy_watchdog_audit=False`. Isso confirma o modo efetivo sem consultar valores do ambiente; não se alterou a configuração.
+- O mesmo boot registrou início e conclusão dos workers dos sete módulos habilitados (TrendPro, Donkey, Cobra, Meme, Predator, Turtle e Falcon) e quatro mensagens `SCANNER INICIADO`. Isso comprova os eventos de inicialização, não atividade contínua, preenchimentos ou reconciliação. Não apareceram registros contendo `error` no filtro da janela 23:04–23:16 UTC.
+- Alertas de watchdog de scanners com último timestamp de 7/nov vieram da instância substituída; não os atribuir ao estado corrente. A nova instância não apresentou esses alertas na janela consultada. Ainda é necessário observar heartbeats posteriores para provar atividade sustentada.
+- O registro direto do modo estático elimina a necessidade de o usuário procurar e copiar `CENTRAL_STATIC_OPERATIONAL_RUNTIME_ENABLED` só para identificar o estado. Qualquer alteração dessa política permanece pendente de avaliação de recursos/custo e de risco; nenhum deploy ou reinício adicional foi iniciado.
+- Nuance da admissão de persistência: em `main.py`, `_central_persistent_registry_startup_admission_v1()` retorna `ok=True` com `NON_PERSISTENT_PATH_NOT_GATED` se o caminho resolvido não começar por `/data/`; nesse caso, o log genérico `registry_admission_passed` não prova sozinho montagem/uso do disco persistente. O resolver prefere `CENTRAL_DATA_DIR`/`DATA_DIR`, depois usa `/data` quando o diretório existe. Não lemos os valores desses ambientes. Para fechar esta evidência sem revelar valores, ainda é necessária uma inspeção manual que mostre apenas se esses nomes estão unset, `/data` ou outro caminho, além de `mountpoint` e metadados do Registry.
+
+## Aditivo — endurecimento local da admissão de Registry no Render
+
+- Confirmei na documentação oficial que Render fornece `RENDER=true` e `RENDER_SERVICE_ID` ao serviço. Referência: https://render.com/docs/environment-variables.
+- No checkout `c5aa9998d46dce6ab2f9472a82fccb014160c58b`, alterei localmente `main.py` para falhar fechado quando a identidade Render está presente e o Registry aponta para fora de `/data/`; ambientes locais sem identificação Render mantêm o caminho de desenvolvimento. O log de admissão agora inclui o status retornado, evitando que `NON_PERSISTENT_PATH_NOT_GATED` pareça comprovar o disco persistente.
+- Cobertura adicionada a `tests/test_main_runtime_drain_contract_v1.py` para `RENDER=true`, `RENDER_SERVICE_ID`, caminho local e as validações existentes de mount/arquivo/schema. `tests/run_falcon_pilot_minimal_offline.py --persistence-locks`: `39 passed` em 501,52 s, com rede bloqueada e persistência temporária; `py_compile` e `git diff --check` passaram.
+- Esta correção permanece sem commit/deploy. A release Render continua no `c5aa999` já publicado; a autorização/confirmação anterior para esse SHA não cobre a nova alteração. Custo de qualquer novo deploy não está confirmado como zero, então não publiquei.
+
+## Aditivo — confirmação de persistência Render e teste de escape de caminho (2026-11-09)
+
+- A saída de Shell fornecida pelo usuário confirma, sem revelar valores sensíveis: `CENTRAL_DATA_DIR` e `TRADE_REGISTRY_FILE` unset; `DATA_DIR` aponta para `/data`; `/data` é mountpoint. O disco tem 4 GB, 1,9 GB usados e 2,1 GB livres (48%). `/data/trade_registry.json` existe, com 16.285.084 bytes e modificação em 2026-11-07 11:03:49 UTC.
+- `paper_integrated_positions.json` e `paper_integrated_seen.json` estão ausentes em `/data`. Isso não demonstra perda do Registry principal e não autoriza criar/importar posições; o Registry e o ledger integrado continuam sendo stores distintos.
+- Endureci adicionalmente a validação local para canonicalizar o caminho ativo e exigir que ele permaneça dentro de `/data`, rejeitando traversal como `/data/../...` e caminhos resolvidos para fora do mount. A mudança segue não implantada.
+- A seleção focalizada `tests/run_falcon_pilot_minimal_offline.py --registry-startup-admission` passou: `1 passed, 19 deselected` em 27,45 s. `py_compile`, `git diff --check` e a suíte prévia `--persistence-locks` (`39 passed`) também passaram; todos os testes relevantes foram herméticos, sem egress, com filesystem temporário quando aplicável.
+- Estado preservado após a validação: branch `codex/personal-readiness-release-20261104`, HEAD `c5aa9998d46dce6ab2f9472a82fccb014160c58b`. As alterações preexistentes e não rastreadas continuam intactas. Nenhum commit, push, deploy, leitura de secret ou alteração de controle PAPER/LIVE foi feito.
+- Próximo bloqueio é exclusivamente publicar/revalidar a correção local: a autorização financeira e operacional anterior era para `c5aa999`, já em produção, não para um novo release. O custo do novo deploy não foi confirmado como zero; portanto a mudança permanece fora da produção. Se houver nova publicação, exigir autorização específica de alvo/custo e reconfirmar operação segura, depois validar SHA, startup fail-closed e liveness sem confundir HTTP live com readiness de trading.

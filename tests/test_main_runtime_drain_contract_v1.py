@@ -1,4 +1,5 @@
 import ast
+import posixpath
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -456,11 +457,27 @@ def test_persistent_registry_startup_admission_requires_mount_file_and_schema():
         def is_file(self):
             return self.file_available
 
+        def resolve(self):
+            return FakePath(posixpath.normpath(self.value))
+
+        def relative_to(self, other):
+            relative = posixpath.relpath(self.value, str(other))
+            if relative == ".." or relative.startswith("../"):
+                raise ValueError("path escapes persistent data root")
+            return FakePath(relative)
+
     registry = {"version": "synthetic-v1", "open_trades": {}, "closed_trades": []}
+    active_path = ["/data/trade_registry.json"]
+    runtime_environment = {}
+
+    class FakeOs:
+        name = "posix"
+        environ = runtime_environment
+
     namespace = {
         "Path": FakePath,
-        "os": type("PosixOs", (), {"name": "posix"}),
-        "_trpsf_v1_active_file": lambda: "/data/trade_registry.json",
+        "os": FakeOs,
+        "_trpsf_v1_active_file": lambda: active_path[0],
         "_trpsf_v1_read_json": lambda _path: registry,
         "_trpsf_v1_registry_shape_errors": lambda _registry: [],
     }
@@ -477,6 +494,21 @@ def test_persistent_registry_startup_admission_requires_mount_file_and_schema():
 
     namespace["_trpsf_v1_registry_shape_errors"] = lambda _registry: ["OPEN_TRADES_INVALID_SHAPE"]
     assert admission()["status"] == "PERSISTENT_TRADE_REGISTRY_INVALID_SHAPE"
+
+    active_path[0] = "/opt/render/project/src/data/trade_registry.json"
+    runtime_environment.clear()
+    assert admission()["status"] == "NON_PERSISTENT_PATH_NOT_GATED"
+
+    runtime_environment["RENDER"] = "true"
+    assert admission()["status"] == "PERSISTENT_REGISTRY_PATH_NOT_PERSISTENT"
+
+    runtime_environment.clear()
+    runtime_environment["RENDER_SERVICE_ID"] = "srv-test"
+    assert admission()["status"] == "PERSISTENT_REGISTRY_PATH_NOT_PERSISTENT"
+
+    active_path[0] = "/data/../opt/render/project/src/data/trade_registry.json"
+    runtime_environment.clear()
+    assert admission()["status"] == "PERSISTENT_REGISTRY_PATH_OUTSIDE_DATA"
 
 
 def test_predator_entry_flow_tracks_post_broker_lifecycle_updates():
