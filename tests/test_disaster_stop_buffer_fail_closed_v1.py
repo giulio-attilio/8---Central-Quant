@@ -292,6 +292,19 @@ def test_paper_entry_stays_preview_only_without_live_preflight_or_exchange(monke
     monkeypatch.setattr(broker, "is_real_live_send_enabled", lambda: False)
     monkeypatch.setattr(
         broker,
+        "broker_paper_persistence_guard_v1_validate",
+        lambda: {
+            "ok": True,
+            "allowed": True,
+            "status": "PAPER_PERSISTENCE_READY",
+            "free_bytes": broker.BROKER_PAPER_MIN_FREE_DISK_BYTES,
+            "minimum_free_bytes": broker.BROKER_PAPER_MIN_FREE_DISK_BYTES,
+            "disk_measurement_ok": True,
+            "error_type": None,
+        },
+    )
+    monkeypatch.setattr(
+        broker,
         "execution_config_for_bot",
         lambda **_kwargs: {
             "margin_usdt": 10.0,
@@ -317,8 +330,8 @@ def test_paper_entry_stays_preview_only_without_live_preflight_or_exchange(monke
             "actual_exposure_usdt": 10.0,
         },
     )
-    monkeypatch.setattr(broker, "log_execution_event", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(broker, "log_execution_audit_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(broker, "log_execution_event", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(broker, "log_execution_audit_event", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         broker,
         "_live_disaster_stop_preflight",
