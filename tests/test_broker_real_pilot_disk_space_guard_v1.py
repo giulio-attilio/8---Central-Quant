@@ -142,8 +142,12 @@ def test_paper_persistence_guard_fails_closed_when_disk_is_unknown(guard_namespa
     assert "sensitive" not in str(result).lower()
 
 
-def test_paper_persistence_guard_allows_margin_and_probe_is_read_only(guard_namespace, tmp_path):
+def test_paper_persistence_guard_allows_margin(guard_namespace, tmp_path):
     guard_namespace["CENTRAL_DATA_DIR"] = tmp_path
+    guard_namespace["_broker_rpg_v1_persistent_disk_space"] = lambda: {
+        "ok": True, "path": str(tmp_path), "total_bytes": 2_000_000_000,
+        "used_bytes": 1_400_000_000, "free_bytes": 600_000_000,
+    }
     result = guard_namespace["broker_paper_persistence_guard_v1_validate"]()
 
     assert result["allowed"] is True

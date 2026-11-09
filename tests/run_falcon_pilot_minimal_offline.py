@@ -237,6 +237,8 @@ if __name__ == "__main__":
             "test_falcon_central_only_reconciliation.py",
             "test_falcon_manual_close_outcome_reconciliation_v1.py",
         )
+    elif sys.argv[1:] == ["--learning-cursor-guard"]:
+        cases = ("test_executive_policy_learning_cursor_guard_v1.py",)
     elif sys.argv[1:] == ["--persistence-locks"]:
         cases = (
             "test_trade_registry_atomic_durable_write_v1.py",
@@ -348,6 +350,8 @@ if __name__ == "__main__":
     elif sys.argv[1:] == ["--trading-mode-defaults"]:
         filters = []
     elif sys.argv[1:] == ["--personal-http-auth"]:
+        filters = []
+    elif sys.argv[1:] == ["--learning-cursor-guard"]:
         filters = []
     elif sys.argv[1:] == ["--persistence-locks"]:
         filters = []
