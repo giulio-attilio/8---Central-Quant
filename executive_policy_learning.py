@@ -402,7 +402,20 @@ def run_executive_policy_learning(context=None, commit=True, max_events=None):
     state = _load_state()
     stats = _load_stats()
 
-    offset = _safe_int(state.get("timeline_offset"), 0)
+    raw_offset = state.get("timeline_offset", 0)
+    error = None
+    try:
+        if isinstance(raw_offset, bool):
+            raise ValueError("boolean cursor")
+        if isinstance(raw_offset, int):
+            offset = raw_offset
+        elif isinstance(raw_offset, str) and raw_offset.strip():
+            offset = int(raw_offset.strip(), 10)
+        else:
+            raise ValueError("invalid cursor type")
+    except (TypeError, ValueError, OverflowError):
+        offset = 0
+        error = "TIMELINE_CURSOR_INVALID"
     max_events = int(max_events or MAX_EVENTS_PER_RUN)
 
     try:
@@ -413,15 +426,17 @@ def run_executive_policy_learning(context=None, commit=True, max_events=None):
         timeline_size = None
         timeline_identity = None
 
-    error = None
-    if offset < 0:
-        error = "TIMELINE_CURSOR_INVALID"
-    elif offset > 0 and (timeline_size is None or offset > timeline_size):
-        error = "TIMELINE_CURSOR_PAST_EOF"
-    else:
+    if error is None:
+        if offset < 0:
+            error = "TIMELINE_CURSOR_INVALID"
+        elif offset > 0 and (timeline_size is None or offset > timeline_size):
+            error = "TIMELINE_CURSOR_PAST_EOF"
+    if error is None:
         saved_identity = state.get("timeline_file_identity")
-        if offset > 0 and saved_identity is not None:
-            if not isinstance(saved_identity, dict) or not {
+        if offset > 0:
+            if saved_identity is None:
+                error = "TIMELINE_SOURCE_IDENTITY_MISSING"
+            elif not isinstance(saved_identity, dict) or not {
                 "device", "inode"
             }.issubset(saved_identity):
                 error = "TIMELINE_SOURCE_IDENTITY_INVALID"
@@ -598,6 +613,7 @@ def get_executive_policy_learning_health():
     if state.get("last_error") in {
         "TIMELINE_CURSOR_INVALID",
         "TIMELINE_CURSOR_PAST_EOF",
+        "TIMELINE_SOURCE_IDENTITY_MISSING",
         "TIMELINE_SOURCE_IDENTITY_INVALID",
         "TIMELINE_SOURCE_IDENTITY_UNAVAILABLE",
         "TIMELINE_SOURCE_CHANGED",

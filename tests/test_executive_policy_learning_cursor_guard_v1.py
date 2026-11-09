@@ -12,6 +12,8 @@ import executive_policy_learning as learning
         (60, b'{"code":"NEW"}\n', "TIMELINE_CURSOR_PAST_EOF"),
         (-1, b'{"code":"NEW"}\n', "TIMELINE_CURSOR_INVALID"),
         (60, None, "TIMELINE_CURSOR_PAST_EOF"),
+        ("corrupt", b'{"code":"NEW"}\n', "TIMELINE_CURSOR_INVALID"),
+        (True, b'{"code":"NEW"}\n', "TIMELINE_CURSOR_INVALID"),
     ],
 )
 def test_invalid_timeline_cursor_fails_closed_without_rewriting_stats(
@@ -42,8 +44,9 @@ def test_invalid_timeline_cursor_fails_closed_without_rewriting_stats(
 
     assert result["ok"] is False
     assert result["error"] == expected_error
-    assert result["old_offset"] == offset
-    assert result["new_offset"] == offset
+    expected_old_offset = offset if isinstance(offset, int) and not isinstance(offset, bool) else 0
+    assert result["old_offset"] == expected_old_offset
+    assert result["new_offset"] == expected_old_offset
     assert result["events_processed"] == 0
     assert stats_path.read_bytes() == stats_bytes
     state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -69,6 +72,38 @@ def test_missing_timeline_at_zero_cursor_remains_waiting_not_error(tmp_path, mon
     assert result["new_offset"] == 0
 
 
+def test_legacy_nonzero_cursor_without_source_identity_fails_closed(tmp_path, monkeypatch):
+    timeline = tmp_path / "timeline.jsonl"
+    timeline.write_bytes(b'{"code":"POLICY_NEW"}\n' * 4)
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps({"timeline_offset": 1, "events_processed": 3}),
+        encoding="utf-8",
+    )
+    stats_path = tmp_path / "stats.json"
+    stats_bytes = json.dumps(
+        {"policies": {"OLD": {"events": 3}}, "summary": {"policy_count": 1}},
+        sort_keys=True,
+    ).encode("utf-8")
+    stats_path.write_bytes(stats_bytes)
+    monkeypatch.setattr(learning, "TIMELINE_FILE", timeline)
+    monkeypatch.setattr(learning, "STATE_FILE", state_path)
+    monkeypatch.setattr(learning, "STATS_FILE", stats_path)
+    monkeypatch.setattr(learning, "LOG_FILE", tmp_path / "learning.jsonl")
+
+    result = learning.run_executive_policy_learning(commit=True)
+
+    assert result["ok"] is False
+    assert result["error"] == "TIMELINE_SOURCE_IDENTITY_MISSING"
+    assert result["old_offset"] == result["new_offset"] == 1
+    assert result["events_processed"] == 0
+    assert stats_path.read_bytes() == stats_bytes
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["timeline_offset"] == 1
+    assert state["last_error"] == "TIMELINE_SOURCE_IDENTITY_MISSING"
+    assert learning.get_executive_policy_learning_health()["ok"] is False
+
+
 def test_cursor_at_or_before_current_eof_continues_normally(tmp_path, monkeypatch):
     timeline = tmp_path / "timeline.jsonl"
     timeline.write_bytes(b'{"code":"POLICY_A"}\n')
@@ -91,17 +126,18 @@ def test_restored_original_timeline_recovers_without_cursor_reset(tmp_path, monk
     third = b'{"code":"POLICY_A","event":3}\n'
     original = first + second + third
     saved_offset = len(first + second)
-    timeline.write_bytes(first)
+    timeline.write_bytes(original)
     state_path = tmp_path / "state.json"
-    state_path.write_text(
-        json.dumps({"timeline_offset": saved_offset, "events_processed": 0}),
-        encoding="utf-8",
-    )
     monkeypatch.setattr(learning, "TIMELINE_FILE", timeline)
     monkeypatch.setattr(learning, "STATE_FILE", state_path)
     monkeypatch.setattr(learning, "STATS_FILE", tmp_path / "stats.json")
     monkeypatch.setattr(learning, "LOG_FILE", tmp_path / "learning.jsonl")
 
+    baseline = learning.run_executive_policy_learning(commit=True, max_events=2)
+    assert baseline["ok"] is True
+    assert baseline["new_offset"] == saved_offset
+
+    timeline.write_bytes(first)
     blocked = learning.run_executive_policy_learning(commit=True)
     assert blocked["error"] == "TIMELINE_CURSOR_PAST_EOF"
     assert json.loads(state_path.read_text(encoding="utf-8"))["timeline_offset"] == saved_offset
