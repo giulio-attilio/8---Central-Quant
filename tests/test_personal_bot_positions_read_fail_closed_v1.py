@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from redis_bandwidth import install_position_read_timeout
+from redis_bandwidth import install_redis_get_timeout
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,12 +98,10 @@ class _FakeRedis:
         self._http = _FakeHTTP(http_client)
 
 
-def test_position_get_timeout_is_per_request_and_does_not_change_other_commands():
+def test_all_get_timeouts_are_per_request_and_do_not_change_writes():
     underlying = _FakeHTTPClient()
     redis_client = _FakeRedis(underlying)
-    install_position_read_timeout(
-        redis_client, "trendpro:positions", timeout_seconds=7.5
-    )
+    install_redis_get_timeout(redis_client, timeout_seconds=7.5)
     bounded = redis_client._http._client
 
     bounded.post("https://redis.invalid", json=["GET", "trendpro:positions"])
@@ -111,17 +109,17 @@ def test_position_get_timeout_is_per_request_and_does_not_change_other_commands(
     bounded.post("https://redis.invalid", json=["SET", "trendpro:positions", "{}"])
 
     assert underlying.calls[0][2]["timeout"] == 7.5
-    assert "timeout" not in underlying.calls[1][2]
+    assert underlying.calls[1][2]["timeout"] == 7.5
     assert "timeout" not in underlying.calls[2][2]
 
 
-def test_position_get_timeout_is_idempotent_and_preserves_close():
+def test_redis_get_timeout_is_idempotent_and_preserves_close():
     underlying = _FakeHTTPClient()
     redis_client = _FakeRedis(underlying)
-    install_position_read_timeout(redis_client, "donkey:positions")
+    install_redis_get_timeout(redis_client)
     wrapper = redis_client._http._client
 
-    install_position_read_timeout(redis_client, "donkey:positions")
+    install_redis_get_timeout(redis_client)
     wrapper.close()
 
     assert redis_client._http._client is wrapper
@@ -129,23 +127,21 @@ def test_position_get_timeout_is_idempotent_and_preserves_close():
 
 
 @pytest.mark.parametrize("timeout_seconds", [0, -1, 61, "bad"])
-def test_position_get_timeout_rejects_invalid_bounds(timeout_seconds):
+def test_redis_get_timeout_rejects_invalid_bounds(timeout_seconds):
     redis_client = _FakeRedis(_FakeHTTPClient())
 
-    with pytest.raises(RuntimeError, match="POSITION_READ_TIMEOUT_INVALID"):
-        install_position_read_timeout(
-            redis_client, "memepro:positions", timeout_seconds=timeout_seconds
-        )
+    with pytest.raises(RuntimeError, match="REDIS_GET_TIMEOUT_INVALID"):
+        install_redis_get_timeout(redis_client, timeout_seconds=timeout_seconds)
 
 
-def test_position_get_timeout_fails_closed_if_sdk_internal_seam_changes():
+def test_redis_get_timeout_fails_closed_if_sdk_internal_seam_changes():
     redis_client = _FakeRedis(object())
 
-    with pytest.raises(RuntimeError, match="POSITION_READ_TIMEOUT_CLIENT_UNSUPPORTED"):
-        install_position_read_timeout(redis_client, "memepro:positions")
+    with pytest.raises(RuntimeError, match="REDIS_GET_TIMEOUT_CLIENT_UNSUPPORTED"):
+        install_redis_get_timeout(redis_client)
 
 
-def test_upstash_httpx_position_timeout_with_mock_transport(monkeypatch):
+def test_upstash_httpx_redis_get_timeout_with_mock_transport(monkeypatch):
     httpx = pytest.importorskip("httpx")
     upstash_redis = pytest.importorskip("upstash_redis")
     redis = upstash_redis.Redis(
@@ -165,9 +161,7 @@ def test_upstash_httpx_position_timeout_with_mock_transport(monkeypatch):
     redis._http._client = httpx.Client(
         timeout=None, transport=httpx.MockTransport(handler)
     )
-    install_position_read_timeout(
-        redis, "trendpro:positions", timeout_seconds=7.5
-    )
+    install_redis_get_timeout(redis, timeout_seconds=7.5)
 
     def reject_network(*_args, **_kwargs):
         raise AssertionError("network access is blocked in this test")
@@ -186,6 +180,6 @@ def test_upstash_httpx_position_timeout_with_mock_transport(monkeypatch):
     assert seen[0][0] == ["GET", "trendpro:positions"]
     assert all(value == 7.5 for value in seen[0][1].values())
     assert seen[1][0] == ["GET", "trendpro:signals"]
-    assert all(value is None for value in seen[1][1].values())
+    assert all(value == 7.5 for value in seen[1][1].values())
     assert seen[2][0][0] == "SET"
     assert all(value is None for value in seen[2][1].values())

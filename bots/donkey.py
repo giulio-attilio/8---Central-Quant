@@ -60,7 +60,7 @@ from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 from redis_bandwidth import (
-    install_position_read_timeout,
+    install_redis_get_timeout,
     redis_get as bandwidth_redis_get,
     redis_set as bandwidth_redis_set,
 )
@@ -511,7 +511,7 @@ redis = Redis(
     url=UPSTASH_REDIS_REST_URL,
     token=UPSTASH_REDIS_REST_TOKEN
 )
-install_position_read_timeout(redis, POSITIONS_KEY)
+install_redis_get_timeout(redis, timeout_seconds=7.5)
 
 
 # ====================================================

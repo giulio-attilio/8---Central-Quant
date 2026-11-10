@@ -417,25 +417,23 @@ def _record_internal_error(exc: Exception) -> None:
         _last_error = f"{type(exc).__name__}: internal observability failure"
 
 
-class _PositionReadTimeoutHTTPClient:
-    """Add per-request network-inactivity timeouts only to the positions GET."""
+class _RedisGetTimeoutHTTPClient:
+    """Add per-request network-inactivity timeouts to Upstash GET commands."""
 
-    def __init__(self, delegate: Any, *, position_key: str, timeout_seconds: float) -> None:
+    def __init__(self, delegate: Any, *, timeout_seconds: float) -> None:
         self._delegate = delegate
-        self._position_key = position_key
         self._timeout_seconds = timeout_seconds
 
     def post(self, url: str, *args: Any, **kwargs: Any) -> Any:
         command = kwargs.get("json")
         if (
             isinstance(command, (list, tuple))
-            and len(command) >= 2
+            and len(command) >= 1
             and str(command[0]).upper() == "GET"
-            and str(command[1]) == self._position_key
         ):
             # httpx.Client.post accepts a per-request `timeout`; HTTPX applies
-            # connect/read/write/pool inactivity limits. Keep this scoped to
-            # the read to avoid changing timeout semantics for writes.
+            # connect/read/write/pool inactivity limits. Bound every read on
+            # this client while leaving writes' timeout semantics unchanged.
             kwargs["timeout"] = self._timeout_seconds
         return self._delegate.post(url, *args, **kwargs)
 
@@ -446,13 +444,12 @@ class _PositionReadTimeoutHTTPClient:
         return getattr(self._delegate, name)
 
 
-def install_position_read_timeout(
+def install_redis_get_timeout(
     client: Any,
-    position_key: str,
     *,
     timeout_seconds: float = 10.0,
 ) -> None:
-    """Apply network-inactivity limits to one Upstash GET, preserving its sync token.
+    """Apply network-inactivity limits to Upstash GETs, preserving the sync token.
 
     Upstash Redis 1.9.0 does not expose an HTTP timeout constructor option.
     Fail closed if the expected internal HTTP client seam changes, rather than
@@ -461,29 +458,22 @@ def install_position_read_timeout(
     try:
         timeout = float(timeout_seconds)
     except (TypeError, ValueError):
-        raise RuntimeError("POSITION_READ_TIMEOUT_INVALID") from None
+        raise RuntimeError("REDIS_GET_TIMEOUT_INVALID") from None
     if not (0 < timeout <= 60):
-        raise RuntimeError("POSITION_READ_TIMEOUT_INVALID")
-    if not isinstance(position_key, str) or not position_key:
-        raise RuntimeError("POSITION_READ_TIMEOUT_KEY_INVALID")
-
+        raise RuntimeError("REDIS_GET_TIMEOUT_INVALID")
     http = getattr(client, "_http", None)
     underlying = getattr(http, "_client", None)
-    if isinstance(underlying, _PositionReadTimeoutHTTPClient):
-        if (
-            underlying._position_key == position_key
-            and underlying._timeout_seconds == timeout
-        ):
+    if isinstance(underlying, _RedisGetTimeoutHTTPClient):
+        if underlying._timeout_seconds == timeout:
             return
-        raise RuntimeError("POSITION_READ_TIMEOUT_ALREADY_CONFIGURED")
+        raise RuntimeError("REDIS_GET_TIMEOUT_ALREADY_CONFIGURED")
     if not callable(getattr(underlying, "post", None)) or not callable(
         getattr(underlying, "close", None)
     ):
-        raise RuntimeError("POSITION_READ_TIMEOUT_CLIENT_UNSUPPORTED")
+        raise RuntimeError("REDIS_GET_TIMEOUT_CLIENT_UNSUPPORTED")
 
-    http._client = _PositionReadTimeoutHTTPClient(
+    http._client = _RedisGetTimeoutHTTPClient(
         underlying,
-        position_key=position_key,
         timeout_seconds=timeout,
     )
 
