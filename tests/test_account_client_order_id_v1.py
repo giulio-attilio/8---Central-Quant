@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import importlib
 import inspect
 import json
@@ -90,6 +91,52 @@ def test_default_redis_client_fails_closed_if_get_timeout_cannot_be_installed(
 
     assert authority._DEFAULT_REDIS_CLIENT is None
     assert created[0].closed is True
+
+
+def test_default_redis_client_bounds_real_upstash_get_without_network(monkeypatch):
+    httpx = pytest.importorskip("httpx")
+    upstash_redis = pytest.importorskip("upstash_redis")
+    seen = []
+
+    def handler(request):
+        command = json.loads(request.content.decode("utf-8"))
+        seen.append((command, request.extensions.get("timeout")))
+        value = base64.b64encode(b"reserved-record").decode("ascii")
+        return httpx.Response(200, json={"result": value})
+
+    clients = []
+
+    def redis_factory(*, url, token):
+        client = upstash_redis.Redis(
+            url=url,
+            token=token,
+            allow_telemetry=False,
+        )
+        client._http._client.close()
+        client._http._client = httpx.Client(
+            timeout=None,
+            transport=httpx.MockTransport(handler),
+        )
+        clients.append(client)
+        return client
+
+    fake_upstash = ModuleType("upstash_redis")
+    fake_upstash.Redis = redis_factory
+    monkeypatch.setitem(sys.modules, "upstash_redis", fake_upstash)
+    monkeypatch.setenv("UPSTASH_REDIS_REST_URL", "https://redis.invalid")
+    monkeypatch.setenv("UPSTASH_REDIS_REST_TOKEN", "synthetic-test-token")
+    monkeypatch.setattr(authority, "_DEFAULT_REDIS_CLIENT", None)
+
+    try:
+        client = authority._default_redis_client()
+        assert client.get("central:test:reservation") == "reserved-record"
+    finally:
+        for client in clients:
+            client.close()
+
+    assert len(seen) == 1
+    assert seen[0][0] == ["GET", "central:test:reservation"]
+    assert all(value == 7.5 for value in seen[0][1].values())
 
 
 class FakeLifetimeLedger:
