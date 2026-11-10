@@ -55,7 +55,7 @@ Executados com `tests/run_falcon_pilot_minimal_offline.py`, cujo runner bloqueia
 | `--upstash-sdk-contract` | 2 passed |
 | `--market-data-throttle` com `ccxt==4.5.88` real | 98 passed |
 
-Reexecução nesta continuação, em `2026-11-10`, de `--personal-http-auth`: **243 passed em 124.67s**, usando o runner offline com bloqueio de rede. Isso revalida os contratos locais de autenticação e o healthz mínimo; não é teste de penetração no serviço publicado.
+Reexecução mais recente às `17:07Z` de `--personal-http-auth`: **243 passed em 122.71s**, usando o runner offline com bloqueio de rede. Isso revalida os contratos locais de Basic Auth global (com a exceção mínima e específica de `/healthz`), a proteção contra mutações via GET, aliases/métodos e o probe HTTP mínimo; não é teste de penetração no serviço publicado.
 
 Também reexecutada nesta continuação a seleção `--personal-position-read-fail-closed`: **45 passed em 8.99s**, com o mesmo runner offline. Isso cobre respostas seguras a leituras de posição indisponíveis nos cenários simulados; não reconcilia o estado atual da conta/corretora.
 
