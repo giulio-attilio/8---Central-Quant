@@ -46,6 +46,7 @@
 from flask import Flask
 import os
 import json
+import math
 import time
 import threading
 import requests
@@ -546,6 +547,17 @@ def safe_fetch_ticker(symbol, max_retries=3):
     HEALTH["last_warning"] = f"Falha Ticker {symbol} após {max_retries} tentativas"
     print(HEALTH["last_warning"])
     return None
+
+
+def _trendpro_ticker_last_price(ticker):
+    """Return only a finite positive last price; missing data stays fail-closed."""
+    if not isinstance(ticker, dict):
+        return None
+    try:
+        price = float(ticker.get("last"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return price if price > 0 and math.isfinite(price) else None
 
 
 def safe_load_markets(max_retries=3):
@@ -3979,7 +3991,16 @@ def gerenciar_posicoes():
 
         try:
             ticker = safe_fetch_ticker(symbol)
-            preco_atual = float(ticker["last"])
+            preco_atual = _trendpro_ticker_last_price(ticker)
+            if preco_atual is None:
+                HEALTH["last_warning"] = (
+                    f"Gestão Trend PRO ignorada: ticker indisponível para {symbol}"
+                )
+                print(
+                    f"AVISO GESTÃO TREND PRO {symbol}: ticker indisponível; "
+                    "posição mantida sem alteração neste ciclo"
+                )
+                continue
 
             if atualizar_mfe_posicao(p, preco_atual):
                 alterou = True

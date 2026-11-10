@@ -47,6 +47,7 @@
 from flask import Flask
 import os
 import json
+import math
 import time
 import threading
 import requests
@@ -590,6 +591,17 @@ def safe_fetch_ticker(symbol, max_retries=3):
     HEALTH["last_warning"] = aviso
     print("WARNING:", aviso)
     return None
+
+
+def _donkey_ticker_last_price(ticker):
+    """Return only a finite positive last price; missing data stays fail-closed."""
+    if not isinstance(ticker, dict):
+        return None
+    try:
+        price = float(ticker.get("last"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return price if price > 0 and math.isfinite(price) else None
 
 
 def safe_load_markets(max_retries=3):
@@ -5299,6 +5311,44 @@ def listen_donkey_commands():
 # SCANNER
 # ====================================================
 
+def _manage_donkey_open_positions_cycle():
+    """Run one fail-closed management pass for open Donkey positions."""
+    posicoes = carregar_posicoes()
+    alterou = False
+
+    for symbol, p in list(posicoes.items()):
+        if p.get("status") == "ENCERRADO":
+            continue
+        if p.get("signal_type") not in ["DONKEY", "DONKEY_ORIGINAL", "EARLY_DONKEY"]:
+            continue
+
+        try:
+            ticker = safe_fetch_ticker(symbol)
+            preco_atual = _donkey_ticker_last_price(ticker)
+            if preco_atual is None:
+                HEALTH["last_warning"] = (
+                    f"Gestão Donkey ignorada: ticker indisponível para {symbol}"
+                )
+                print(
+                    f"AVISO GESTÃO DONKEY {symbol}: ticker indisponível; "
+                    "posição mantida sem alteração neste ciclo"
+                )
+                continue
+
+            if atualizar_mfe_posicao(p, preco_atual):
+                alterou = True
+
+            if gerenciar_donkey_position(symbol, p, preco_atual):
+                alterou = True
+
+        except Exception as e:
+            print(f"ERRO GESTÃO DONKEY {symbol}:", e)
+
+    if alterou:
+        salvar_posicoes(posicoes)
+    return alterou
+
+
 def scanner():
     global ultimo_relatorio_hora
 
@@ -5327,30 +5377,7 @@ def scanner():
             atualizar_thread_heartbeat("scanner")
 
             # Gestão exclusiva Donkey.
-            posicoes = carregar_posicoes()
-            alterou = False
-
-            for symbol, p in list(posicoes.items()):
-                if p.get("status") == "ENCERRADO":
-                    continue
-                if p.get("signal_type") not in ["DONKEY", "DONKEY_ORIGINAL", "EARLY_DONKEY"]:
-                    continue
-
-                try:
-                    ticker = safe_fetch_ticker(symbol)
-                    preco_atual = float(ticker["last"])
-
-                    if atualizar_mfe_posicao(p, preco_atual):
-                        alterou = True
-
-                    if gerenciar_donkey_position(symbol, p, preco_atual):
-                        alterou = True
-
-                except Exception as e:
-                    print(f"ERRO GESTÃO DONKEY {symbol}:", e)
-
-            if alterou:
-                salvar_posicoes(posicoes)
+            _manage_donkey_open_positions_cycle()
 
             HEALTH["last_management_run"] = data_hora_sp_str()
             atualizar_thread_heartbeat("management")

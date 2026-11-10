@@ -283,6 +283,280 @@ def test_bot_ticker_throttle_fails_fast_without_retry_or_sleep(
     )
 
 
+@pytest.mark.parametrize(
+    ("ticker", "expected"),
+    [
+        (None, None),
+        ({}, None),
+        ({"last": None}, None),
+        ({"last": "nan"}, None),
+        ({"last": "inf"}, None),
+        ({"last": "0"}, None),
+        ({"last": "101.5"}, 101.5),
+    ],
+)
+def test_donkey_position_management_price_is_finite_positive_or_skipped(
+    ticker, expected
+):
+    import math
+
+    tree = ast.parse((BOT_DIR / "donkey.py").read_text(encoding="utf-8"))
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_donkey_ticker_last_price"
+    )
+    namespace = {"math": math}
+    isolated = ast.Module(body=[helper], type_ignores=[])
+    exec(
+        compile(ast.fix_missing_locations(isolated), "donkey:ticker_last_price", "exec"),
+        namespace,
+    )
+
+    assert namespace["_donkey_ticker_last_price"](ticker) == expected
+
+
+def test_donkey_management_cycle_preserves_position_on_intermittent_ticker_failure():
+    import copy
+    import math
+
+    tree = ast.parse((BOT_DIR / "donkey.py").read_text(encoding="utf-8"))
+    manager = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_manage_donkey_open_positions_cycle"
+    )
+    scanner = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "scanner"
+    )
+    manager_source = ast.unparse(manager)
+    assert "preco_atual = _donkey_ticker_last_price(ticker)" in manager_source
+    assert "if preco_atual is None" in manager_source
+    assert 'ticker["last"]' not in manager_source
+    assert "_manage_donkey_open_positions_cycle()" in ast.unparse(scanner)
+
+    ticker_helper = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_donkey_ticker_last_price"
+    )
+    isolated = ast.Module(body=[ticker_helper, manager], type_ignores=[])
+    positions = {
+        "BTC/USDT:USDT": {
+            "status": "ABERTA",
+            "signal_type": "DONKEY",
+            "management_prices": [],
+        }
+    }
+    ticker_sequence = iter([None, {"last": "101.5"}, None, {"last": "102"}])
+    saved_positions = []
+    managed_prices = []
+
+    def update_mfe(position, price):
+        position["management_prices"].append(price)
+        return True
+
+    namespace = {
+        "math": math,
+        "carregar_posicoes": lambda: positions,
+        "safe_fetch_ticker": lambda _symbol: next(ticker_sequence),
+        "atualizar_mfe_posicao": update_mfe,
+        "gerenciar_donkey_position": lambda _symbol, _position, price: managed_prices.append(price) or False,
+        "salvar_posicoes": lambda current: saved_positions.append(copy.deepcopy(current)),
+        "HEALTH": {"last_warning": None},
+        "symbol": "BTC/USDT",
+        "print": lambda *args, **kwargs: None,
+    }
+    exec(
+        compile(ast.fix_missing_locations(isolated), "donkey:management_cycle", "exec"),
+        namespace,
+    )
+    cycle = namespace["_manage_donkey_open_positions_cycle"]
+
+    assert cycle() is False
+    assert positions["BTC/USDT:USDT"]["management_prices"] == []
+    assert saved_positions == []
+    assert "ticker indisponível" in namespace["HEALTH"]["last_warning"]
+
+    assert cycle() is True
+    assert positions["BTC/USDT:USDT"]["management_prices"] == [101.5]
+    assert managed_prices == [101.5]
+    assert len(saved_positions) == 1
+
+    assert cycle() is False
+    assert positions["BTC/USDT:USDT"]["management_prices"] == [101.5]
+    assert len(saved_positions) == 1
+
+    assert cycle() is True
+    assert positions["BTC/USDT:USDT"]["management_prices"] == [101.5, 102.0]
+    assert managed_prices == [101.5, 102.0]
+    assert len(saved_positions) == 2
+
+
+@pytest.mark.parametrize(
+    ("ticker", "expected"),
+    [
+        (None, None),
+        ({}, None),
+        ({"last": None}, None),
+        ({"last": "nan"}, None),
+        ({"last": "inf"}, None),
+        ({"last": "0"}, None),
+        ({"last": "101.5"}, 101.5),
+    ],
+)
+def test_trendpro_management_price_is_finite_positive_or_skipped(ticker, expected):
+    import math
+
+    tree = ast.parse((BOT_DIR / "trendpro.py").read_text(encoding="utf-8"))
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_trendpro_ticker_last_price"
+    )
+    namespace = {"math": math}
+    isolated = ast.Module(body=[helper], type_ignores=[])
+    exec(
+        compile(ast.fix_missing_locations(isolated), "trendpro:ticker_last_price", "exec"),
+        namespace,
+    )
+    assert namespace["_trendpro_ticker_last_price"](ticker) == expected
+
+
+def test_trendpro_management_loop_skips_missing_price_without_mutation():
+    import copy
+
+    tree = ast.parse((BOT_DIR / "trendpro.py").read_text(encoding="utf-8"))
+    manager = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "gerenciar_posicoes"
+    )
+    manager_source = ast.unparse(manager)
+    assert "preco_atual = _trendpro_ticker_last_price(ticker)" in manager_source
+    assert 'ticker["last"]' not in manager_source
+    guard = next(
+        node
+        for node in ast.walk(manager)
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "preco_atual is None"
+    )
+    isolated = ast.parse(
+        "def _run_guard(ticker):\n"
+        "    unchanged = False\n"
+        "    for _ in (0,):\n"
+        "        pass\n"
+        "    return unchanged\n"
+    )
+    loop = next(node for node in ast.walk(isolated) if isinstance(node, ast.For))
+    loop.body = [
+        ast.parse("preco_atual = _trendpro_ticker_last_price(ticker)").body[0],
+        copy.deepcopy(guard),
+        ast.parse("unchanged = True").body[0],
+    ]
+    namespace = {
+        "_trendpro_ticker_last_price": lambda ticker: ticker,
+        "HEALTH": {"last_warning": None},
+        "symbol": "BTC/USDT",
+        "print": lambda *args, **kwargs: None,
+    }
+    exec(compile(ast.fix_missing_locations(isolated), "trendpro:management_guard", "exec"), namespace)
+    assert namespace["_run_guard"](None) is False
+    assert namespace["_run_guard"](101.5) is True
+
+
+def test_trendpro_management_cycle_recovers_after_intermittent_ticker_failure():
+    import copy
+    import math
+
+    tree = ast.parse((BOT_DIR / "trendpro.py").read_text(encoding="utf-8"))
+    helper = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_trendpro_ticker_last_price"
+    )
+    manager = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "gerenciar_posicoes"
+    )
+    # Exercise the production manager body while omitting only its runtime drain
+    # decorator, which is independently covered by the drain regression suite.
+    manager.decorator_list = []
+    isolated = ast.Module(body=[helper, manager], type_ignores=[])
+
+    class _Row:
+        @staticmethod
+        def get(_key, default=False):
+            return default
+
+    class _Frame:
+        def __init__(self, *_args, **_kwargs):
+            self.iloc = self
+
+        def __getitem__(self, _index):
+            return _Row()
+
+        def __setitem__(self, _key, _value):
+            pass
+
+    positions = {
+        "BTC/USDT:USDT": {
+            "status": "ABERTA",
+            "signal_type": "TRENDPRO",
+            "side": "LONG",
+            "entry": 100.0,
+            "sl": 90.0,
+            "tp50": 120.0,
+            "management_prices": [],
+        }
+    }
+    ticker_sequence = iter([None, {"last": "101.5"}, None, {"last": "102"}])
+    saved_positions = []
+    managed_prices = []
+
+    def update_mfe(position, price):
+        position["management_prices"].append(price)
+        return True
+
+    namespace = {
+        "math": math,
+        "carregar_posicoes": lambda: positions,
+        "safe_fetch_ticker": lambda _symbol: next(ticker_sequence),
+        "atualizar_mfe_posicao": update_mfe,
+        "safe_fetch_ohlcv": lambda *_args, **_kwargs: [],
+        "pd": type("_PandasStub", (), {"DataFrame": _Frame}),
+        "TIMEFRAME_H1": "1h",
+        "ATR_LEN": 14,
+        "calcular_atr": lambda _frame, _length: [],
+        "marcar_spikes": lambda _frame: None,
+        "stop_em_carencia": lambda _position: True,
+        "salvar_posicoes": lambda current: saved_positions.append(copy.deepcopy(current)),
+        "HEALTH": {"last_warning": None},
+        "print": lambda *args, **kwargs: None,
+    }
+    exec(
+        compile(ast.fix_missing_locations(isolated), "trendpro:management_cycle", "exec"),
+        namespace,
+    )
+    namespace["gerenciar_posicoes"]()
+    assert positions["BTC/USDT:USDT"]["management_prices"] == []
+    assert saved_positions == []
+    assert "ticker indisponível" in namespace["HEALTH"]["last_warning"]
+
+    namespace["gerenciar_posicoes"]()
+    assert positions["BTC/USDT:USDT"]["management_prices"] == [101.5]
+    assert len(saved_positions) == 1
+
+    namespace["gerenciar_posicoes"]()
+    assert positions["BTC/USDT:USDT"]["management_prices"] == [101.5]
+    assert len(saved_positions) == 1
+
+    namespace["gerenciar_posicoes"]()
+    assert positions["BTC/USDT:USDT"]["management_prices"] == [101.5, 102.0]
+    assert len(saved_positions) == 2
+
+
 @pytest.mark.parametrize("module_name", ["cobra.py", "donkey.py", "meme.py", "trendpro.py"])
 def test_bot_load_markets_operation_failed_100410_fails_fast(module_name):
     calls = []

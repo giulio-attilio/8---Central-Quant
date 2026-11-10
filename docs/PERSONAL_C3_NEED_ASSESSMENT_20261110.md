@@ -13,9 +13,13 @@ prontidão de trading.
 - Render `central-robos-bingx`: um serviço web, uma instância Standard, comando
   de startup `python main.py`, disco persistente de 4 GB em `/data`,
   `autoDeploy=off`. Consulta somente de leitura em 2026-11-10 06:04 UTC.
-- Deploy ativo no Render: `c5aa9998d46dce6ab2f9472a82fccb014160c58b`. As métricas
-  mais recentes da consulta mostravam uma instância, CPU ~4,6% e memória ~717
-  MB; não indicavam pressão de recursos.
+- Reconsulta Render somente de leitura em 2026-11-10: deploy Live mais recente
+  `4c2ff20db31584ab23f74a2f76073a02881fb90d` (`dep-dbphh9ff3r2c73865ebg`),
+  uma instância, disco persistente de 4 GB em `/data`, `autoDeploy=off`.
+  O branch configurado no serviço (`codex/personal-readiness-20261103`) difere
+  do branch do release validado (`codex/personal-readiness-runtime-fix-20261110`);
+  não muda o deploy atual com auto-deploy desligado, mas deve ser reconciliado
+  antes de futuras publicações. `healthCheckPath` permanece vazio.
 - Em produção, watchdogs continuavam marcando Trend PRO Elite, Donkey H4 e
   Meme Hunter como parados desde 2026-11-09 20:04 BRT. Portanto, o serviço não
   está operacionalmente pronto; disponibilidade HTTP e baixa CPU não explicam
@@ -30,6 +34,11 @@ prontidão de trading.
   configurado é um único `python main.py`, não um servidor configurado com
   múltiplos workers. A API de serviço reporta uma instância; inspeção manual
   anterior encontrou um processo Python com várias threads.
+- Revalidação offline no HEAD `4c2ff20`: `--registry-writers` aprovou 60 testes;
+  essa seleção verifica callsites de save/RMW, falhas, reload e concorrência
+  sintética, não mede simultaneidade real em produção. `--c3-dormant-startup`
+  aprovou 24 testes e 3 subtestes em 610,20 s, cobrindo atribuições/startup sem
+  I/O e mantendo a instalação/gate C3 inativos nos cenários testados.
 - A inicialização de coordenação C3 na fonte fica default-off/dormente. A
   verificação do preflight classifica a indisponibilidade do C3 como informativa
   para uma instância com disco persistente e lock local, e sugere reavaliar se
@@ -64,7 +73,10 @@ recuperação, rollback e preflight recente.
 Esta é uma avaliação de arquitetura e configuração, não um ensaio de contenção
 física em produção. As consultas Render foram somente leitura; nenhum secret foi
 consultado; não houve mudança de controles de trading, restart, deploy ou ordem.
-O último deploy live não inclui a correção local de timeout de leitura Redis.
-Os scanners seguem parados, e a causa raiz ainda não foi confirmada. O custo de
-um deploy do candidato continua sem confirmação de zero; não publicar nem
-implantar até validar o release exato, custo e condições operacionais.
+Os logs consultados após o deploy `4c2ff20` registraram tarefas bloqueadas por
+`STATIC_OPERATIONAL_RUNTIME`, como relatório histórico, snapshot Redis grande e
+auditoria pesada do Predator. Isso confirma suspensão deliberada, não a causa
+raiz de scanners anteriormente observados como parados. Não desligar o gate sem
+medir carga, latência, locks e impacto de escrita. Custo de futuras publicações
+não está confirmado como zero; não publicar sem verificar custo e condições
+operacionais atuais.
