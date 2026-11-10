@@ -14,6 +14,7 @@
 from flask import Flask
 import os
 import json
+import copy
 import hashlib
 import math
 import logging
@@ -61,10 +62,14 @@ from predator_daily_summary import (
     build_daily_metrics,
     daily_summary_health,
     load_events_for_period,
+    read_predator_event_log,
 )
 
 
 LOGGER = logging.getLogger(__name__)
+_PREDATOR_TRADES_LEDGER_CACHE_LOCK = threading.Lock()
+_PREDATOR_TRADES_LEDGER_CACHE_TTL_SECONDS = 5.0
+_PREDATOR_TRADES_LEDGER_CACHE = {"loaded_at": 0.0, "payload": None}
 
 # ====================================================
 # BROKER / EXECUÇÃO REAL SAFE MODE
@@ -568,8 +573,64 @@ def salvar_sinais(dados):
 
 
 def carregar_trades():
+    if not large_redis_snapshot_allowed():
+        with _PREDATOR_TRADES_LEDGER_CACHE_LOCK:
+            now = time.monotonic()
+            cached_payload = _PREDATOR_TRADES_LEDGER_CACHE.get("payload")
+            loaded_at = float(_PREDATOR_TRADES_LEDGER_CACHE.get("loaded_at") or 0.0)
+            if cached_payload is None or now - loaded_at >= _PREDATOR_TRADES_LEDGER_CACHE_TTL_SECONDS:
+                try:
+                    source = read_predator_event_log()
+                    source = source if isinstance(source, dict) else {}
+                    events = [
+                        copy.deepcopy(event)
+                        for event in source.get("events", [])
+                        if isinstance(event, dict)
+                    ]
+                    warnings = source.get("warnings")
+                    cached_payload = {
+                        "ok": source.get("ok") is True,
+                        "events": events,
+                        "partial": bool(source.get("partial") or warnings),
+                    }
+                except Exception:
+                    cached_payload = {"ok": False, "events": [], "partial": True}
+                _PREDATOR_TRADES_LEDGER_CACHE["loaded_at"] = now
+                _PREDATOR_TRADES_LEDGER_CACHE["payload"] = cached_payload
+
+            payload = copy.deepcopy(cached_payload)
+
+        if payload.get("ok") is True:
+            HEALTH["predator_trade_snapshot_source"] = "PERSISTENT_EVENT_LOG"
+            HEALTH["predator_trade_snapshot_partial"] = bool(payload.get("partial"))
+            HEALTH["predator_trade_snapshot_warning"] = (
+                "STATIC_RUNTIME_LEDGER_BOUNDED"
+                if payload.get("partial")
+                else "STATIC_RUNTIME_LEDGER_RECENT_ONLY"
+            )
+            return payload.get("events", [])
+
+        HEALTH["predator_trade_snapshot_source"] = "UNAVAILABLE"
+        HEALTH["predator_trade_snapshot_partial"] = True
+        HEALTH["predator_trade_snapshot_warning"] = "STATIC_RUNTIME_LEDGER_UNAVAILABLE"
+        return []
+
+    HEALTH["predator_trade_snapshot_source"] = "REDIS_SNAPSHOT"
+    HEALTH["predator_trade_snapshot_partial"] = False
+    HEALTH["predator_trade_snapshot_warning"] = None
     dados = redis_get_json(TRADES_KEY, [])
     return dados if isinstance(dados, list) else []
+
+
+def _predator_trade_snapshot_notice():
+    if large_redis_snapshot_allowed():
+        return ""
+    source = HEALTH.get("predator_trade_snapshot_source")
+    if source == "UNAVAILABLE":
+        return "⚠️ Snapshot Redis automático pausado; ledger persistente indisponível. Dados estatísticos não são conclusivos."
+    if HEALTH.get("predator_trade_snapshot_partial"):
+        return "⚠️ Snapshot Redis automático pausado; dados vêm da cauda limitada do ledger persistente e podem estar incompletos."
+    return "⚠️ Snapshot Redis automático pausado; dados vêm do ledger persistente recente, não representam necessariamente todo o histórico."
 
 
 def salvar_trades(dados, *, automatic=False):
@@ -3868,10 +3929,16 @@ def asset_ranking_text(exits, limit=8):
 
 def montar_stats_gerais():
     trades = carregar_trades()
+    if HEALTH.get("predator_trade_snapshot_source") != "REDIS_SNAPSHOT":
+        return (
+            "📈 ESTATÍSTICAS SMART PREDATOR V4\n\n"
+            + _predator_trade_snapshot_notice()
+            + "\n\nMétricas agregadas ocultas: a fonte atual não é um snapshot íntegro."
+        )
     stats = calc_predator_stats(trades)
     exits = stats["exits"]
 
-    return (
+    report = (
         f"📈 ESTATÍSTICAS SMART PREDATOR V4\n\n"
         f"Smart Predator ativo: {check_bool(SMART_PREDATOR_ENABLED)}\n"
         f"Modo: {predator_mode_label()}\n\n"
@@ -3901,6 +3968,18 @@ def montar_stats_gerais():
         f"Melhor trade:\n{trade_line_predator(stats['best_trade'])}\n\n"
         f"Pior trade:\n{trade_line_predator(stats['worst_trade'])}"
     )
+    notice = _predator_trade_snapshot_notice()
+    return f"{notice}\n\n{report}" if notice else report
+
+
+def montar_ranking_smart_predator_text(limit=12):
+    trades = carregar_trades()
+    title = "🏆 RANKING SMART PREDATOR POR ATIVO"
+    notice = _predator_trade_snapshot_notice()
+    if HEALTH.get("predator_trade_snapshot_source") != "REDIS_SNAPSHOT":
+        return f"{title}\n\n{notice}\n\nRanking agregado oculto: a fonte atual não é um snapshot íntegro."
+    report = f"{title}\n\n" + asset_ranking_text(calc_predator_stats(trades)["exits"], limit)
+    return f"{notice}\n\n{report}" if notice else report
 
 
 def montar_posicoes_texto():
@@ -3998,16 +4077,28 @@ def montar_funil():
 
 def montar_eventos_texto(limit=20):
     trades = carregar_trades()
+    notice = _predator_trade_snapshot_notice()
+    if HEALTH.get("predator_trade_snapshot_source") == "UNAVAILABLE":
+        return "📋 EVENTOS SMART PREDATOR\n\n" + notice
     if not isinstance(trades, list) or not trades:
-        return "📋 EVENTOS SMART PREDATOR\n\nNenhum evento registrado ainda."
+        if HEALTH.get("predator_trade_snapshot_source") != "REDIS_SNAPSHOT":
+            message = (
+                "📋 EVENTOS SMART PREDATOR\n\n"
+                "Nenhum evento encontrado na cauda legível; isso não comprova ausência histórica."
+            )
+            return f"{notice}\n\n{message}" if notice else message
+        message = "📋 EVENTOS SMART PREDATOR\n\nNenhum evento registrado ainda."
+        return f"{notice}\n\n{message}" if notice else message
 
     recentes = trades[-int(limit):]
     linhas = ["📋 EVENTOS SMART PREDATOR", ""]
+    if notice:
+        linhas.extend([notice, ""])
 
     for t in reversed(recentes):
         try:
             event = t.get("event", "N/A")
-            dt = t.get("datetime") or t.get("created_at_txt") or t.get("date", "")
+            dt = t.get("datetime") or t.get("created_at_txt") or t.get("date") or t.get("recorded_at", "")
             symbol = t.get("symbol_clean") or nome_limpo(t.get("symbol", ""))
             side = t.get("side", "")
             setup = t.get("signal_type", "SMART_PREDATOR")
@@ -4376,7 +4467,7 @@ def processar_comando(texto):
         return montar_eventos_texto()
 
     if cmd in ["/ranking", "/ativos"]:
-        return "🏆 RANKING SMART PREDATOR POR ATIVO\n\n" + asset_ranking_text(calc_predator_stats(carregar_trades())["exits"], 12)
+        return montar_ranking_smart_predator_text(12)
 
     if cmd in ["/execution", "/exec", "/verify", "/live"]:
         return montar_execution_status_texto()
@@ -4630,7 +4721,7 @@ def funnel_rota():
 
 @app.route("/ranking")
 def ranking_rota():
-    return ("🏆 RANKING SMART PREDATOR POR ATIVO\n\n" + asset_ranking_text(calc_predator_stats(carregar_trades())["exits"], 12)).replace("\n", "<br>")
+    return montar_ranking_smart_predator_text(12).replace("\n", "<br>")
 
 
 @app.route("/eventos")

@@ -297,7 +297,7 @@ if __name__ == "__main__":
         cases = ("test_account_client_order_id_v1.py",)
     elif sys.argv[1:] == ["--personal-safety-no-ccxt"]:
         # Run the available personal-execution regressions when the offline
-        # Python environment has no cached ccxt package. The two excluded
+        # Python environment has no cached ccxt package. The ccxt-dependent
         # modules are not silently represented as tested by this selection.
         cases = (
             "test_falcon_real_pilot_preflight_fail_closed_v1.py",

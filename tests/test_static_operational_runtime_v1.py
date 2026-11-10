@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import ast
+import copy
 import importlib
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -284,6 +287,111 @@ def test_static_runtime_preserves_minimal_event_journal_but_skips_redis_trade_sn
     assert namespace["salvar_trades"]([], automatic=True) is False
     assert namespace["salvar_trades"]([], automatic=False) is True
     assert calls["redis_set"] == [("smartpredator:trades", [])]
+
+
+def test_static_runtime_reads_bounded_persistent_events_instead_of_stale_redis():
+    calls = {"ledger": 0, "redis": 0}
+
+    def read_ledger():
+        calls["ledger"] += 1
+        return {
+            "ok": True,
+            "partial": True,
+            "warnings": ["tail limited"],
+            "events": [{"event": "ENTRY", "event_key": "E1"}],
+        }
+
+    namespace = {
+        "large_redis_snapshot_allowed": lambda: False,
+        "read_predator_event_log": read_ledger,
+        "HEALTH": {},
+        "redis_get_json": lambda *_args: calls.__setitem__("redis", calls["redis"] + 1)
+        or pytest.fail("stale Redis snapshot must not be read"),
+        "TRADES_KEY": "smartpredator:trades",
+        "copy": copy,
+        "time": time,
+        "_PREDATOR_TRADES_LEDGER_CACHE_LOCK": threading.Lock(),
+        "_PREDATOR_TRADES_LEDGER_CACHE_TTL_SECONDS": 5.0,
+        "_PREDATOR_TRADES_LEDGER_CACHE": {"loaded_at": 0.0, "payload": None},
+    }
+    _load_functions("bots/predator.py", {"carregar_trades", "_predator_trade_snapshot_notice"}, namespace)
+
+    first = namespace["carregar_trades"]()
+    first[0]["event"] = "MUTATED_BY_REPORT"
+    second = namespace["carregar_trades"]()
+
+    assert second == [{"event": "ENTRY", "event_key": "E1"}]
+    assert calls == {"ledger": 1, "redis": 0}
+    assert namespace["HEALTH"]["predator_trade_snapshot_source"] == "PERSISTENT_EVENT_LOG"
+    assert namespace["HEALTH"]["predator_trade_snapshot_partial"] is True
+    assert "incompletos" in namespace["_predator_trade_snapshot_notice"]()
+
+
+def test_static_runtime_ledger_failure_is_not_replaced_with_redis_snapshot():
+    namespace = {
+        "large_redis_snapshot_allowed": lambda: False,
+        "read_predator_event_log": lambda: {"ok": False, "events": []},
+        "HEALTH": {},
+        "redis_get_json": lambda *_args: pytest.fail("must not fall back to stale Redis"),
+        "TRADES_KEY": "smartpredator:trades",
+        "copy": copy,
+        "time": time,
+        "_PREDATOR_TRADES_LEDGER_CACHE_LOCK": threading.Lock(),
+        "_PREDATOR_TRADES_LEDGER_CACHE_TTL_SECONDS": 5.0,
+        "_PREDATOR_TRADES_LEDGER_CACHE": {"loaded_at": 0.0, "payload": None},
+    }
+    _load_functions("bots/predator.py", {"carregar_trades", "_predator_trade_snapshot_notice"}, namespace)
+
+    assert namespace["carregar_trades"]() == []
+    assert namespace["HEALTH"]["predator_trade_snapshot_source"] == "UNAVAILABLE"
+    assert "indisponível" in namespace["_predator_trade_snapshot_notice"]()
+
+
+def test_default_runtime_still_uses_redis_trade_snapshot():
+    calls = {"redis": 0, "ledger": 0}
+
+    def read_redis(_key, default):
+        calls["redis"] += 1
+        return [{"event": "ENTRY"}]
+
+    namespace = {
+        "large_redis_snapshot_allowed": lambda: True,
+        "read_predator_event_log": lambda: calls.__setitem__("ledger", calls["ledger"] + 1)
+        or pytest.fail("default runtime must keep its existing Redis source"),
+        "HEALTH": {},
+        "redis_get_json": read_redis,
+        "TRADES_KEY": "smartpredator:trades",
+    }
+    _load_functions("bots/predator.py", {"carregar_trades"}, namespace)
+
+    assert namespace["carregar_trades"]() == [{"event": "ENTRY"}]
+    assert calls == {"redis": 1, "ledger": 0}
+    assert namespace["HEALTH"]["predator_trade_snapshot_source"] == "REDIS_SNAPSHOT"
+
+
+@pytest.mark.parametrize("source", ["UNAVAILABLE", "PERSISTENT_EVENT_LOG"])
+def test_static_runtime_reporting_does_not_present_partial_ledger_as_authoritative_aggregates(source):
+    namespace = {
+        "carregar_trades": lambda: [],
+        "HEALTH": {"predator_trade_snapshot_source": source},
+        "_predator_trade_snapshot_notice": lambda: "Ledger indisponível; dados não conclusivos.",
+    }
+    _load_functions(
+        "bots/predator.py",
+        {"montar_stats_gerais", "montar_eventos_texto", "montar_ranking_smart_predator_text"},
+        namespace,
+    )
+
+    stats = namespace["montar_stats_gerais"]()
+    events = namespace["montar_eventos_texto"]()
+    ranking = namespace["montar_ranking_smart_predator_text"]()
+
+    for report in (stats, events, ranking):
+        assert "Ledger indisponível" in report
+        assert "Nenhum evento registrado" not in report
+        assert "Win rate: 0.00%" not in report
+    assert "Métricas agregadas ocultas" in stats
+    assert "Ranking agregado oculto" in ranking
 
 
 def _predator_salvar_trades_callers():
