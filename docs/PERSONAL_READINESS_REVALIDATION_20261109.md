@@ -292,3 +292,8 @@ Não alterar `ENABLE_REAL_TRADING`, `BROKER_DRY_RUN` ou `FALCON_MODE`; não rear
 
 - O runner offline ganhou o seletor `--account-client-order-authority` para executar isoladamente toda a suíte `tests/test_account_client_order_id_v1.py`, sem coletar módulos que dependem de `ccxt`. Execução no Python 3.14 com saída externa bloqueada: `97 passed` em 1,67 s.
 - A nova seleção exercita a autoridade account-wide e os contratos de retry/reserva/send/reconciliação presentes no módulo, em fixtures/simuladores; não envia ordens nem consulta a conta real. `git diff --check` segue sem erros. A alteração do runner e o pin continuam locais e não implantados.
+
+## Aditivo — watchdogs ainda parados (2026-11-10 10:19 UTC)
+
+- Nova leitura Render somente de logs em `10:19:37Z`: Trend PRO, Donkey H4 e Meme Hunter permaneciam com último scanner em `09/11 20:04` BRT (670,7–670,8 min). Donkey ainda reportava `boot_completed=false` e heartbeat de gestão em `07/11 08:17`; Trend ainda reportava watchlist vazia. O campo `last_error` não apresentava exceção. Isso confirma persistência do stall, não sua causa.
+- O release de produção continuava em `c5aa999`; nenhuma ordem, alteração PAPER/LIVE, deploy ou restart foi executado. A mitigação local ainda requer confirmação manual de estado BingX e leitura sanitizada de threads/wchan no Render Shell antes de avaliar a publicação.
