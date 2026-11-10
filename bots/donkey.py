@@ -1751,9 +1751,14 @@ def enviar_alerta_watchdog(status):
         f"Última gestão:\n{status.get('last_management_run')}\n\n"
         f"Último erro:\n{status.get('last_error')}"
     )
-    safe_send_telegram_donkey(msg, event_type="WATCHDOG_STALLED", operational_critical=True)
+    sent = safe_send_telegram_donkey(
+        msg, event_type="WATCHDOG_STALLED", operational_critical=True
+    )
+    if not sent:
+        return False
     HEALTH["last_watchdog_alert"] = data_hora_sp_str()
     HEALTH["last_watchdog_alert_ts"] = time.time()
+    return True
 
 def watchdog_loop():
     print(f"WATCHDOG INICIADO - {BOT_NAME}")

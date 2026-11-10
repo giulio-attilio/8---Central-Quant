@@ -451,6 +451,48 @@ def test_donkey_watchdog_alerts_after_management_ticker_stale_threshold():
     assert recovered["stale_ticker_positions_count"] == 0
 
 
+def test_donkey_watchdog_retries_telegram_after_failed_delivery_before_cooldown():
+    source = (BOT_DIR / "donkey.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"pode_enviar_alerta_watchdog", "enviar_alerta_watchdog"}
+    }
+    assert set(functions) == {"pode_enviar_alerta_watchdog", "enviar_alerta_watchdog"}
+    isolated = ast.Module(body=list(functions.values()), type_ignores=[])
+    ast.fix_missing_locations(isolated)
+
+    clock = {"now": 10_000.0}
+    deliveries = iter([False, True])
+    sends = []
+    health = {"last_watchdog_alert_ts": 0}
+    namespace = {
+        "HEALTH": health,
+        "WATCHDOG_ALERT_COOLDOWN_SECONDS": 3600,
+        "BOT_NAME": "Donkey H4",
+        "data_hora_sp_str": lambda: "2026-11-10 14:00:00",
+        "time": type("Clock", (), {"time": staticmethod(lambda: clock["now"])})(),
+        "safe_send_telegram_donkey": lambda message, **kwargs: (
+            sends.append((message, kwargs)) or next(deliveries)
+        ),
+    }
+    exec(compile(isolated, "donkey:watchdog_delivery_retry", "exec"), namespace)
+    send_alert = namespace["enviar_alerta_watchdog"]
+    status = {"reasons": ["ticker de gestão indisponível"], "last_scanner_run": None,
+              "last_management_run": None, "last_error": None}
+
+    assert send_alert(status) is False
+    assert health["last_watchdog_alert_ts"] == 0
+    assert send_alert(status) is True
+    assert health["last_watchdog_alert_ts"] == clock["now"]
+    assert health["last_watchdog_alert"] == "2026-11-10 14:00:00"
+    assert len(sends) == 2
+    assert all(item[1] == {"event_type": "WATCHDOG_STALLED", "operational_critical": True}
+               for item in sends)
+
+
 @pytest.mark.parametrize(
     ("ticker", "expected"),
     [
