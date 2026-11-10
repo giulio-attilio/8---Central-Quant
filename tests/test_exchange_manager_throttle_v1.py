@@ -181,6 +181,39 @@ def test_public_exchange_client_uses_the_configured_bounded_timeout(
     assert captured["timeout"] == expected_timeout
 
 
+def test_load_markets_waiter_cannot_block_forever_on_exchange_manager_lock(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        exchange_manager, "SHARED_MARKET_DATA_LOCK_TIMEOUT_SECONDS", 0.01
+    )
+    finished = threading.Event()
+    outcomes = []
+
+    def load_markets():
+        try:
+            exchange_manager.load_markets_once()
+        except Exception as exc:
+            outcomes.append(exc)
+        finally:
+            finished.set()
+
+    lock = exchange_manager._exchange_lock
+    assert lock.acquire(blocking=False)
+    worker = threading.Thread(target=load_markets)
+    try:
+        worker.start()
+        assert finished.wait(timeout=1)
+    finally:
+        lock.release()
+        worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], exchange_manager.ccxt.NetworkError)
+    assert "exchange manager lock acquisition timed out" in str(outcomes[0])
+
+
 @pytest.mark.parametrize(
     ("module_name", "error_type_name", "message"),
     [

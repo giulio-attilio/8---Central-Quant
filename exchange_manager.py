@@ -40,19 +40,27 @@ def _public_market_data_timeout_ms():
 
 
 @contextmanager
-def _shared_market_data_lock():
-    """Bound waiters so one stalled public request cannot freeze every bot."""
-    acquired = _shared_ohlcv_request_lock.acquire(
+def _bounded_lock(lock, lock_name):
+    """Bound waiters on locks that protect synchronous public market data."""
+    acquired = lock.acquire(
         timeout=SHARED_MARKET_DATA_LOCK_TIMEOUT_SECONDS
     )
     if not acquired:
         raise ccxt.NetworkError(
-            "shared market-data lock acquisition timed out"
+            f"{lock_name} acquisition timed out"
         )
     try:
         yield
     finally:
-        _shared_ohlcv_request_lock.release()
+        lock.release()
+
+
+def _shared_market_data_lock():
+    return _bounded_lock(_shared_ohlcv_request_lock, "shared market-data lock")
+
+
+def _exchange_lock_context():
+    return _bounded_lock(_exchange_lock, "exchange manager lock")
 
 
 def get_exchange():
@@ -62,7 +70,7 @@ def get_exchange():
     """
     global _exchange
 
-    with _exchange_lock:
+    with _exchange_lock_context():
         if _exchange is None:
             ex = ccxt.bingx({
                 "enableRateLimit": True,
@@ -279,7 +287,7 @@ def load_markets_once(force=False):
     """
     global _markets_loaded, _last_markets_load_ts
 
-    with _exchange_lock:
+    with _exchange_lock_context():
         ex = get_exchange()
         now = time.time()
 
@@ -310,7 +318,7 @@ def clear_markets_cache():
     """
     global _markets_loaded
 
-    with _exchange_lock:
+    with _exchange_lock_context():
         ex = get_exchange()
         try:
             ex.markets = None
