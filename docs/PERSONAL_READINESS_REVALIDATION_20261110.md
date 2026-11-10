@@ -100,6 +100,11 @@ Também aprovadas anteriormente no mesmo HEAD: `--static-runtime` (30), `--perso
 - Reconsulta Render após o push manteve `autoDeploy=off` e o deploy Live `4c2ff20db31584ab23f74a2f76073a02881fb90d`; o push não implantou nem reiniciou o serviço.
 - Presença de ambas as variáveis Basic Auth confirmada pelo usuário no Shell (`SET=True`), sem revelar valores; o teste HTTP externo ainda está pendente.
 
+## Validação adicional — 2026-11-10 18:10 UTC
+
+- Reexecução de `--personal-execution-safety` no HEAD `bb3eed1`: **402 passed em 955.86s**, com o runner offline/rede bloqueada. A seleção cobre preflight, entrada/fill, stop, gestão, leitura fail-closed e contratos simulados de fechamento/reconciliação; não comprova integração da conta, execução de ordens, nem posição/stop atual em produção.
+- Consulta de logs de aplicação entre `17:25Z–17:49Z` não encontrou `NoneType`/erro de gestão Donkey. O serviço continuava no release antigo `4c2ff20` na última consulta; portanto, a janela sem eventos não valida a correção ainda não implantada.
+
 ## Pendências e próximos passos seguros
 
 1. Confirmar em leitura somente de metadados o estado atual das posições e a reconciliação entre Registry e ledger PAPER, sem imprimir conteúdo de trades nem segredos.
