@@ -64,6 +64,7 @@ from flask import Flask, request
 from upstash_redis import Redis
 from redis_bandwidth import (
     build_bounded_event_history_payload as bandwidth_build_bounded_event_history_payload,
+    install_redis_get_timeout,
     redis_get as bandwidth_redis_get,
     redis_set as bandwidth_redis_set,
 )
@@ -234,6 +235,7 @@ LAST_CANDLES_KEY = "turtle_pro:last_scanned_candles_by_symbol"
 FUNNEL_KEY = "turtle_pro:funnel"
 
 redis = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
+install_redis_get_timeout(redis, timeout_seconds=7.5)
 
 exchange = get_exchange()   
 

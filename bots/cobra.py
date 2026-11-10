@@ -19,7 +19,11 @@ from exchange_throttle_policy_v1 import is_exchange_throttle_error
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
-from redis_bandwidth import redis_get as bandwidth_redis_get, redis_set as bandwidth_redis_set
+from redis_bandwidth import (
+    install_redis_get_timeout,
+    redis_get as bandwidth_redis_get,
+    redis_set as bandwidth_redis_set,
+)
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 from telegram_notification_policy import send_automatic_telegram
 
@@ -58,6 +62,7 @@ WATCHLIST_FILE = os.environ.get("COBRA_WATCHLIST_FILE", "watchlists/cobra.json")
 exchange = get_exchange()
 
 redis = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
+install_redis_get_timeout(redis, timeout_seconds=7.5)
 
 # ====================================================
 # CHAVES REDIS

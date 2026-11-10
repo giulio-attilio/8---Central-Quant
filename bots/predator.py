@@ -34,6 +34,7 @@ from exchange_throttle_policy_v1 import is_exchange_throttle_error
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 from redis_bandwidth import (
+    install_redis_get_timeout,
     redis_get as bandwidth_redis_get,
     redis_get_authoritative as bandwidth_redis_get_authoritative,
     redis_set as bandwidth_redis_set,
@@ -152,6 +153,7 @@ redis = Redis(
     url=UPSTASH_REDIS_REST_URL,
     token=UPSTASH_REDIS_REST_TOKEN
 )
+install_redis_get_timeout(redis, timeout_seconds=7.5)
 
 # ====================================================
 # CONFIGURAÇÕES PRINCIPAIS

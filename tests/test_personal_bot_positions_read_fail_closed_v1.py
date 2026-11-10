@@ -12,6 +12,37 @@ from redis_bandwidth import install_redis_get_timeout
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULES = ("trendpro", "donkey", "meme")
+ACTIVE_REDIS_BOT_MODULES = (
+    "trendpro",
+    "donkey",
+    "meme",
+    "cobra",
+    "falcon",
+    "predator",
+    "turtle",
+)
+
+
+def test_every_active_redis_bot_bounds_upstash_gets_at_import():
+    for module_name in ACTIVE_REDIS_BOT_MODULES:
+        source = ROOT / "bots" / f"{module_name}.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "install_redis_get_timeout"
+        ]
+
+        assert len(calls) == 1, module_name
+        assert calls[0].args and isinstance(calls[0].args[0], ast.Name)
+        assert calls[0].args[0].id == "redis", module_name
+        timeout = next(
+            (kw.value for kw in calls[0].keywords if kw.arg == "timeout_seconds"),
+            None,
+        )
+        assert isinstance(timeout, ast.Constant) and timeout.value == 7.5, module_name
 
 
 def _load_helpers(module_name, *, read_result=None, read_error=None):

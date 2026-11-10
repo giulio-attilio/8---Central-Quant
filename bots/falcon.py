@@ -48,6 +48,7 @@ from flask import Flask
 from upstash_redis import Redis
 from redis_bandwidth import (
     build_bounded_event_history_payload as bandwidth_build_bounded_event_history_payload,
+    install_redis_get_timeout,
     redis_compare_and_delete as bandwidth_redis_compare_and_delete,
     redis_get_authoritative as bandwidth_redis_get_authoritative,
     redis_get as bandwidth_redis_get,
@@ -354,6 +355,7 @@ FALCON_TERMINAL_STOP_LIFECYCLE_LOCK_PREFIX = "falcon:terminal_stop_emergency_lif
 FALCON_CLIENT_ORDER_ID_RESERVATION_PREFIX = ACCOUNT_CLIENT_ORDER_ID_LEDGER_PREFIX
 
 redis = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
+install_redis_get_timeout(redis, timeout_seconds=7.5)
 redis_lock = threading.Lock()
 events_redis_lock = threading.Lock()
 position_mutation_lock = threading.RLock()
