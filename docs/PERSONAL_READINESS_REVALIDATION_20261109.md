@@ -208,3 +208,10 @@ Não alterar `ENABLE_REAL_TRADING`, `BROKER_DRY_RUN` ou `FALCON_MODE`; não rear
 - GET público contemporâneo: `/healthz` HTTP 200 com `HTTP_LIVE`; `/` HTTP 401 sem autenticação. Isso valida apenas liveness e bloqueio básico de acesso, não readiness, corretora, execução ou ciclo de trading.
 - GitHub retornou status/checks vazios para `0198ea0`; isso não é aprovação de CI. O branch local está um commit à frente de `origin`; push/deploy não foram feitos porque custo externo/uso de pipeline não está comprovado como zero. A autorização financeira recebida anteriormente cobria somente o deploy do SHA `c5aa999`.
 - A árvore continua preservando a modificação preexistente em `docs/PERSONAL_STARTUP_AND_C3_NEED_ASSESSMENT_20261107.md` e o diretório não rastreado `wheelhouse/`; não foram incluídos no commit de correção.
+
+## Aditivo — regressões locais de execução PAPER e defaults (2026-11-09)
+
+- No HEAD `ff3f0d62fbed955517dc399b5328920baf718aed`, `tests/run_falcon_pilot_minimal_offline.py --personal-lifecycle-completeness`: `843 passed` em 1392,94 s.
+- `--personal-execution-safety`: `402 passed` em 658,23 s; `--trading-mode-defaults`: `9 passed` em 25,13 s. Runner configurado para bloquear rede externa e usar stores temporários; nenhum cliente de exchange foi autenticado nem houve ordem.
+- Esses resultados aumentam evidência de contratos locais de preflight, entrada/fill, posição, disaster stop, fechamento e reconciliação. São suites simuladas: não comprovam conectividade/permissões de produção, fills reais, estado atual de posições ou prontidão completa do serviço.
+- Permanecem verdadeiros os limites da seção anterior: Render ainda em `c5aa999`, commit de endurecimento local não publicado, custo de push/deploy não confirmado como zero, autenticação de produção validada somente por respostas anônimas 401 e `healthz` 200, e ledger PAPER integrado ausente apesar do Registry persistente presente.
