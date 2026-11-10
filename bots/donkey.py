@@ -133,6 +133,9 @@ BOT_NAME = os.environ.get("BOT_NAME", "Donkey H4")
 WATCHDOG_CHECK_SECONDS = int(os.environ.get("WATCHDOG_CHECK_SECONDS", "300"))
 WATCHDOG_THRESHOLD_MINUTES = int(os.environ.get("WATCHDOG_THRESHOLD_MINUTES", "20"))
 WATCHDOG_ALERT_COOLDOWN_SECONDS = int(os.environ.get("WATCHDOG_ALERT_COOLDOWN_SECONDS", "3600"))
+DONKEY_TICKER_STALE_ALERT_SECONDS = max(
+    1, int(os.environ.get("DONKEY_TICKER_STALE_ALERT_SECONDS", "900"))
+)
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -645,7 +648,8 @@ HEALTH = {
     "last_watchdog_alert": None,
     "last_watchdog_alert_ts": 0,
     "watchdog_last_check": None,
-    "watchdog_last_status": "OK"
+    "watchdog_last_status": "OK",
+    "management_ticker_failures": {},
 }
 
 
@@ -1660,7 +1664,28 @@ def montar_watchdog_status():
     except Exception:
         startup_stalled = False
 
-    ok = HEALTH.get("last_error") is None and not scanner_stalled and not management_stalled and not startup_stalled
+    ticker_failures = HEALTH.get("management_ticker_failures", {})
+    stale_ticker_count = 0
+    stale_ticker_max_seconds = 0
+    if isinstance(ticker_failures, dict):
+        now = time.time()
+        for failed_at in ticker_failures.values():
+            try:
+                stale_seconds = max(0, now - float(failed_at))
+            except (TypeError, ValueError):
+                continue
+            stale_ticker_max_seconds = max(stale_ticker_max_seconds, int(stale_seconds))
+            if stale_seconds >= DONKEY_TICKER_STALE_ALERT_SECONDS:
+                stale_ticker_count += 1
+    ticker_management_stale = stale_ticker_count > 0
+
+    ok = (
+        HEALTH.get("last_error") is None
+        and not scanner_stalled
+        and not management_stalled
+        and not startup_stalled
+        and not ticker_management_stale
+    )
 
     reasons = []
     if HEALTH.get("last_error") is not None:
@@ -1671,6 +1696,12 @@ def montar_watchdog_status():
         reasons.append(f"gestão parada há {minutes_since_management} min")
     if startup_stalled:
         reasons.append("bootstrap excedeu o tempo esperado")
+    if ticker_management_stale:
+        reasons.append(
+            "ticker de gestão indisponível por pelo menos "
+            f"{DONKEY_TICKER_STALE_ALERT_SECONDS} s em "
+            f"{stale_ticker_count} posição(ões)"
+        )
 
     return {
         "ok": ok,
@@ -1680,6 +1711,9 @@ def montar_watchdog_status():
         "minutes_since_scanner": minutes_since_scanner,
         "minutes_since_management": minutes_since_management,
         "last_error": HEALTH.get("last_error"),
+        "stale_ticker_positions_count": stale_ticker_count,
+        "stale_ticker_max_seconds": stale_ticker_max_seconds,
+        "stale_ticker_alert_threshold_seconds": DONKEY_TICKER_STALE_ALERT_SECONDS,
         "watchdog_check_seconds": WATCHDOG_CHECK_SECONDS,
         "watchdog_threshold_minutes": WATCHDOG_THRESHOLD_MINUTES,
         "watchdog_alert_cooldown_seconds": WATCHDOG_ALERT_COOLDOWN_SECONDS,
@@ -5321,17 +5355,24 @@ def _manage_donkey_open_positions_cycle():
     """Run one fail-closed management pass for open Donkey positions."""
     posicoes = carregar_posicoes()
     alterou = False
+    ticker_failures = HEALTH.setdefault("management_ticker_failures", {})
+    if not isinstance(ticker_failures, dict):
+        ticker_failures = {}
+        HEALTH["management_ticker_failures"] = ticker_failures
+    active_symbols = set()
 
     for symbol, p in list(posicoes.items()):
         if p.get("status") == "ENCERRADO":
             continue
         if p.get("signal_type") not in ["DONKEY", "DONKEY_ORIGINAL", "EARLY_DONKEY"]:
             continue
+        active_symbols.add(symbol)
 
         try:
             ticker = safe_fetch_ticker(symbol)
             preco_atual = _donkey_ticker_last_price(ticker)
             if preco_atual is None:
+                ticker_failures.setdefault(symbol, time.time())
                 HEALTH["last_warning"] = (
                     f"Gestão Donkey ignorada: ticker indisponível para {symbol}"
                 )
@@ -5341,6 +5382,7 @@ def _manage_donkey_open_positions_cycle():
                 )
                 continue
 
+            ticker_failures.pop(symbol, None)
             if atualizar_mfe_posicao(p, preco_atual):
                 alterou = True
 
@@ -5349,6 +5391,10 @@ def _manage_donkey_open_positions_cycle():
 
         except Exception as e:
             print(f"ERRO GESTÃO DONKEY {symbol}:", e)
+
+    for symbol in list(ticker_failures):
+        if symbol not in active_symbols:
+            ticker_failures.pop(symbol, None)
 
     if alterou:
         salvar_posicoes(posicoes)

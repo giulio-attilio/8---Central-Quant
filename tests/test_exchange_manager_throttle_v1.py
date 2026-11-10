@@ -365,6 +365,7 @@ def test_donkey_management_cycle_preserves_position_on_intermittent_ticker_failu
         "gerenciar_donkey_position": lambda _symbol, _position, price: managed_prices.append(price) or False,
         "salvar_posicoes": lambda current: saved_positions.append(copy.deepcopy(current)),
         "HEALTH": {"last_warning": None},
+        "time": time,
         "symbol": "BTC/USDT",
         "print": lambda *args, **kwargs: None,
     }
@@ -378,11 +379,13 @@ def test_donkey_management_cycle_preserves_position_on_intermittent_ticker_failu
     assert positions["BTC/USDT:USDT"]["management_prices"] == []
     assert saved_positions == []
     assert "ticker indisponível" in namespace["HEALTH"]["last_warning"]
+    assert set(namespace["HEALTH"]["management_ticker_failures"]) == {"BTC/USDT:USDT"}
 
     assert cycle() is True
     assert positions["BTC/USDT:USDT"]["management_prices"] == [101.5]
     assert managed_prices == [101.5]
     assert len(saved_positions) == 1
+    assert namespace["HEALTH"]["management_ticker_failures"] == {}
 
     assert cycle() is False
     assert positions["BTC/USDT:USDT"]["management_prices"] == [101.5]
@@ -392,6 +395,60 @@ def test_donkey_management_cycle_preserves_position_on_intermittent_ticker_failu
     assert positions["BTC/USDT:USDT"]["management_prices"] == [101.5, 102.0]
     assert managed_prices == [101.5, 102.0]
     assert len(saved_positions) == 2
+    assert namespace["HEALTH"]["management_ticker_failures"] == {}
+
+
+def test_donkey_watchdog_alerts_after_management_ticker_stale_threshold():
+    tree = ast.parse((BOT_DIR / "donkey.py").read_text(encoding="utf-8"))
+    watchdog = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "montar_watchdog_status"
+    )
+    isolated = ast.Module(body=[watchdog], type_ignores=[])
+    ast.fix_missing_locations(isolated)
+    clock = {"now": 10_000.0}
+    health = {
+        "last_error": None,
+        "last_scanner_run": None,
+        "last_management_run": None,
+        "management_ticker_failures": {"BTC/USDT:USDT": clock["now"] - 899},
+    }
+    namespace = {
+        "HEALTH": health,
+        "minutos_desde_health": lambda _field: 0,
+        "WATCHDOG_THRESHOLD_MINUTES": 20,
+        "DONKEY_TICKER_STALE_ALERT_SECONDS": 900,
+        "startup_signal_guard_active": lambda: False,
+        "segundos_restantes_startup_guard": lambda: 0,
+        "carregar_boot_state": lambda: {},
+        "carregar_thread_heartbeat": lambda: {},
+        "BOT_NAME": "Donkey H4",
+        "WATCHDOG_CHECK_SECONDS": 300,
+        "WATCHDOG_ALERT_COOLDOWN_SECONDS": 3600,
+        "SERVICE_STARTED_TS": clock["now"],
+        "STARTUP_SIGNAL_GRACE_SECONDS": 60,
+        "time": type("Clock", (), {"time": staticmethod(lambda: clock["now"])})(),
+    }
+    exec(compile(isolated, "donkey:watchdog_stale_ticker", "exec"), namespace)
+    watchdog_status = namespace["montar_watchdog_status"]
+
+    before_threshold = watchdog_status()
+    assert before_threshold["ok"] is True
+    assert before_threshold["stale_ticker_positions_count"] == 0
+
+    clock["now"] += 1
+    at_threshold = watchdog_status()
+    assert at_threshold["ok"] is False
+    assert at_threshold["status"] == "ALERTA"
+    assert at_threshold["stale_ticker_positions_count"] == 1
+    assert at_threshold["stale_ticker_alert_threshold_seconds"] == 900
+    assert any("ticker de gestão indisponível" in reason for reason in at_threshold["reasons"])
+
+    health["management_ticker_failures"].clear()
+    recovered = watchdog_status()
+    assert recovered["ok"] is True
+    assert recovered["stale_ticker_positions_count"] == 0
 
 
 @pytest.mark.parametrize(
