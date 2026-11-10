@@ -252,6 +252,7 @@ def _load_real_flask_auth_app(*, draining=False, runtime_ready=True):
         "central_personal_http_mutation_method_before_request",
         "central_personal_http_runtime_readiness_before_request",
         "render_healthz_v1",
+        "central_personal_thread_diagnostics_v1",
     }
     nodes = [
         node
@@ -2194,6 +2195,33 @@ def test_render_healthz_is_minimal_public_liveness_only(monkeypatch):
     unconfigured = _load_real_flask_auth_app().test_client().get("/healthz")
     assert unconfigured.status_code == 200
     assert unconfigured.get_json() == {"ok": True, "status": "HTTP_LIVE"}
+
+
+def test_thread_diagnostics_route_is_authenticated_read_only_and_not_cacheable(monkeypatch):
+    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_USER", "local-operator")
+    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
+    app = _load_real_flask_auth_app()
+    client = app.test_client()
+
+    unauthorized = client.get("/ops/threads")
+    authorized = client.get("/ops/threads", headers={"Authorization": _runtime_basic_header()})
+    posted = client.post("/ops/threads", headers={"Authorization": _runtime_basic_header()})
+    query = client.get(
+        "/ops/threads?detail=true",
+        headers={"Authorization": _runtime_basic_header()},
+    )
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+    assert posted.status_code == 405
+    assert authorized.get_json()["status"] == "THREAD_DIAGNOSTIC_ONLY"
+    assert authorized.headers["Cache-Control"] == "no-store"
+    assert authorized.headers["X-Content-Type-Options"] == "nosniff"
+    assert query.status_code == 400
+    assert query.get_json() == {
+        "ok": False,
+        "status": "THREAD_DIAGNOSTIC_QUERY_NOT_ALLOWED",
+    }
 
 
 def test_runtime_routes_fail_closed_until_boot_completes(monkeypatch):

@@ -869,6 +869,32 @@ def render_healthz_v1():
         return {"ok": False, "status": "HTTP_DRAINING"}, 503
     return {"ok": True, "status": "HTTP_LIVE"}, 200
 
+
+@app.route("/ops/threads", methods=["GET"])
+def central_personal_thread_diagnostics_v1():
+    """Authenticated, read-only thread locations; not a trading-readiness check."""
+    if request.args:
+        payload = {"ok": False, "status": "THREAD_DIAGNOSTIC_QUERY_NOT_ALLOWED"}
+        status_code = 400
+    else:
+        try:
+            from personal_thread_diagnostics import collect_thread_diagnostics
+
+            payload = collect_thread_diagnostics()
+            status_code = 200 if payload.get("ok") is True else 503
+        except Exception:
+            # Do not return exception text, which may contain sensitive context.
+            payload = {"ok": False, "status": "THREAD_SNAPSHOT_UNAVAILABLE"}
+            status_code = 503
+    response = app.response_class(
+        response=json.dumps(payload, separators=(",", ":")),
+        status=status_code,
+        mimetype="application/json",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
 # ==========================================================
 # TRADE LIFECYCLE SHADOW OBSERVABILITY V1 — HTTP READ-ONLY
 # ==========================================================
