@@ -46,6 +46,7 @@
 from flask import Flask
 import os
 import json
+import math
 import time
 import threading
 import requests
@@ -833,6 +834,17 @@ def safe_fetch_ticker(symbol, max_retries=3):
     HEALTH["last_warning"] = f"Falha Ticker {symbol} após {max_retries} tentativas"
     print(HEALTH["last_warning"])
     return None
+
+
+def _meme_ticker_last_price(ticker):
+    """Return a finite positive price or None; never infer from invalid data."""
+    if not isinstance(ticker, dict):
+        return None
+    try:
+        price = float(ticker.get("last"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return price if price > 0 and math.isfinite(price) else None
 
 def safe_load_markets(max_retries=3):
     for attempt in range(max_retries):
@@ -3273,7 +3285,9 @@ def atualizar_monitor_be():
 
         try:
             ticker = safe_fetch_ticker(m["symbol"])
-            preco = float(ticker["last"])
+            preco = _meme_ticker_last_price(ticker)
+            if preco is None:
+                continue
             saida = float(m["exit_price"])
 
             if m["side"] == "LONG":
@@ -3334,9 +3348,11 @@ def gerenciar_posicoes():
 
         try:
             ticker = safe_fetch_ticker(symbol)
-            if not ticker:
+            preco_atual = _meme_ticker_last_price(ticker)
+            if preco_atual is None:
+                HEALTH["last_warning"] = f"Gestão Meme ignorada: ticker indisponível para {symbol}"
+                print(f"AVISO GESTÃO MEME {symbol}: preço indisponível; posição mantida neste ciclo")
                 continue
-            preco_atual = float(ticker["last"])
             p = atualizar_mfe_mae_posicao(p, preco_atual)
 
             # Proteção anti-spike para gestão:

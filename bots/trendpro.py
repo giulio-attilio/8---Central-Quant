@@ -3957,7 +3957,9 @@ def atualizar_monitor_be():
 
         try:
             ticker = safe_fetch_ticker(m["symbol"])
-            preco = float(ticker["last"])
+            preco = _trendpro_ticker_last_price(ticker)
+            if preco is None:
+                continue
             saida = float(m["exit_price"])
 
             if m["side"] == "LONG":

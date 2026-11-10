@@ -4300,7 +4300,9 @@ def atualizar_monitor_be():
 
         try:
             ticker = safe_fetch_ticker(m["symbol"])
-            preco = float(ticker["last"])
+            preco = _donkey_ticker_last_price(ticker)
+            if preco is None:
+                continue
             saida = float(m["exit_price"])
 
             if m["side"] == "LONG":
@@ -4334,7 +4336,11 @@ def gerenciar_posicoes():
 
         try:
             ticker = safe_fetch_ticker(symbol)
-            preco_atual = float(ticker["last"])
+            preco_atual = _donkey_ticker_last_price(ticker)
+            if preco_atual is None:
+                HEALTH["last_warning"] = f"Gestão Donkey ignorada: ticker indisponível para {symbol}"
+                print(f"AVISO GESTÃO DONKEY {symbol}: preço indisponível; posição mantida neste ciclo")
+                continue
 
             if atualizar_mfe_posicao(p, preco_atual):
                 alterou = True

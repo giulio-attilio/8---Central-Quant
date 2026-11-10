@@ -557,6 +557,142 @@ def test_trendpro_management_cycle_recovers_after_intermittent_ticker_failure():
     assert len(saved_positions) == 2
 
 
+@pytest.mark.parametrize(
+    ("module_name", "helper_name"),
+    [
+        ("cobra.py", "_cobra_ticker_last_price"),
+        ("meme.py", "_meme_ticker_last_price"),
+        ("predator.py", "_predator_ticker_last_price"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("ticker", "expected"),
+    [
+        (None, None),
+        ({}, None),
+        ({"last": None}, None),
+        ({"last": "nan"}, None),
+        ({"last": "inf"}, None),
+        ({"last": "0"}, None),
+        ({"last": "-1"}, None),
+        ({"last": "101.5"}, 101.5),
+    ],
+)
+def test_cobra_meme_predator_ticker_price_is_finite_positive_or_rejected(
+    module_name, helper_name, ticker, expected
+):
+    import math
+
+    tree = ast.parse((BOT_DIR / module_name).read_text(encoding="utf-8"))
+    helper = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == helper_name
+    )
+    namespace = {"math": math}
+    isolated = ast.Module(body=[helper], type_ignores=[])
+    exec(
+        compile(ast.fix_missing_locations(isolated), f"{module_name}:ticker_price", "exec"),
+        namespace,
+    )
+    assert namespace[helper_name](ticker) == expected
+
+
+@pytest.mark.parametrize(
+    ("module_name", "helper_name"),
+    [
+        ("cobra.py", "_cobra_ticker_last_price"),
+        ("meme.py", "_meme_ticker_last_price"),
+    ],
+)
+def test_cobra_meme_management_skips_nonfinite_price_without_mutation(
+    module_name, helper_name
+):
+    import copy
+    import math
+
+    tree = ast.parse((BOT_DIR / module_name).read_text(encoding="utf-8"))
+    helper = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == helper_name
+    )
+    manager = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "gerenciar_posicoes"
+    )
+    manager.decorator_list = []
+    isolated = ast.Module(body=[helper, manager], type_ignores=[])
+    positions = {
+        "BTC/USDT:USDT": {
+            "status": "ABERTA",
+            "side": "LONG",
+            "entry": 100.0,
+            "sl": 90.0,
+            "tp50": 120.0,
+        }
+    }
+    original = copy.deepcopy(positions)
+    saves = []
+    namespace = {
+        "math": math,
+        "carregar_posicoes": lambda: positions,
+        "safe_fetch_ticker": lambda _symbol: {"last": "nan"},
+        "salvar_posicoes": lambda value: saves.append(copy.deepcopy(value)),
+        "atualizar_mfe_mae": lambda *_args: pytest.fail("invalid price reached MFE update"),
+        "atualizar_mfe_mae_posicao": lambda *_args: pytest.fail("invalid price reached MFE update"),
+        "data_hora_sp_str": lambda: "2026-11-10 00:00:00",
+        "HEALTH": {"last_warning": None},
+        "print": lambda *args, **kwargs: None,
+    }
+    exec(
+        compile(ast.fix_missing_locations(isolated), f"{module_name}:manager", "exec"),
+        namespace,
+    )
+    namespace["gerenciar_posicoes"]()
+    assert positions == original
+    assert saves == []
+    assert "ticker indisponível" in namespace["HEALTH"]["last_warning"]
+
+
+@pytest.mark.parametrize("module_name", ["falcon.py", "turtle.py"])
+@pytest.mark.parametrize(
+    ("ticker", "expected"),
+    [
+        (None, None),
+        ({}, None),
+        ({"last": "nan"}, None),
+        ({"last": "inf"}, None),
+        ({"last": "0"}, None),
+        ({"last": "-1"}, None),
+        ({"last": None, "close": "101.5"}, 101.5),
+        ({"last": "101.5", "close": "100"}, 101.5),
+    ],
+)
+def test_falcon_turtle_safe_fetch_price_rejects_invalid_tick_values(module_name, ticker, expected):
+    import math
+
+    tree = ast.parse((BOT_DIR / module_name).read_text(encoding="utf-8"))
+    price_helper = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "safe_fetch_price"
+    )
+    safe_float = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "safe_float"
+    )
+    isolated = ast.Module(body=[safe_float, price_helper], type_ignores=[])
+    namespace = {
+        "math": math,
+        "exchange": type("_ExchangeStub", (), {"fetch_ticker": lambda _self, _symbol: ticker})(),
+        "to_ccxt_symbol": lambda symbol: symbol,
+        "HEALTH": {"last_warning": None},
+    }
+    exec(
+        compile(ast.fix_missing_locations(isolated), f"{module_name}:safe_fetch_price", "exec"),
+        namespace,
+    )
+    assert namespace["safe_fetch_price"]("BTC/USDT") == expected
+
+
 @pytest.mark.parametrize("module_name", ["cobra.py", "donkey.py", "meme.py", "trendpro.py"])
 def test_bot_load_markets_operation_failed_100410_fails_fast(module_name):
     calls = []

@@ -15,6 +15,7 @@ from flask import Flask
 import os
 import json
 import hashlib
+import math
 import logging
 import re
 import time
@@ -2996,9 +2997,23 @@ def registrar_posicao(s):
     return True
 
 
+def _predator_ticker_last_price(ticker):
+    """Return a finite positive last price, failing closed on bad payloads."""
+    if not isinstance(ticker, dict):
+        return None
+    try:
+        price = float(ticker.get("last"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return price if price > 0 and math.isfinite(price) else None
+
+
 def obter_preco_atual(symbol):
     ticker = exchange.fetch_ticker(symbol)
-    return float(ticker["last"])
+    price = _predator_ticker_last_price(ticker)
+    if price is None:
+        raise ValueError("ticker last price unavailable or invalid")
+    return price
 
 
 def calcular_trailing_stop(symbol, side):

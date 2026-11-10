@@ -8,6 +8,7 @@
 from flask import Flask
 import os
 import json
+import math
 import time
 import threading
 import requests
@@ -407,6 +408,17 @@ def safe_fetch_ticker(symbol, max_retries=3):
     HEALTH["last_warning"] = f"Falha Ticker {symbol} após {max_retries} tentativas"
     print(HEALTH["last_warning"])
     return None
+
+
+def _cobra_ticker_last_price(ticker):
+    """Return a finite positive price or None; never infer from invalid data."""
+    if not isinstance(ticker, dict):
+        return None
+    try:
+        price = float(ticker.get("last"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return price if price > 0 and math.isfinite(price) else None
 
 def safe_load_markets(max_retries=3):
     for attempt in range(max_retries):
@@ -1501,10 +1513,12 @@ def gerenciar_posicoes():
         try:
             # USO DA FUNÇÃO SEGURA
             ticker = safe_fetch_ticker(symbol)
-            if not ticker:
+            price = _cobra_ticker_last_price(ticker)
+            if price is None:
+                HEALTH["last_warning"] = f"Gestão Cobra ignorada: ticker indisponível para {symbol}"
+                print(f"AVISO GESTÃO COBRA {symbol}: preço indisponível; posição mantida neste ciclo")
                 continue
 
-            price = float(ticker["last"])
             p = atualizar_mfe_mae(p, price)
             side = p["side"]
             entry = float(p["entry"])

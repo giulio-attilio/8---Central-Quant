@@ -50,6 +50,7 @@
 
 import os
 import json
+import math
 import time
 import threading
 import traceback
@@ -702,7 +703,17 @@ def safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=OHLCV_LIMIT):
 def safe_fetch_price(symbol):
     try:
         ticker = exchange.fetch_ticker(to_ccxt_symbol(symbol))
-        return safe_float(ticker.get("last") or ticker.get("close"))
+        if not isinstance(ticker, dict):
+            HEALTH["last_warning"] = f"price {symbol}: ticker indisponível"
+            return None
+        raw_price = ticker.get("last")
+        if raw_price is None:
+            raw_price = ticker.get("close")
+        price = safe_float(raw_price, default=None)
+        if price is None or price <= 0 or not math.isfinite(price):
+            HEALTH["last_warning"] = f"price {symbol}: ticker last inválido"
+            return None
+        return price
     except Exception as exc:
         HEALTH["last_warning"] = f"price {symbol}: {exc}"
         return None
