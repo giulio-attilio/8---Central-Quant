@@ -48,7 +48,7 @@ Executados com `tests/run_falcon_pilot_minimal_offline.py`, cujo runner bloqueia
 | Seleção | Resultado |
 |---|---:|
 | `--account-client-order-authority` | 97 passed |
-| `--personal-execution-safety` | 402 passed em 15m29s |
+| `--personal-execution-safety` | 402 passed em 12m12s (reexecutado nesta continuação; runner offline) |
 | `--personal-lifecycle-completeness` | 888 passed em 31m38s |
 | `--personal-position-read-fail-closed` | 45 passed |
 | `--upstash-sdk-contract` | 2 passed |
