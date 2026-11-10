@@ -8,6 +8,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -21,6 +22,74 @@ FACTUAL_ENTRY_CLIENT_ORDER_IDS = (
     "FALCON-LIVE-FALCON15-1784470538",  # 2026-07-19
 )
 LEGACY_DUPLICATED_DISASTER_STOP_ID = "FALCON-LIVE-FALCON15-178-DS"
+
+
+def test_default_redis_client_installs_bounded_get_before_caching(monkeypatch):
+    created = []
+
+    class FakeRedis:
+        def __init__(self, *, url, token):
+            self.url = url
+            self.token = token
+            self.closed = False
+            created.append(self)
+
+        def close(self):
+            self.closed = True
+
+    fake_upstash = ModuleType("upstash_redis")
+    fake_upstash.Redis = FakeRedis
+    monkeypatch.setitem(sys.modules, "upstash_redis", fake_upstash)
+    monkeypatch.setenv("UPSTASH_REDIS_REST_URL", "https://redis.invalid")
+    monkeypatch.setenv("UPSTASH_REDIS_REST_TOKEN", "synthetic-test-token")
+    monkeypatch.setattr(authority, "_DEFAULT_REDIS_CLIENT", None)
+
+    installed = []
+
+    def install(client, *, timeout_seconds):
+        installed.append((client, timeout_seconds))
+
+    monkeypatch.setattr("redis_bandwidth.install_redis_get_timeout", install)
+
+    client = authority._default_redis_client()
+
+    assert client is created[0]
+    assert installed == [(client, 7.5)]
+    assert authority._DEFAULT_REDIS_CLIENT is client
+    assert not client.closed
+
+
+def test_default_redis_client_fails_closed_if_get_timeout_cannot_be_installed(
+    monkeypatch,
+):
+    created = []
+
+    class FakeRedis:
+        def __init__(self, *, url, token):
+            self.closed = False
+            created.append(self)
+
+        def close(self):
+            self.closed = True
+
+    fake_upstash = ModuleType("upstash_redis")
+    fake_upstash.Redis = FakeRedis
+    monkeypatch.setitem(sys.modules, "upstash_redis", fake_upstash)
+    monkeypatch.setenv("UPSTASH_REDIS_REST_URL", "https://redis.invalid")
+    monkeypatch.setenv("UPSTASH_REDIS_REST_TOKEN", "synthetic-test-token")
+    monkeypatch.setattr(authority, "_DEFAULT_REDIS_CLIENT", None)
+
+    def reject_install(_client, *, timeout_seconds):
+        assert timeout_seconds == 7.5
+        raise RuntimeError("REDIS_GET_TIMEOUT_CLIENT_UNSUPPORTED")
+
+    monkeypatch.setattr("redis_bandwidth.install_redis_get_timeout", reject_install)
+
+    with pytest.raises(RuntimeError, match="REDIS_GET_TIMEOUT_CLIENT_UNSUPPORTED"):
+        authority._default_redis_client()
+
+    assert authority._DEFAULT_REDIS_CLIENT is None
+    assert created[0].closed is True
 
 
 class FakeLifetimeLedger:

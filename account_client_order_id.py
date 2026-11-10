@@ -380,7 +380,20 @@ def _default_redis_client() -> Any:
         return None
     from upstash_redis import Redis
 
-    _DEFAULT_REDIS_CLIENT = Redis(url=url, token=token)
+    redis_client = Redis(url=url, token=token)
+    try:
+        from redis_bandwidth import install_redis_get_timeout
+
+        install_redis_get_timeout(redis_client, timeout_seconds=7.5)
+    except Exception:
+        close = getattr(redis_client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        raise
+    _DEFAULT_REDIS_CLIENT = redis_client
     return _DEFAULT_REDIS_CLIENT
 
 
