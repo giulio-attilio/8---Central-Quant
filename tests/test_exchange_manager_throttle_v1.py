@@ -112,6 +112,75 @@ def test_all_bot_ohlcv_reads_use_the_shared_exchange_client(module_name):
     ), f"{module_name} bypasses the shared exchange client's OHLCV wrapper"
 
 
+def test_shared_market_data_guards_fail_fast_when_another_request_holds_the_lock(monkeypatch):
+    monkeypatch.setattr(
+        exchange_manager, "SHARED_MARKET_DATA_LOCK_TIMEOUT_SECONDS", 0.01
+    )
+
+    class FakeExchange:
+        def __init__(self):
+            self.calls = []
+
+        def fetch_ohlcv(self, *_args, **_kwargs):
+            self.calls.append("ohlcv")
+            return []
+
+        def fetch_ticker(self, *_args, **_kwargs):
+            self.calls.append("ticker")
+            return {}
+
+        def load_markets(self, *_args, **_kwargs):
+            self.calls.append("markets")
+            return {}
+
+        def fetch_time(self, *_args, **_kwargs):
+            self.calls.append("time")
+            return 0
+
+    exchange = FakeExchange()
+    exchange_manager.install_shared_market_data_throttle_guards(exchange)
+    lock = exchange_manager._shared_ohlcv_request_lock
+    assert lock.acquire(blocking=False)
+    try:
+        guarded_calls = (
+            lambda: exchange.fetch_ohlcv("BTC/USDT:USDT", timeframe="1h", limit=40),
+            lambda: exchange.fetch_ticker("BTC/USDT:USDT"),
+            lambda: exchange.load_markets(),
+            lambda: exchange.fetch_time(),
+        )
+        for call in guarded_calls:
+            with pytest.raises(exchange_manager.ccxt.NetworkError, match="lock acquisition timed out"):
+                call()
+        assert exchange.calls == []
+    finally:
+        lock.release()
+
+
+@pytest.mark.parametrize(
+    ("configured_timeout", "expected_timeout"),
+    [("12000", 12000), ("120000", 30000), ("invalid", 15000)],
+)
+def test_public_exchange_client_uses_the_configured_bounded_timeout(
+    monkeypatch, configured_timeout, expected_timeout
+):
+    captured = {}
+
+    class FakeExchange:
+        options = {}
+
+    def factory(config):
+        captured.update(config)
+        return FakeExchange()
+
+    monkeypatch.setenv("BINGX_TIMEOUT_MS", configured_timeout)
+    monkeypatch.setattr(exchange_manager.ccxt, "bingx", factory)
+
+    exchange_manager.get_exchange()
+
+    assert captured["enableRateLimit"] is True
+    assert captured["timeout"] == expected_timeout
+
+
 @pytest.mark.parametrize(
     ("module_name", "error_type_name", "message"),
     [

@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+from contextlib import contextmanager
 import ccxt
 from exchange_throttle_policy_v1 import (
     exchange_throttle_cooldown_remaining,
@@ -23,9 +24,35 @@ _markets_loaded = False
 _last_markets_load_ts = 0
 _exchange_lock = threading.RLock()
 _shared_ohlcv_request_lock = threading.Lock()
+SHARED_MARKET_DATA_LOCK_TIMEOUT_SECONDS = 20.0
+PUBLIC_MARKET_DATA_TIMEOUT_MS_MAX = 30000
 
 DEFAULT_TYPE = os.environ.get("BINGX_DEFAULT_TYPE", "swap")
 MARKETS_RELOAD_SECONDS = int(os.environ.get("BINGX_MARKETS_RELOAD_SECONDS", "21600"))  # 6h
+
+
+def _public_market_data_timeout_ms():
+    try:
+        configured = int(os.environ.get("BINGX_TIMEOUT_MS", "15000"))
+    except (TypeError, ValueError):
+        configured = 15000
+    return min(max(configured, 1000), PUBLIC_MARKET_DATA_TIMEOUT_MS_MAX)
+
+
+@contextmanager
+def _shared_market_data_lock():
+    """Bound waiters so one stalled public request cannot freeze every bot."""
+    acquired = _shared_ohlcv_request_lock.acquire(
+        timeout=SHARED_MARKET_DATA_LOCK_TIMEOUT_SECONDS
+    )
+    if not acquired:
+        raise ccxt.NetworkError(
+            "shared market-data lock acquisition timed out"
+        )
+    try:
+        yield
+    finally:
+        _shared_ohlcv_request_lock.release()
 
 
 def get_exchange():
@@ -37,7 +64,12 @@ def get_exchange():
 
     with _exchange_lock:
         if _exchange is None:
-            ex = ccxt.bingx({"enableRateLimit": True})
+            ex = ccxt.bingx({
+                "enableRateLimit": True,
+                # Keep the lock owner bounded as well as lock waiters. The
+                # authenticated broker client uses the same deployment knob.
+                "timeout": _public_market_data_timeout_ms(),
+            })
             ex.options["defaultType"] = DEFAULT_TYPE
             install_shared_market_data_throttle_guards(ex)
             _exchange = ex
@@ -57,7 +89,7 @@ def _install_shared_ohlcv_throttle_guard(ex):
         # The client is shared by concurrent bot threads. Serialize the check
         # and request so only one in-flight scanner call can pass before a
         # throttling response opens the process-wide cooldown.
-        with _shared_ohlcv_request_lock:
+        with _shared_market_data_lock():
             cache_request = _cache_request_parts(args, kwargs)
             window_start_ms = None
             if cache_request is not None:
@@ -119,7 +151,7 @@ def _install_shared_ticker_throttle_guard(ex):
         # Ticker callers retry independently in several bots. Serialize them
         # with scanner reads and open the same process-wide cooldown on an
         # explicit exchange throttle, so one bot cannot amplify another's 429.
-        with _shared_ohlcv_request_lock:
+        with _shared_market_data_lock():
             remaining = exchange_throttle_cooldown_remaining()
             if remaining > 0:
                 raise ccxt.RateLimitExceeded(
@@ -157,7 +189,7 @@ def _install_shared_load_markets_throttle_guard(ex):
         # Market metadata is read by both the public scanner client and the
         # separate broker client. Serialize it with other market-data reads so
         # a throttle from either client opens one shared process cooldown.
-        with _shared_ohlcv_request_lock:
+        with _shared_market_data_lock():
             remaining = exchange_throttle_cooldown_remaining()
             if remaining > 0:
                 raise ccxt.RateLimitExceeded(
@@ -190,7 +222,7 @@ def _install_shared_fetch_time_throttle_guard(ex):
         # A throttle there must suppress scanner retries, but this wrapper is
         # deliberately limited to fetch_time and does not touch account/order
         # methods on the authenticated client.
-        with _shared_ohlcv_request_lock:
+        with _shared_market_data_lock():
             remaining = exchange_throttle_cooldown_remaining()
             if remaining > 0:
                 raise ccxt.RateLimitExceeded(
