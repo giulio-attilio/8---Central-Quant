@@ -545,7 +545,7 @@ def enviar_startup_cobra_uma_vez():
         "BOT_STARTUP",
     )
 
-def redis_get_json(key, padrao):
+def redis_get_json(key, padrao, *, fail_closed=False):
     try:
         data = bandwidth_redis_get(redis, key, caller=__name__)
         if data is None:
@@ -554,6 +554,8 @@ def redis_get_json(key, padrao):
             return json.loads(data)
         return data
     except Exception as e:
+        if fail_closed:
+            raise RuntimeError("REDIS_JSON_READ_FAILED") from None
         print(f"ERRO REDIS GET {key}:", e)
         return padrao
 
@@ -564,7 +566,10 @@ def redis_set_json(key, value):
         print(f"ERRO REDIS SET {key}:", e)
 
 def carregar_posicoes():
-    return redis_get_json(POSITIONS_KEY, {})
+    positions = redis_get_json(POSITIONS_KEY, {}, fail_closed=True)
+    if not isinstance(positions, dict):
+        raise RuntimeError("POSITIONS_READ_INVALID")
+    return positions
 
 def salvar_posicoes(dados):
     redis_set_json(POSITIONS_KEY, dados)

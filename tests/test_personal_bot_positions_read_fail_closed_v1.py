@@ -11,7 +11,15 @@ from redis_bandwidth import install_redis_get_timeout
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULES = ("trendpro", "donkey", "meme")
+POSITION_LOADER_BY_MODULE = {
+    "trendpro": "carregar_posicoes",
+    "donkey": "carregar_posicoes",
+    "meme": "carregar_posicoes",
+    "cobra": "carregar_posicoes",
+    "predator": "carregar_posicoes",
+    "turtle": "get_positions",
+}
+MODULES = tuple(POSITION_LOADER_BY_MODULE)
 ACTIVE_REDIS_BOT_MODULES = (
     "trendpro",
     "donkey",
@@ -21,6 +29,14 @@ ACTIVE_REDIS_BOT_MODULES = (
     "predator",
     "turtle",
 )
+
+
+class _NoopLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
 
 
 def test_every_active_redis_bot_bounds_upstash_gets_at_import():
@@ -48,7 +64,8 @@ def test_every_active_redis_bot_bounds_upstash_gets_at_import():
 def _load_helpers(module_name, *, read_result=None, read_error=None):
     source = ROOT / "bots" / f"{module_name}.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
-    wanted = {"redis_get_json", "carregar_posicoes"}
+    position_loader = POSITION_LOADER_BY_MODULE[module_name]
+    wanted = {"redis_get_json", position_loader}
     nodes = [
         node
         for node in tree.body
@@ -68,11 +85,18 @@ def _load_helpers(module_name, *, read_result=None, read_error=None):
         "POSITIONS_KEY": f"{module_name}:positions",
         "__name__": f"bots.{module_name}",
         "json": json,
+        "HEALTH": {},
+        "redis_lock": _NoopLock(),
     }
     module = ast.Module(body=nodes, type_ignores=[])
     ast.fix_missing_locations(module)
     exec(compile(module, str(source), "exec"), namespace)
-    return namespace
+    return namespace, position_loader
+
+
+def _load_positions(namespace_and_loader):
+    namespace, loader_name = namespace_and_loader
+    return namespace[loader_name]()
 
 
 @pytest.mark.parametrize("module_name", MODULES)
@@ -80,7 +104,7 @@ def test_position_read_error_is_not_converted_to_empty_positions(module_name):
     namespace = _load_helpers(module_name, read_error=OSError("offline"))
 
     with pytest.raises(RuntimeError, match="REDIS_JSON_READ_FAILED"):
-        namespace["carregar_posicoes"]()
+        _load_positions(namespace)
 
 
 @pytest.mark.parametrize("module_name", MODULES)
@@ -88,20 +112,23 @@ def test_position_read_error_is_not_converted_to_empty_positions(module_name):
 def test_malformed_or_non_mapping_position_state_fails_closed(module_name, read_result):
     namespace = _load_helpers(module_name, read_result=read_result)
 
-    with pytest.raises(RuntimeError, match="REDIS_JSON_READ_FAILED|POSITIONS_READ_INVALID"):
-        namespace["carregar_posicoes"]()
+    with pytest.raises(
+        RuntimeError,
+        match="REDIS_JSON_READ_FAILED|POSITIONS_READ_INVALID|TURTLE_POSITIONS_READ_INVALID",
+    ):
+        _load_positions(namespace)
 
 
 @pytest.mark.parametrize("module_name", MODULES)
 def test_missing_position_key_remains_an_empty_mapping(module_name):
     namespace = _load_helpers(module_name, read_result=None)
 
-    assert namespace["carregar_posicoes"]() == {}
+    assert _load_positions(namespace) == {}
 
 
 @pytest.mark.parametrize("module_name", MODULES)
 def test_non_position_json_reads_keep_existing_fallback(module_name):
-    namespace = _load_helpers(module_name, read_error=OSError("offline"))
+    namespace, _loader_name = _load_helpers(module_name, read_error=OSError("offline"))
 
     assert namespace["redis_get_json"]("unrelated:key", ["fallback"]) == ["fallback"]
 

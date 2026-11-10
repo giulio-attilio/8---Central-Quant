@@ -475,7 +475,7 @@ def enviar_texto(chat_id, msg):
             print("ERRO AO RESPONDER TELEGRAM:", e)
 
 
-def redis_get_json(key, padrao):
+def redis_get_json(key, padrao, *, fail_closed=False):
     with redis_lock:
         try:
             data = bandwidth_redis_get(redis, key, caller=__name__)
@@ -485,6 +485,8 @@ def redis_get_json(key, padrao):
                 return json.loads(data)
             return data
         except Exception as e:
+            if fail_closed:
+                raise RuntimeError("REDIS_JSON_READ_FAILED") from None
             print(f"ERRO REDIS GET {key}:", e)
             return padrao
 
@@ -546,7 +548,10 @@ def validar_watchlist_bingx(watchlist, avisar_telegram=False):
 
 
 def carregar_posicoes():
-    return redis_get_json(POSITIONS_KEY, {})
+    positions = redis_get_json(POSITIONS_KEY, {}, fail_closed=True)
+    if not isinstance(positions, dict):
+        raise RuntimeError("POSITIONS_READ_INVALID")
+    return positions
 
 
 def salvar_posicoes(dados):

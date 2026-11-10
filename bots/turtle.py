@@ -445,7 +445,7 @@ def safe_send_telegram(message):
         return False
 
 
-def redis_get_json(key, default):
+def redis_get_json(key, default, *, fail_closed=False):
     try:
         with redis_lock:
             raw = bandwidth_redis_get(redis, key, caller=__name__)
@@ -457,6 +457,8 @@ def redis_get_json(key, default):
             return json.loads(raw)
         return raw
     except Exception as exc:
+        if fail_closed:
+            raise RuntimeError("REDIS_JSON_READ_FAILED") from None
         HEALTH["last_warning"] = f"redis get {key}: {exc}"
         return default
 
@@ -763,8 +765,10 @@ def r_for_side(side, entry, initial_stop, price):
 
 
 def get_positions():
-    data = redis_get_json(POSITIONS_KEY, {})
-    return data if isinstance(data, dict) else {}
+    data = redis_get_json(POSITIONS_KEY, {}, fail_closed=True)
+    if not isinstance(data, dict):
+        raise RuntimeError("TURTLE_POSITIONS_READ_INVALID")
+    return data
 
 
 def save_positions(positions):
