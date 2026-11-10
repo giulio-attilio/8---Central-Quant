@@ -1,6 +1,7 @@
 """Run the existing Falcon safety regressions without external access.
 
 Usage: python3 -I tests/run_falcon_pilot_minimal_offline.py
+       [--upstash-sdk-contract|--account-client-order-authority]
 Some tests import main.py, so runtime auto-start is disabled before collection.
 Pytest is loaded only after network, subprocess and .env-file access are denied.
 """
@@ -287,6 +288,13 @@ if __name__ == "__main__":
         )
     elif sys.argv[1:] == ["--personal-position-read-fail-closed"]:
         cases = ("test_personal_bot_positions_read_fail_closed_v1.py",)
+    elif sys.argv[1:] == ["--upstash-sdk-contract"]:
+        cases = (
+            "test_account_client_order_id_v1.py",
+            "test_personal_bot_positions_read_fail_closed_v1.py",
+        )
+    elif sys.argv[1:] == ["--account-client-order-authority"]:
+        cases = ("test_account_client_order_id_v1.py",)
     elif sys.argv[1:] == ["--personal-safety-no-ccxt"]:
         # Run the available personal-execution regressions when the offline
         # Python environment has no cached ccxt package. The two excluded
@@ -371,6 +379,14 @@ if __name__ == "__main__":
     elif sys.argv[1:] == ["--personal-execution-safety"]:
         filters = []
     elif sys.argv[1:] == ["--personal-lifecycle-completeness"]:
+        filters = []
+    elif sys.argv[1:] == ["--upstash-sdk-contract"]:
+        filters = [
+            "-k",
+            "test_default_redis_client_bounds_real_upstash_get_without_network or "
+            "test_upstash_httpx_redis_get_timeout_with_mock_transport",
+        ]
+    elif sys.argv[1:] == ["--account-client-order-authority"]:
         filters = []
     elif sys.argv[1:] == ["--personal-safety-no-ccxt"]:
         filters = []

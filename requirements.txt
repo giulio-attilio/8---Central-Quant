@@ -4,4 +4,4 @@ requests
 pandas
 numpy
 ccxt==4.5.88
-upstash-redis
+upstash-redis==1.9.0
