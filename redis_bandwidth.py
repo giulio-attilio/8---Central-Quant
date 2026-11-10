@@ -417,6 +417,77 @@ def _record_internal_error(exc: Exception) -> None:
         _last_error = f"{type(exc).__name__}: internal observability failure"
 
 
+class _PositionReadTimeoutHTTPClient:
+    """Add per-request network-inactivity timeouts only to the positions GET."""
+
+    def __init__(self, delegate: Any, *, position_key: str, timeout_seconds: float) -> None:
+        self._delegate = delegate
+        self._position_key = position_key
+        self._timeout_seconds = timeout_seconds
+
+    def post(self, url: str, *args: Any, **kwargs: Any) -> Any:
+        command = kwargs.get("json")
+        if (
+            isinstance(command, (list, tuple))
+            and len(command) >= 2
+            and str(command[0]).upper() == "GET"
+            and str(command[1]) == self._position_key
+        ):
+            # httpx.Client.post accepts a per-request `timeout`; HTTPX applies
+            # connect/read/write/pool inactivity limits. Keep this scoped to
+            # the read to avoid changing timeout semantics for writes.
+            kwargs["timeout"] = self._timeout_seconds
+        return self._delegate.post(url, *args, **kwargs)
+
+    def close(self) -> Any:
+        return self._delegate.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+
+def install_position_read_timeout(
+    client: Any,
+    position_key: str,
+    *,
+    timeout_seconds: float = 10.0,
+) -> None:
+    """Apply network-inactivity limits to one Upstash GET, preserving its sync token.
+
+    Upstash Redis 1.9.0 does not expose an HTTP timeout constructor option.
+    Fail closed if the expected internal HTTP client seam changes, rather than
+    silently running the position read without a deadline.
+    """
+    try:
+        timeout = float(timeout_seconds)
+    except (TypeError, ValueError):
+        raise RuntimeError("POSITION_READ_TIMEOUT_INVALID") from None
+    if not (0 < timeout <= 60):
+        raise RuntimeError("POSITION_READ_TIMEOUT_INVALID")
+    if not isinstance(position_key, str) or not position_key:
+        raise RuntimeError("POSITION_READ_TIMEOUT_KEY_INVALID")
+
+    http = getattr(client, "_http", None)
+    underlying = getattr(http, "_client", None)
+    if isinstance(underlying, _PositionReadTimeoutHTTPClient):
+        if (
+            underlying._position_key == position_key
+            and underlying._timeout_seconds == timeout
+        ):
+            return
+        raise RuntimeError("POSITION_READ_TIMEOUT_ALREADY_CONFIGURED")
+    if not callable(getattr(underlying, "post", None)) or not callable(
+        getattr(underlying, "close", None)
+    ):
+        raise RuntimeError("POSITION_READ_TIMEOUT_CLIENT_UNSUPPORTED")
+
+    http._client = _PositionReadTimeoutHTTPClient(
+        underlying,
+        position_key=position_key,
+        timeout_seconds=timeout,
+    )
+
+
 def redis_get(
     client: Any,
     key: Any,

@@ -58,7 +58,11 @@ from exchange_throttle_policy_v1 import is_exchange_throttle_error
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
-from redis_bandwidth import redis_get as bandwidth_redis_get, redis_set as bandwidth_redis_set
+from redis_bandwidth import (
+    install_position_read_timeout,
+    redis_get as bandwidth_redis_get,
+    redis_set as bandwidth_redis_set,
+)
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 
 try:
@@ -322,6 +326,7 @@ redis = Redis(
     url=UPSTASH_REDIS_REST_URL,
     token=UPSTASH_REDIS_REST_TOKEN
 )
+install_position_read_timeout(redis, POSITIONS_KEY)
 
 ultimo_candle_h1 = {}
 ultimo_relatorio_hora = None
@@ -633,7 +638,7 @@ def validar_watchlist_bingx(watchlist, avisar_telegram=False):
     return validos
 
 
-def redis_get_json(key, padrao):
+def redis_get_json(key, padrao, *, fail_closed=False):
     try:
         data = bandwidth_redis_get(redis, key, caller=__name__)
         if data is None:
@@ -642,6 +647,8 @@ def redis_get_json(key, padrao):
             return json.loads(data)
         return data
     except Exception as e:
+        if fail_closed:
+            raise RuntimeError("REDIS_JSON_READ_FAILED") from None
         print(f"ERRO REDIS GET {key}:", e)
         return padrao
 
@@ -806,7 +813,10 @@ def montar_funil():
 
 
 def carregar_posicoes():
-    return redis_get_json(POSITIONS_KEY, {})
+    posicoes = redis_get_json(POSITIONS_KEY, {}, fail_closed=True)
+    if not isinstance(posicoes, dict):
+        raise RuntimeError("POSITIONS_READ_INVALID")
+    return posicoes
 
 
 def salvar_posicoes(dados):
