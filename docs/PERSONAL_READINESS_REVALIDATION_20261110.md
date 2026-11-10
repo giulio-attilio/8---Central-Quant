@@ -105,6 +105,14 @@ Também aprovadas anteriormente no mesmo HEAD: `--static-runtime` (30), `--perso
 - Reexecução de `--personal-execution-safety` no HEAD `bb3eed1`: **402 passed em 955.86s**, com o runner offline/rede bloqueada. A seleção cobre preflight, entrada/fill, stop, gestão, leitura fail-closed e contratos simulados de fechamento/reconciliação; não comprova integração da conta, execução de ordens, nem posição/stop atual em produção.
 - Consulta de logs de aplicação entre `17:25Z–17:49Z` não encontrou `NoneType`/erro de gestão Donkey. O serviço continuava no release antigo `4c2ff20` na última consulta; portanto, a janela sem eventos não valida a correção ainda não implantada.
 
+## Revalidação adicional — 2026-11-10 18:15 UTC
+
+- A consulta de logs Render somente de leitura entre `17:49Z–18:14:56Z` encontrou novas rajadas de `NoneType` durante gestão Donkey às `17:50:34Z` (nove símbolos) e `18:05:34Z` (oito símbolos), na mesma instância `srv-d8rtuv9o3t8c73ehav5g-xpm28`. Isso confirma que o defeito continua no release Live `4c2ff20`; não prova envio de ordens nem mudança de posição.
+- Revisão local dos acessos a `ticker["last"]` em `bots/donkey.py`: os acessos remanescentes identificados pertencem a consultas/relatórios com tratamento de exceção; os caminhos de gestão de posição usam `_donkey_ticker_last_price()` e não devem mutar a posição quando o preço é inválido. Isso é inspeção estática do candidato local, não evidência de correção em produção.
+- O usuário confirmou no Render Shell `CENTRAL_PERSONAL_HTTP_USER_SET=True` e `CENTRAL_PERSONAL_HTTP_PASSWORD_SET=True`. Os valores não foram exibidos. Isso comprova apenas que ambos estão definidos no ambiente consultado, não que o processo principal os carregou ou que o Basic Auth externo autentica corretamente; esse teste manual segue pendente.
+- Verificação HTTP sem credenciais às `18:19Z`: `GET /` retornou `401` e `/healthz` retornou `200` com `{"ok":true,"status":"HTTP_LIVE"}`. Isso comprova que a rota raiz exige autenticação e que a exceção pública do health check está acessível; não prova que credenciais válidas sejam aceitas nem readiness dos workers.
+- Reconsulta Render somente de leitura às `18:19Z`: o deploy mais recente continua Live em `4c2ff20db31584ab23f74a2f76073a02881fb90d`; auto-deploy segue desligado, branch configurada continua `codex/personal-readiness-20261103`, uma instância, `/data` 4 GB e `healthCheckPath` vazio. A busca filtrada por `NoneType` desde `18:14:56Z` não retornou linhas; janela de aproximadamente quatro minutos, insuficiente para declarar recuperação.
+
 ## Pendências e próximos passos seguros
 
 1. Confirmar em leitura somente de metadados o estado atual das posições e a reconciliação entre Registry e ledger PAPER, sem imprimir conteúdo de trades nem segredos.
@@ -116,3 +124,4 @@ Também aprovadas anteriormente no mesmo HEAD: `--static-runtime` (30), `--perso
 7. Antes de qualquer nova alteração externa, confirmar custo, ausência atual de operações, alvo exato, validação e rollback. Manter `ENABLE_REAL_TRADING=false`, `BROKER_DRY_RUN=true` e `FALCON_MODE=PAPER`.
 
 **Ação manual imediata:** testar o Basic Auth no site sem fornecer credenciais ao assistente; em janela anônima, `GET /` deve pedir autenticação, e `/healthz` deve continuar respondendo publicamente conforme previsto. Para publicar `86edee4`, ainda faltam decisão financeira específica para esse SHA (custo zero não está confirmado) e confirmação operacional atual de ausência de operações/interrupção segura. Nenhum controle LIVE foi alterado e nenhuma ordem real foi enviada; isso continua proibido pela meta.
+
