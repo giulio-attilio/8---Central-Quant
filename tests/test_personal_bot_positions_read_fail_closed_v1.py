@@ -2,6 +2,7 @@
 
 import ast
 import json
+import socket
 from pathlib import Path
 
 import pytest
@@ -142,3 +143,49 @@ def test_position_get_timeout_fails_closed_if_sdk_internal_seam_changes():
 
     with pytest.raises(RuntimeError, match="POSITION_READ_TIMEOUT_CLIENT_UNSUPPORTED"):
         install_position_read_timeout(redis_client, "memepro:positions")
+
+
+def test_upstash_httpx_position_timeout_with_mock_transport(monkeypatch):
+    httpx = pytest.importorskip("httpx")
+    upstash_redis = pytest.importorskip("upstash_redis")
+    redis = upstash_redis.Redis(
+        url="https://redis.invalid",
+        token="synthetic-test-token",
+        allow_telemetry=False,
+    )
+    seen = []
+
+    def handler(request):
+        command = json.loads(request.content.decode("utf-8"))
+        seen.append((command, request.extensions.get("timeout")))
+        result = "{}" if command[0].upper() == "GET" else "OK"
+        return httpx.Response(200, json={"result": result})
+
+    redis._http._client.close()
+    redis._http._client = httpx.Client(
+        timeout=None, transport=httpx.MockTransport(handler)
+    )
+    install_position_read_timeout(
+        redis, "trendpro:positions", timeout_seconds=7.5
+    )
+
+    def reject_network(*_args, **_kwargs):
+        raise AssertionError("network access is blocked in this test")
+
+    try:
+        with monkeypatch.context() as patch_network:
+            patch_network.setattr(socket, "socket", reject_network)
+            patch_network.setattr(socket, "create_connection", reject_network)
+            redis.get("trendpro:positions")
+            redis.get("trendpro:signals")
+            assert redis.set("trendpro:positions", "{}")
+    finally:
+        redis._http._client.close()
+
+    assert len(seen) == 3
+    assert seen[0][0] == ["GET", "trendpro:positions"]
+    assert all(value == 7.5 for value in seen[0][1].values())
+    assert seen[1][0] == ["GET", "trendpro:signals"]
+    assert all(value is None for value in seen[1][1].values())
+    assert seen[2][0][0] == "SET"
+    assert all(value is None for value in seen[2][1].values())
