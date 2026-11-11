@@ -71,7 +71,71 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
             return []
         return json.loads(self.positions_file.read_text(encoding="utf-8"))
 
+    def _initialize_state(self):
+        self.positions_file.write_text("[]", encoding="utf-8")
+        self.seen_file.write_text("{}", encoding="utf-8")
+
+    def test_health_reports_missing_state_files_separately_from_empty_files(self):
+        health = paper_executor.paper_integrated_health()
+
+        self.assertTrue(health["ok"])
+        self.assertFalse(health["state_files_present"])
+        self.assertEqual(health["state_files_status"], "PAPER_STATE_FILES_MISSING")
+        self.assertFalse(health["files"]["paper_positions_present"])
+        self.assertFalse(health["files"]["paper_seen_present"])
+
+        self.positions_file.write_text("[]", encoding="utf-8")
+        self.seen_file.write_text("{}", encoding="utf-8")
+        health = paper_executor.paper_integrated_health()
+
+        self.assertTrue(health["state_files_present"])
+        self.assertEqual(health["state_files_status"], "PAPER_STATE_FILES_PRESENT")
+        self.assertEqual(health["open_positions"], 0)
+
+    def test_missing_position_ledger_blocks_without_initializing_or_logging(self):
+        self.seen_file.write_text("{}", encoding="utf-8")
+        self.positions_file.unlink(missing_ok=True)
+
+        result = paper_executor.execute_paper_from_engine({"plan": self._plan()})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["payload"]["status"], "PAPER_STATE_UNINITIALIZED")
+        self.assertEqual(result["payload"]["errors"], ["PAPER_POSITION_LEDGER_MISSING"])
+        self.assertTrue(self.seen_file.exists())
+        self.assertFalse(self.positions_file.exists())
+        self.assertFalse(self.log_file.exists())
+
+    def test_missing_seen_cache_blocks_new_key_but_recovers_existing_key(self):
+        position = {
+            "idempotency_key": "paper-existing-key",
+            "trade_id": "paper-existing-trade",
+            "opened_at": "2026-11-10 12:00:00",
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+        }
+        self.positions_file.write_text(json.dumps([position]), encoding="utf-8")
+
+        duplicate = paper_executor.execute_paper_from_engine({
+            "plan": self._plan("paper-existing-key")
+        })
+        self.assertFalse(duplicate["ok"])
+        self.assertEqual(duplicate["payload"]["status"], "PAPER_DUPLICATE_BLOCKED")
+        self.assertTrue(json.loads(self.seen_file.read_text(encoding="utf-8"))[
+            "paper-existing-key"]["recovered_from_position_ledger"]
+        )
+
+        self.seen_file.unlink()
+        new_key = paper_executor.execute_paper_from_engine({
+            "plan": self._plan("paper-new-key")
+        })
+        self.assertFalse(new_key["ok"])
+        self.assertEqual(new_key["payload"]["status"], "PAPER_STATE_UNINITIALIZED")
+        self.assertEqual(new_key["payload"]["errors"], ["PAPER_IDEMPOTENCY_STATE_MISSING"])
+        self.assertEqual(len(self._positions()), 1)
+        self.assertFalse(self.seen_file.exists())
+
     def test_position_ledger_blocks_retry_when_seen_write_failed(self):
+        self._initialize_state()
         original_write = paper_executor._write_json
         failed_seen_write = False
 
@@ -95,6 +159,7 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertTrue(seen["paper-idempotency-test-v1"]["recovered_from_position_ledger"])
 
     def test_failed_position_write_does_not_consume_idempotency_key(self):
+        self._initialize_state()
         original_write = paper_executor._write_json
         failed_position_write = False
 
@@ -115,6 +180,7 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertEqual(len(self._positions()), 1)
 
     def test_concurrent_same_idempotency_key_opens_one_paper_position(self):
+        self._initialize_state()
         barrier = threading.Barrier(8)
 
         def execute(_index):
@@ -129,6 +195,7 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertEqual(len(self._positions()), 1)
 
     def test_corrupt_position_state_fails_closed(self):
+        self.seen_file.write_text("{}", encoding="utf-8")
         self.positions_file.write_text("{invalid", encoding="utf-8")
 
         result = paper_executor.execute_paper_from_engine({"plan": self._plan()})
@@ -136,7 +203,7 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["payload"]["status"], "PAPER_STATE_INVALID")
         self.assertEqual(self.positions_file.read_text(encoding="utf-8"), "{invalid")
-        self.assertFalse(self.seen_file.exists())
+        self.assertEqual(self.seen_file.read_text(encoding="utf-8"), "{}")
 
     def test_non_string_idempotency_key_is_rejected_before_state_access(self):
         plan = self._plan()
@@ -172,6 +239,7 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertFalse(self.log_file.exists())
 
     def test_disk_drop_before_position_write_blocks_without_committing_position(self):
+        self._initialize_state()
         ready = {
             "allowed": True,
             "status": "PAPER_PERSISTENCE_READY",
@@ -196,8 +264,8 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["payload"]["status"], "PAPER_PERSISTENCE_BLOCKED")
         self.assertEqual(result["payload"]["persistence"]["free_bytes"], 63 * 1024 * 1024)
-        self.assertFalse(self.positions_file.exists())
-        self.assertFalse(self.seen_file.exists())
+        self.assertEqual(self._positions(), [])
+        self.assertEqual(json.loads(self.seen_file.read_text(encoding="utf-8")), {})
         self.assertFalse(self.log_file.exists())
 
     def test_persistent_disk_measurement_error_blocks_integrated_paper(self):
@@ -302,6 +370,7 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertIs(outcome_evaluator.PAPER_STATE_LOCK, paper_state_storage.PAPER_STATE_LOCK)
 
     def test_lifecycle_update_waits_for_concurrent_paper_entry_and_closes_new_position(self):
+        self._initialize_state()
         paper_lifecycle.PAPER_POSITIONS_FILE = self.positions_file
         paper_lifecycle.PAPER_LIFECYCLE_LOG_FILE = self.root / "lifecycle.jsonl"
         paper_lifecycle.PAPER_LIFECYCLE_HISTORY_ENABLED = False
@@ -358,6 +427,7 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertEqual(positions[0]["status"], "CLOSED")
 
     def test_outcome_read_modify_write_cannot_overwrite_concurrent_lifecycle_close(self):
+        self._initialize_state()
         initial = paper_executor.execute_paper_from_engine(
             {"plan": self._plan("paper-outcome-lifecycle-race-v1")}
         )
