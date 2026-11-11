@@ -82,6 +82,28 @@ def _read_state_json(path: Path, default: Any) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _paper_state_shape_is_valid(positions: Any, seen: Any) -> bool:
+    """Require every persisted position to retain its idempotency identity."""
+    if not isinstance(positions, list) or not isinstance(seen, dict):
+        return False
+
+    position_keys = []
+    for position in positions:
+        if not isinstance(position, dict):
+            return False
+        key = position.get("idempotency_key")
+        if not isinstance(key, str) or not key.strip():
+            return False
+        position_keys.append(key)
+    if len(position_keys) != len(set(position_keys)):
+        return False
+
+    return all(
+        isinstance(key, str) and bool(key.strip()) and isinstance(value, dict)
+        for key, value in seen.items()
+    )
+
+
 def _write_json(path: Path, payload: Any) -> bool:
     """Durably replace one PAPER state file; report failures to the caller."""
     return write_json_atomically(path, payload)
@@ -342,15 +364,15 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
             positions = _read_state_json(PAPER_POSITIONS_FILE, [])
         except Exception:
             seen, positions = None, None
-        if not isinstance(seen, dict) or not isinstance(positions, list):
+        if not _paper_state_shape_is_valid(positions, seen):
             result = {
                 "ok": False,
                 "status": "PAPER_STATE_INVALID",
-                "reason": "estado PAPER inválido; execução bloqueada para evitar duplicidade",
+                "reason": "estado PAPER inválido ou sem identidade idempotente; execução bloqueada",
                 "version": VERSION,
                 "generated_at": _now_br(),
                 "idempotency_key": idem,
-                "errors": ["estado PAPER não é JSON object/list válido"],
+                "errors": ["estado PAPER não preserva formato e identidade idempotente válidos"],
                 "warnings": validation["warnings"],
                 "exchange_executor_called": False,
                 "paper_executor_called": True,
@@ -495,13 +517,33 @@ def paper_integrated_health() -> Dict[str, Any]:
     positions_file_present = PAPER_POSITIONS_FILE.is_file()
     seen_file_present = PAPER_SEEN_FILE.is_file()
     state_files_present = positions_file_present and seen_file_present
-    positions = _read_json(PAPER_POSITIONS_FILE, [])
-    seen = _read_json(PAPER_SEEN_FILE, {})
+    state_files_status = "PAPER_STATE_FILES_MISSING"
+    positions = None
+    seen = None
+    state_files_valid = False
+    if state_files_present:
+        try:
+            positions = _read_state_json(PAPER_POSITIONS_FILE, [])
+            seen = _read_state_json(PAPER_SEEN_FILE, {})
+        except Exception:
+            state_files_status = "PAPER_STATE_FILES_INVALID"
+        else:
+            state_files_valid = _paper_state_shape_is_valid(positions, seen)
+            state_files_status = (
+                "PAPER_STATE_FILES_PRESENT" if state_files_valid else "PAPER_STATE_FILES_INVALID"
+            )
 
-    open_positions = [
-        p for p in positions
-        if isinstance(p, dict) and p.get("status") == "OPEN"
-    ]
+    if state_files_valid:
+        open_positions = [p for p in positions if p.get("status") == "OPEN"]
+        closed_positions = [p for p in positions if p.get("status") == "CLOSED"]
+        pending_outcome = [p for p in closed_positions if not p.get("outcome_evaluated")]
+        total_count = len(positions)
+        open_count = len(open_positions)
+        closed_count = len(closed_positions)
+        pending_outcome_count = len(pending_outcome)
+        seen_count = len(seen)
+    else:
+        total_count = open_count = closed_count = pending_outcome_count = seen_count = None
 
     return {
         "ok": True,
@@ -512,10 +554,13 @@ def paper_integrated_health() -> Dict[str, Any]:
         "paper_execution_enabled": PAPER_EXECUTION_ENABLED,
         "real_execution_enabled": REAL_EXECUTION_ENABLED,
         "state_files_present": state_files_present,
-        "state_files_status": "PAPER_STATE_FILES_PRESENT" if state_files_present else "PAPER_STATE_FILES_MISSING",
-        "open_positions": len(open_positions),
-        "total_positions": len(positions),
-        "seen_count": len(seen),
+        "state_files_valid": state_files_valid,
+        "state_files_status": state_files_status,
+        "open_positions": open_count,
+        "closed_positions": closed_count,
+        "pending_outcome": pending_outcome_count,
+        "total_positions": total_count,
+        "seen_count": seen_count,
         "files": {
             "paper_positions": str(PAPER_POSITIONS_FILE),
             "paper_positions_present": positions_file_present,
@@ -532,11 +577,18 @@ def paper_integrated_health() -> Dict[str, Any]:
 
 
 def get_paper_integrated_open_positions() -> Dict[str, Any]:
-    positions = _read_json(PAPER_POSITIONS_FILE, [])
-    open_positions = [
-        p for p in positions
-        if isinstance(p, dict) and p.get("status") == "OPEN"
-    ]
+    health = paper_integrated_health()
+    if health["state_files_status"] != "PAPER_STATE_FILES_PRESENT":
+        return {
+            "ok": False,
+            "status": health["state_files_status"],
+            "generated_at": health["generated_at"],
+            "count": None,
+            "positions": None,
+        }
+
+    positions = _read_state_json(PAPER_POSITIONS_FILE, [])
+    open_positions = [p for p in positions if p.get("status") == "OPEN"]
 
     return {
         "ok": True,

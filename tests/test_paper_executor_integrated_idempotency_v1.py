@@ -81,6 +81,8 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertTrue(health["ok"])
         self.assertFalse(health["state_files_present"])
         self.assertEqual(health["state_files_status"], "PAPER_STATE_FILES_MISSING")
+        self.assertIsNone(health["open_positions"])
+        self.assertIsNone(health["total_positions"])
         self.assertFalse(health["files"]["paper_positions_present"])
         self.assertFalse(health["files"]["paper_seen_present"])
 
@@ -91,6 +93,27 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertTrue(health["state_files_present"])
         self.assertEqual(health["state_files_status"], "PAPER_STATE_FILES_PRESENT")
         self.assertEqual(health["open_positions"], 0)
+        self.assertTrue(health["state_files_valid"])
+
+    def test_health_does_not_report_zero_for_corrupt_or_unidentified_state(self):
+        self.positions_file.write_text("{invalid", encoding="utf-8")
+        self.seen_file.write_text("{}", encoding="utf-8")
+        health = paper_executor.paper_integrated_health()
+        self.assertEqual(health["state_files_status"], "PAPER_STATE_FILES_INVALID")
+        self.assertFalse(health["state_files_valid"])
+        self.assertIsNone(health["open_positions"])
+
+        self.positions_file.write_text(json.dumps([{"status": "OPEN"}]), encoding="utf-8")
+        health = paper_executor.paper_integrated_health()
+        self.assertEqual(health["state_files_status"], "PAPER_STATE_FILES_INVALID")
+        self.assertIsNone(health["total_positions"])
+
+    def test_open_positions_query_does_not_turn_missing_state_into_empty_positions(self):
+        result = paper_executor.get_paper_integrated_open_positions()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "PAPER_STATE_FILES_MISSING")
+        self.assertIsNone(result["count"])
+        self.assertIsNone(result["positions"])
 
     def test_missing_position_ledger_blocks_without_initializing_or_logging(self):
         self.seen_file.write_text("{}", encoding="utf-8")
@@ -204,6 +227,16 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertEqual(result["payload"]["status"], "PAPER_STATE_INVALID")
         self.assertEqual(self.positions_file.read_text(encoding="utf-8"), "{invalid")
         self.assertEqual(self.seen_file.read_text(encoding="utf-8"), "{}")
+
+    def test_position_without_idempotency_identity_fails_closed(self):
+        self.seen_file.write_text("{}", encoding="utf-8")
+        self.positions_file.write_text(json.dumps([{"status": "OPEN"}]), encoding="utf-8")
+
+        result = paper_executor.execute_paper_from_engine({"plan": self._plan()})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["payload"]["status"], "PAPER_STATE_INVALID")
+        self.assertEqual(json.loads(self.positions_file.read_text(encoding="utf-8")), [{"status": "OPEN"}])
 
     def test_non_string_idempotency_key_is_rejected_before_state_access(self):
         plan = self._plan()
