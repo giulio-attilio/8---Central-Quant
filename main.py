@@ -4553,21 +4553,19 @@ def execution_engine_run_route():
 
     url_mode = request.args.get("mode")
 
-    if not payload:
-        payload = {
-            "decision": "ALLOW",
-            "bot": "DONKEY",
-            "setup": "DONKEY",
-            "symbol": "ETHUSDT",
-            "side": "LONG",
-            "entry": 3501,
-            "sl": 3431,
-            "tp50": 3571,
-            "risk_pct": 2.0,
-            "capital_allocated": 4500,
-            "requested_qty": 0.1,
-            "signal_id": f"EXECUTION-ENGINE-MANUAL-TEST-{int(time.time())}",
-        }
+    if not isinstance(payload, dict) or not payload:
+        return {
+            "ok": False,
+            "mode": url_mode or "OBSERVATION_ONLY",
+            "dry_run": True,
+            "decision": "DENY",
+            "allowed": False,
+            "status": "EXECUTION_PAYLOAD_REQUIRED",
+            "sent": False,
+            "send_attempted": False,
+            "paper_executor_called": False,
+            "no_order_sent": True,
+        }, 400
 
     # Em chamadas GET, normalmente enviamos bot/symbol/side/entry/etc.,
     # mas não enviamos decision. O Execution Engine exige uma decisão executável.
