@@ -96,30 +96,33 @@ def _safe_call(fn):
         return {"ok": False, "error": str(exc)}
 
 
-def _positions_summary() -> Dict[str, Any]:
-    positions = _read_json(PAPER_POSITIONS_FILE, [])
-    if not isinstance(positions, list):
-        positions = []
-
-    open_positions = [p for p in positions if isinstance(p, dict) and p.get("status") == "OPEN"]
-    closed_positions = [p for p in positions if isinstance(p, dict) and p.get("status") == "CLOSED"]
-    pending_outcome = [p for p in closed_positions if not p.get("outcome_evaluated")]
-
-    last_trade = None
-    valid = [p for p in positions if isinstance(p, dict)]
-    if valid:
-        last_trade = sorted(
-            valid,
-            key=lambda p: p.get("closed_epoch") or p.get("opened_epoch") or 0,
-            reverse=True,
-        )[0]
+def _positions_summary(paper_health: Any) -> Dict[str, Any]:
+    state_status = (
+        paper_health.get("state_files_status")
+        if isinstance(paper_health, dict)
+        else None
+    )
+    state_ready = (
+        state_status == "PAPER_STATE_FILES_PRESENT"
+        and paper_health.get("state_files_valid") is True
+    )
+    if not state_ready:
+        return {
+            "state_files_status": state_status or "PAPER_STATE_STATUS_UNAVAILABLE",
+            "total": None,
+            "open": None,
+            "closed": None,
+            "pending_outcome": None,
+            "last_trade": None,
+        }
 
     return {
-        "total": len(valid),
-        "open": len(open_positions),
-        "closed": len(closed_positions),
-        "pending_outcome": len(pending_outcome),
-        "last_trade": last_trade,
+        "state_files_status": state_status,
+        "total": paper_health.get("total_positions"),
+        "open": paper_health.get("open_positions"),
+        "closed": paper_health.get("closed_positions"),
+        "pending_outcome": paper_health.get("pending_outcome"),
+        "last_trade": None,
     }
 
 
@@ -172,10 +175,20 @@ def build_execution_pipeline_status() -> Dict[str, Any]:
     outcome = _safe_call(outcome_evaluator_health)
     adaptive = _safe_call(adaptive_weights_health)
 
-    positions = _positions_summary()
+    positions = _positions_summary(paper)
     outcome_summary = _outcome_summary()
     adaptive_summary = _adaptive_summary()
 
+    paper_enabled = bool(
+        paper.get("paper_execution_enabled")
+        if isinstance(paper, dict)
+        else False
+    )
+    paper_state_ready = (
+        isinstance(paper, dict)
+        and paper.get("state_files_status") == "PAPER_STATE_FILES_PRESENT"
+        and paper.get("state_files_valid") is True
+    )
     components = {
         "execution_engine": {
             "ok": bool(engine and engine.get("ok")),
@@ -184,9 +197,10 @@ def build_execution_pipeline_status() -> Dict[str, Any]:
             "health": engine,
         },
         "paper_executor": {
-            "ok": bool(paper and paper.get("ok")),
+            "ok": bool(paper and paper.get("ok")) and (not paper_enabled or paper_state_ready),
             "loaded": callable(paper_integrated_health),
             "import_error": PAPER_EXECUTOR_IMPORT_ERROR,
+            "state_ready": paper_state_ready,
             "health": paper,
         },
         "paper_lifecycle": {
@@ -214,15 +228,17 @@ def build_execution_pipeline_status() -> Dict[str, Any]:
         alerts.append("Execution Engine indisponível.")
     if not components["paper_executor"]["ok"]:
         alerts.append("Paper Executor indisponível.")
+    if paper_enabled and not paper_state_ready:
+        alerts.append("Estado persistente PAPER ausente ou inválido; execução PAPER não está pronta.")
     if not components["paper_lifecycle"]["ok"]:
         alerts.append("Paper Lifecycle indisponível.")
     if not components["outcome_evaluator"]["ok"]:
         alerts.append("Outcome Evaluator indisponível.")
     if not components["adaptive_weights"]["ok"]:
         alerts.append("Adaptive Weights indisponível.")
-    if positions["pending_outcome"] > 0:
+    if positions["pending_outcome"] is not None and positions["pending_outcome"] > 0:
         alerts.append(f"{positions['pending_outcome']} trade(s) fechado(s) pendente(s) de Outcome.")
-    if positions["open"] > 0:
+    if positions["open"] is not None and positions["open"] > 0:
         alerts.append(f"{positions['open']} posição(ões) PAPER aberta(s).")
 
     real_enabled = False
