@@ -320,8 +320,25 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     with _PAPER_EXECUTION_LOCK:
+        positions_file_present = PAPER_POSITIONS_FILE.is_file()
+        seen_file_present = PAPER_SEEN_FILE.is_file()
+        if not positions_file_present:
+            result = {
+                "ok": False,
+                "status": "PAPER_STATE_UNINITIALIZED",
+                "reason": "ledger PAPER ausente; estado desconhecido, nova execução bloqueada",
+                "version": VERSION,
+                "generated_at": _now_br(),
+                "idempotency_key": idem,
+                "errors": ["PAPER_POSITION_LEDGER_MISSING"],
+                "warnings": validation["warnings"],
+                "exchange_executor_called": False,
+                "paper_executor_called": True,
+            }
+            return {"ok": False, "payload": result}
+
         try:
-            seen = _read_state_json(PAPER_SEEN_FILE, {})
+            seen = _read_state_json(PAPER_SEEN_FILE, {}) if seen_file_present else {}
             positions = _read_state_json(PAPER_POSITIONS_FILE, [])
         except Exception:
             seen, positions = None, None
@@ -380,6 +397,21 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
                 _append_jsonl(PAPER_LOG_FILE, {"event": "PAPER_DUPLICATE_BLOCKED", "payload": result})
             except Exception:
                 pass
+            return {"ok": False, "payload": result}
+
+        if not seen_file_present:
+            result = {
+                "ok": False,
+                "status": "PAPER_STATE_UNINITIALIZED",
+                "reason": "cache de idempotência PAPER ausente; nova execução bloqueada",
+                "version": VERSION,
+                "generated_at": _now_br(),
+                "idempotency_key": idem,
+                "errors": ["PAPER_IDEMPOTENCY_STATE_MISSING"],
+                "warnings": validation["warnings"],
+                "exchange_executor_called": False,
+                "paper_executor_called": True,
+            }
             return {"ok": False, "payload": result}
 
         positions.append(position)
@@ -460,6 +492,9 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def paper_integrated_health() -> Dict[str, Any]:
+    positions_file_present = PAPER_POSITIONS_FILE.is_file()
+    seen_file_present = PAPER_SEEN_FILE.is_file()
+    state_files_present = positions_file_present and seen_file_present
     positions = _read_json(PAPER_POSITIONS_FILE, [])
     seen = _read_json(PAPER_SEEN_FILE, {})
 
@@ -476,13 +511,17 @@ def paper_integrated_health() -> Dict[str, Any]:
         "generated_at": _now_br(),
         "paper_execution_enabled": PAPER_EXECUTION_ENABLED,
         "real_execution_enabled": REAL_EXECUTION_ENABLED,
+        "state_files_present": state_files_present,
+        "state_files_status": "PAPER_STATE_FILES_PRESENT" if state_files_present else "PAPER_STATE_FILES_MISSING",
         "open_positions": len(open_positions),
         "total_positions": len(positions),
         "seen_count": len(seen),
         "files": {
             "paper_positions": str(PAPER_POSITIONS_FILE),
+            "paper_positions_present": positions_file_present,
             "paper_log": str(PAPER_LOG_FILE),
             "paper_seen": str(PAPER_SEEN_FILE),
+            "paper_seen_present": seen_file_present,
         },
         "notes": [
             "Executor paper integrado ao Execution Engine V2.",
