@@ -236,10 +236,13 @@ if __name__ == "__main__":
     elif sys.argv[1:] == ["--personal-http-auth"]:
         cases = (
             "test_personal_http_auth_gate_v1.py",
+            "test_execution_engine_empty_payload_guard_v1.py",
             "test_personal_thread_diagnostics.py",
             "test_falcon_central_only_reconciliation.py",
             "test_falcon_manual_close_outcome_reconciliation_v1.py",
         )
+    elif sys.argv[1:] == ["--execution-payload-guard"]:
+        cases = ("test_execution_engine_empty_payload_guard_v1.py",)
     elif sys.argv[1:] == ["--learning-cursor-guard"]:
         cases = ("test_executive_policy_learning_cursor_guard_v1.py",)
     elif sys.argv[1:] == ["--telegram-notification-policy"]:
@@ -367,6 +370,8 @@ if __name__ == "__main__":
     elif sys.argv[1:] == ["--trading-mode-defaults"]:
         filters = []
     elif sys.argv[1:] == ["--personal-http-auth"]:
+        filters = []
+    elif sys.argv[1:] == ["--execution-payload-guard"]:
         filters = []
     elif sys.argv[1:] == ["--learning-cursor-guard"]:
         filters = []
