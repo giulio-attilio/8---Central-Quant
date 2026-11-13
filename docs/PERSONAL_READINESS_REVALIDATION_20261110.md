@@ -283,3 +283,8 @@ Também aprovadas anteriormente no mesmo HEAD: `--static-runtime` (30), `--perso
 - Rodou com dados em diretório temporário, sem importar/iniciar `main.py`; sockets de conexão, DNS, `urlopen`, conexão HTTP e subprocessos foram bloqueados antes da coleta dos testes. Nenhuma dependência foi instalada; `ccxt` continua ausente no Python global, logo essa seleção não cobriu funções de `broker.py` que dependem do cliente real.
 - Os resultados verificam contratos com fixtures e funções isoladas; não são teste de integração com BingX, não verificam a conta atual e não demonstram fills/ordens reais ou comportamento em produção.
 
+### Contrato local de fill e sizing do disaster stop — 2026-11-13
+
+- `tests/test_broker_entry_fill_stop_sizing_v1.py`: **11 passed em 0,48 s**, com sockets/DNS, chamadas HTTP e subprocessos bloqueados e dados em diretório temporário.
+- O teste valida a função pura `validate_entry_fill_for_disaster_stop()` com fills/identidades sintéticos. Como `ccxt` não está instalado, foi usado apenas um módulo Python vazio em `sys.modules` para satisfazer o import; nenhum método do cliente foi chamado. Isso não valida a biblioteca `ccxt`, respostas reais da BingX, ordem, fill, stop criado ou integração em produção.
+
