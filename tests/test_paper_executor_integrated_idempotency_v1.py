@@ -132,9 +132,17 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         position = {
             "idempotency_key": "paper-existing-key",
             "trade_id": "paper-existing-trade",
+            "status": "OPEN",
+            "mode": "PAPER",
             "opened_at": "2026-11-10 12:00:00",
             "symbol": "BTCUSDT",
             "side": "LONG",
+            "entry": 100.0,
+            "sl_initial": 95.0,
+            "sl_current": 95.0,
+            "tp50": 110.0,
+            "exchange_executor_called": False,
+            "real_exchange_order_id": None,
         }
         self.positions_file.write_text(json.dumps([position]), encoding="utf-8")
 
@@ -237,6 +245,70 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["payload"]["status"], "PAPER_STATE_INVALID")
         self.assertEqual(json.loads(self.positions_file.read_text(encoding="utf-8")), [{"status": "OPEN"}])
+
+    def test_unknown_position_status_fails_closed_in_health_and_execution(self):
+        self._initialize_state()
+        opened = paper_executor.execute_paper_from_engine({"plan": self._plan("paper-status-v1")})
+        self.assertTrue(opened["ok"])
+        positions = self._positions()
+        positions[0]["status"] = "UNKNOWN"
+        self.positions_file.write_text(json.dumps(positions), encoding="utf-8")
+
+        health = paper_executor.paper_integrated_health()
+        result = paper_executor.execute_paper_from_engine({"plan": self._plan("paper-next-v1")})
+
+        self.assertEqual(health["state_files_status"], "PAPER_STATE_FILES_INVALID")
+        self.assertIsNone(health["open_positions"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["payload"]["status"], "PAPER_STATE_INVALID")
+        self.assertEqual(len(self._positions()), 1)
+
+    def test_noncanonical_persisted_idempotency_key_fails_closed(self):
+        self._initialize_state()
+        opened = paper_executor.execute_paper_from_engine({"plan": self._plan("paper-key-v1")})
+        self.assertTrue(opened["ok"])
+        positions = self._positions()
+        positions[0]["idempotency_key"] = " paper-key-v1 "
+        self.positions_file.write_text(json.dumps(positions), encoding="utf-8")
+
+        result = paper_executor.execute_paper_from_engine({"plan": self._plan("paper-next-v1")})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["payload"]["status"], "PAPER_STATE_INVALID")
+
+    def test_non_finite_persisted_entry_or_stop_fails_closed(self):
+        for field in ("entry", "sl_initial", "sl_current"):
+            with self.subTest(field=field):
+                self._initialize_state()
+                opened = paper_executor.execute_paper_from_engine({"plan": self._plan(f"paper-ledger-{field}")})
+                self.assertTrue(opened["ok"])
+                positions = self._positions()
+                positions[0][field] = float("nan")
+                self.positions_file.write_text(json.dumps(positions), encoding="utf-8")
+
+                health = paper_executor.paper_integrated_health()
+                result = paper_executor.execute_paper_from_engine({"plan": self._plan(f"paper-next-{field}")})
+
+                self.assertEqual(health["state_files_status"], "PAPER_STATE_FILES_INVALID")
+                self.assertIsNone(health["open_positions"])
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["payload"]["status"], "PAPER_STATE_INVALID")
+                self.assertEqual(len(self._positions()), 1)
+
+    def test_non_finite_entry_and_stop_are_rejected(self):
+        for field in ("entry", "sl"):
+            for value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(field=field, value=value):
+                    plan = self._plan(f"paper-nonfinite-{field}")
+                    plan["payload"][field] = value
+                    validation = paper_executor.validate_paper_plan(plan)
+                    self.assertFalse(validation["ok"])
+                    self.assertIsNone(validation["normalized"][field])
+
+    def test_safe_float_uses_default_for_non_finite_values(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                self.assertEqual(paper_executor._safe_float(value, 0.0), 0.0)
 
     def test_non_string_idempotency_key_is_rejected_before_state_access(self):
         plan = self._plan()

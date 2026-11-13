@@ -18,6 +18,7 @@ import json
 import shutil
 import time
 import hashlib
+import math
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -83,7 +84,7 @@ def _read_state_json(path: Path, default: Any) -> Any:
 
 
 def _paper_state_shape_is_valid(positions: Any, seen: Any) -> bool:
-    """Require every persisted position to retain its idempotency identity."""
+    """Reject persisted position rows whose identity or lifecycle is ambiguous."""
     if not isinstance(positions, list) or not isinstance(seen, dict):
         return False
 
@@ -92,14 +93,23 @@ def _paper_state_shape_is_valid(positions: Any, seen: Any) -> bool:
         if not isinstance(position, dict):
             return False
         key = position.get("idempotency_key")
-        if not isinstance(key, str) or not key.strip():
+        if not isinstance(key, str) or not key.strip() or key != key.strip():
             return False
+        if position.get("status") not in {"OPEN", "CLOSED"}:
+            return False
+        for field in ("entry", "sl_initial", "sl_current"):
+            numeric_value = _safe_float(position.get(field))
+            if numeric_value is None or numeric_value <= 0:
+                return False
         position_keys.append(key)
     if len(position_keys) != len(set(position_keys)):
         return False
 
     return all(
-        isinstance(key, str) and bool(key.strip()) and isinstance(value, dict)
+        isinstance(key, str)
+        and bool(key.strip())
+        and key == key.strip()
+        and isinstance(value, dict)
         for key, value in seen.items()
     )
 
@@ -118,7 +128,8 @@ def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         if value is None:
             return default
-        return float(value)
+        result = float(value)
+        return result if math.isfinite(result) else default
     except Exception:
         return default
 
