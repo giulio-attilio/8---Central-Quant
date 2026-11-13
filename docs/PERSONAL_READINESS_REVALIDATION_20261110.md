@@ -312,3 +312,8 @@ Também aprovadas anteriormente no mesmo HEAD: `--static-runtime` (30), `--perso
 - Repeti os mesmos dez módulos offline após corrigir o fixture: **624 passed em 716,66 s**. Inclui projeção de lifecycle, contenção de falha de stop inicial, forensics de disaster stop, fail-closed do execution engine, auth de fallback/stop, recovery terminal, caminho único LIVE, preflight e leitura de posições.
 - Dados de Registry/serviço em diretório temporário; socket/DNS/HTTP/subprocess bloqueados antes da coleta; plugins pytest externos desabilitados. Foi usado um stub `ccxt` vazio somente para importação; sem chamada ao cliente ou à BingX. Resultado valida contratos isolados e fixtures, não integração ou comportamento de produção.
 
+### Observabilidade de autenticação da rota de execução — 2026-11-13
+
+- Render request logs somente leitura, janela móvel de 30 dias: dois `GET /execution/engine/run` retornaram `401`; nenhuma chamada `POST` aos quatro aliases de execução foi retornada. Não registrei IP nem user-agent. Isso confirma rejeição de duas solicitações sem autenticação, mas não prova sucesso/autenticação em todas as rotas nem ausência de chamadas anteriores à janela.
+- Billing atual não foi confirmado pelo Render MCP; a ferramenta não expõe uso/custos. A tentativa de leitura no painel também não pôde prosseguir porque os backends de automação de UI falharam na inicialização. O custo do build/deploy permanece incerto e nenhuma ação externa foi iniciada.
+
