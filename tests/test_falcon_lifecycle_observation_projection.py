@@ -105,7 +105,7 @@ def test_live_order_projection_preserves_complete_factual_stop_without_importing
 
 
 def test_protected_entry_with_ack_persistence_failure_is_consumed_and_registered_once():
-    health = {}
+    health = {"falcon_live_management_reconciliation_ready": True}
     sync = _function(
         "falcon_sync_live_order_state",
         {
@@ -222,6 +222,12 @@ def test_protected_entry_with_ack_persistence_failure_is_consumed_and_registered
             "_ORIGINAL_EXECUTE_SIGNAL_IF_ALLOWED_BEFORE_RPM_V1": original_consumer,
             "falcon_sync_live_order_state": sync,
             "HEALTH": health,
+            # The AST helper loads this function without Falcon's module imports;
+            # keep this projection test focused on the wrapper body.
+            "guard_live_flow": lambda *_args, **_kwargs: (lambda function: function),
+            "RUNTIME_DRAIN": object(),
+            "_falcon_live_entry_flow_enabled": lambda *_args, **_kwargs: False,
+            "_falcon_runtime_drain_denial": lambda *_args, **_kwargs: {},
         },
     )
     signal = {

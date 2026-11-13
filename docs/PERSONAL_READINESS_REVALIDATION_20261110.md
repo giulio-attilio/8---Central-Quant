@@ -288,3 +288,16 @@ Também aprovadas anteriormente no mesmo HEAD: `--static-runtime` (30), `--perso
 - `tests/test_broker_entry_fill_stop_sizing_v1.py`: **11 passed em 0,48 s**, com sockets/DNS, chamadas HTTP e subprocessos bloqueados e dados em diretório temporário.
 - O teste valida a função pura `validate_entry_fill_for_disaster_stop()` com fills/identidades sintéticos. Como `ccxt` não está instalado, foi usado apenas um módulo Python vazio em `sys.modules` para satisfazer o import; nenhum método do cliente foi chamado. Isso não valida a biblioteca `ccxt`, respostas reais da BingX, ordem, fill, stop criado ou integração em produção.
 
+### Render e disponibilidade da branch candidata — 2026-11-13 07:21 UTC
+
+- Render MCP somente leitura confirmou `central-robos-bingx` ainda Live em `8de7431909227a2d7ecae50000f06912b21529bc`, auto-deploy desligado, uma instância Standard em Oregon e disco persistente `/data` de 4 GB. `healthCheckPath` continua vazio e a allowlist de IP é `0.0.0.0/0`; a autenticação HTTP da aplicação é uma camada separada e precisa continuar sendo mantida.
+- Entre `06:20Z` e `07:21Z`, consulta de logs com severidade error/fatal retornou zero linhas; filtro de app por `Traceback`, `NoneType` e `PAPER_POSITION_LEDGER_MISSING` também retornou zero. As métricas mostram uma instância, CPU aproximadamente 0,06–0,60 unidades e memória aproximadamente 0,79–0,98 GiB. Métricas HTTP filtradas para `/healthz` vieram vazias; portanto não comprovam tráfego/latência do endpoint nem readiness de trading.
+- GitHub somente leitura: a branch local `codex/paper-ledger-guard-release-8de7431-20261113` não foi encontrada no remoto e `fetch_commit` do candidato `8c02d37607d1f85540a069ffff03a9d221e74504` retornou “No commit found”. O SHA está apenas no histórico local; para o Render poder buscá-lo é necessário publicar um ref/branch sem force push antes do deploy.
+- Nenhum push, deploy, ajuste de variável, alteração do disco/Registry, ordem, leitura de segredo ou ação financeira foi feito. Custo de pipeline do próximo build não pôde ser confirmado como zero; implantação permanece pendente de autorização financeira específica.
+
+### Regressão do teste de projeção de ciclo Falcon — 2026-11-13
+
+- Seleção offline de 10 módulos de segurança/ciclo: **623 passed, 1 failed em 754,24 s**. A falha foi `test_protected_entry_with_ack_persistence_failure_is_consumed_and_registered_once`: o teste AST-isolado não injetava o decorador `guard_live_flow` nem marcava a reconciliação LIVE como pronta para alcançar o cenário que pretendia testar. A falha ocorria antes do corpo do teste exercitar o comportamento previsto.
+- Ajustei somente o fixture do teste para usar um decorador identity e declarar `falcon_live_management_reconciliation_ready=True` naquele cenário pós-preflight. O código de produção e os controles LIVE/PAPER não foram alterados. O teste específico passou (**1 passed em 3,32 s**) e o arquivo completo passou (**11 passed em 7,53 s**) com diretório de dados temporário, plugins pytest externos desabilitados e socket/DNS/HTTP/subprocess bloqueados.
+- A correção do fixture não demonstra por si só o comportamento de `guard_live_flow`; seus gates permanecem cobertos por seleções separadas. Os outros nove módulos passaram na seleção original, mas a seleção completa de dez não foi repetida após o ajuste pontual.
+
