@@ -277,3 +277,9 @@ Também aprovadas anteriormente no mesmo HEAD: `--static-runtime` (30), `--perso
 - O custo e saldo de uso do próximo build/deploy não foram consultados nem confirmados como zero. A documentação Render atual informa que deploys consomem minutos de pipeline e que disco persistente desabilita zero-downtime; nenhum deploy foi acionado. Não houve alteração do serviço, variáveis, disco, Registry, ordens ou acesso a segredos.
 - Referências oficiais consultadas nesta data: `https://render.com/docs/deploys.md` (minutos de pipeline e efeito do disco) e `https://render.com/docs/health-checks.md` (probe TCP padrão e critérios HTTP).
 
+### Regressões offline de reconciliação — 2026-11-13
+
+- Seleção de quatro arquivos: `test_falcon_manual_close_outcome_reconciliation_v1.py`, `test_falcon_central_only_reconciliation.py`, `test_live_position_reconciliation_risk_gate_v1.py` e `test_real_close_identity_backfill_v1.py`: **106 passed em 454,06 s**.
+- Rodou com dados em diretório temporário, sem importar/iniciar `main.py`; sockets de conexão, DNS, `urlopen`, conexão HTTP e subprocessos foram bloqueados antes da coleta dos testes. Nenhuma dependência foi instalada; `ccxt` continua ausente no Python global, logo essa seleção não cobriu funções de `broker.py` que dependem do cliente real.
+- Os resultados verificam contratos com fixtures e funções isoladas; não são teste de integração com BingX, não verificam a conta atual e não demonstram fills/ordens reais ou comportamento em produção.
+
