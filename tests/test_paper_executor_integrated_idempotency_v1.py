@@ -78,7 +78,7 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
     def test_health_reports_missing_state_files_separately_from_empty_files(self):
         health = paper_executor.paper_integrated_health()
 
-        self.assertTrue(health["ok"])
+        self.assertFalse(health["ok"])
         self.assertFalse(health["state_files_present"])
         self.assertEqual(health["state_files_status"], "PAPER_STATE_FILES_MISSING")
         self.assertIsNone(health["open_positions"])
@@ -90,6 +90,7 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.seen_file.write_text("{}", encoding="utf-8")
         health = paper_executor.paper_integrated_health()
 
+        self.assertTrue(health["ok"])
         self.assertTrue(health["state_files_present"])
         self.assertEqual(health["state_files_status"], "PAPER_STATE_FILES_PRESENT")
         self.assertEqual(health["open_positions"], 0)
@@ -99,6 +100,7 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.positions_file.write_text("{invalid", encoding="utf-8")
         self.seen_file.write_text("{}", encoding="utf-8")
         health = paper_executor.paper_integrated_health()
+        self.assertFalse(health["ok"])
         self.assertEqual(health["state_files_status"], "PAPER_STATE_FILES_INVALID")
         self.assertFalse(health["state_files_valid"])
         self.assertIsNone(health["open_positions"])

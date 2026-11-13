@@ -557,7 +557,7 @@ def paper_integrated_health() -> Dict[str, Any]:
         total_count = open_count = closed_count = pending_outcome_count = seen_count = None
 
     return {
-        "ok": True,
+        "ok": bool(not PAPER_EXECUTION_ENABLED or state_files_valid),
         "module": "paper_executor_integrated",
         "loaded": True,
         "version": VERSION,
