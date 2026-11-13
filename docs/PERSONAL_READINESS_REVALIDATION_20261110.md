@@ -301,3 +301,9 @@ Também aprovadas anteriormente no mesmo HEAD: `--static-runtime` (30), `--perso
 - Ajustei somente o fixture do teste para usar um decorador identity e declarar `falcon_live_management_reconciliation_ready=True` naquele cenário pós-preflight. O código de produção e os controles LIVE/PAPER não foram alterados. O teste específico passou (**1 passed em 3,32 s**) e o arquivo completo passou (**11 passed em 7,53 s**) com diretório de dados temporário, plugins pytest externos desabilitados e socket/DNS/HTTP/subprocess bloqueados.
 - A correção do fixture não demonstra por si só o comportamento de `guard_live_flow`; seus gates permanecem cobertos por seleções separadas. Os outros nove módulos passaram na seleção original, mas a seleção completa de dez não foi repetida após o ajuste pontual.
 
+### Revalidação offline de autenticação e estado PAPER — HEAD 561a533
+
+- `test_personal_http_auth_gate_v1.py`, `test_paper_executor_integrated_idempotency_v1.py` e `test_execution_pipeline_status_paper_state_v1.py`: **190 passed, 12 subtests passed em 28,72 s**.
+- Execução no HEAD local `561a533ba29e26448ca1b5faa0fc8c7c2cfe4ee5`, com `CENTRAL_DATA_DIR`, `DATA_DIR` e `TRADE_REGISTRY_FILE` em pasta temporária; sockets/DNS/HTTP e `subprocess.Popen` bloqueados antes da coleta; plugins pytest externos desabilitados. Foi injetado um módulo `ccxt` inerte apenas para satisfazer importação; nenhuma chamada de broker foi feita.
+- Reconsulta Render MCP somente leitura confirmou que o deploy Live continua em `8de7431909227a2d7ecae50000f06912b21529bc`, auto-deploy desligado, uma instância e disco `/data` de 4 GB. Não houve push, deploy, mudança de ambiente ou acesso a segredos.
+
