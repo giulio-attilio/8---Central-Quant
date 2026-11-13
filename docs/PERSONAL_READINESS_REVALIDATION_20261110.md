@@ -307,3 +307,8 @@ Também aprovadas anteriormente no mesmo HEAD: `--static-runtime` (30), `--perso
 - Execução no HEAD local `561a533ba29e26448ca1b5faa0fc8c7c2cfe4ee5`, com `CENTRAL_DATA_DIR`, `DATA_DIR` e `TRADE_REGISTRY_FILE` em pasta temporária; sockets/DNS/HTTP e `subprocess.Popen` bloqueados antes da coleta; plugins pytest externos desabilitados. Foi injetado um módulo `ccxt` inerte apenas para satisfazer importação; nenhuma chamada de broker foi feita.
 - Reconsulta Render MCP somente leitura confirmou que o deploy Live continua em `8de7431909227a2d7ecae50000f06912b21529bc`, auto-deploy desligado, uma instância e disco `/data` de 4 GB. Não houve push, deploy, mudança de ambiente ou acesso a segredos.
 
+### Repetição completa do lote de segurança/ciclo após ajuste do fixture — HEAD 3341f68
+
+- Repeti os mesmos dez módulos offline após corrigir o fixture: **624 passed em 716,66 s**. Inclui projeção de lifecycle, contenção de falha de stop inicial, forensics de disaster stop, fail-closed do execution engine, auth de fallback/stop, recovery terminal, caminho único LIVE, preflight e leitura de posições.
+- Dados de Registry/serviço em diretório temporário; socket/DNS/HTTP/subprocess bloqueados antes da coleta; plugins pytest externos desabilitados. Foi usado um stub `ccxt` vazio somente para importação; sem chamada ao cliente ou à BingX. Resultado valida contratos isolados e fixtures, não integração ou comportamento de produção.
+
