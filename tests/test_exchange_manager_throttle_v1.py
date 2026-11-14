@@ -1502,3 +1502,58 @@ def test_broker_authenticated_client_installs_shared_guards():
         and node.args[0].id == "ex"
         for node in ast.walk(exchange_function)
     )
+
+
+def test_cobra_position_report_does_not_render_missing_price_as_zero():
+    import math
+
+    tree = ast.parse((BOT_DIR / "cobra.py").read_text(encoding="utf-8"))
+    wanted = {
+        "_cobra_ticker_last_price",
+        "_cobra_position_pnl_sort_key",
+        "fmt_pct",
+        "fmt_r",
+        "obter_posicoes_ativas_ordenadas",
+    }
+    functions = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted
+    ]
+    assert {node.name for node in functions} == wanted
+
+    positions = {
+        "BTC/USDT:USDT": {
+            "status": "ABERTA", "side": "LONG", "entry": 100.0, "sl": 90.0,
+        },
+        "ETH/USDT:USDT": {
+            "status": "ABERTA", "side": "LONG", "entry": 100.0, "sl": 90.0,
+            "preco_atual": 88.0, "pnl_atual": -12.0, "r_atual": -1.2,
+        },
+    }
+    tickers = {
+        "BTC/USDT:USDT": {"last": "110"},
+        "ETH/USDT:USDT": {"last": "nan"},
+    }
+    namespace = {
+        "math": math,
+        "carregar_posicoes": lambda: positions,
+        "safe_fetch_ticker": lambda symbol: tickers[symbol],
+        "pnl_pct": lambda _side, entry, price: (price - entry) / entry * 100,
+        "pnl_r": lambda _side, entry, sl, price: (price - entry) / (entry - sl),
+    }
+    isolated = ast.Module(body=functions, type_ignores=[])
+    exec(
+        compile(ast.fix_missing_locations(isolated), "cobra.py:position_report", "exec"),
+        namespace,
+    )
+
+    result = namespace["obter_posicoes_ativas_ordenadas"]()
+
+    assert [row["pnl_atual"] for row in result] == [10.0, None]
+    unavailable = next(row for row in result if row.get("preco_atual") is None)
+    assert unavailable["pnl_atual"] is None
+    assert unavailable["r_atual"] is None
+    assert unavailable["price_status"] == "UNAVAILABLE"
+    assert namespace["fmt_pct"](None) == "indisponível"
+    assert namespace["fmt_r"](None) == "indisponível"
+    assert namespace["fmt_pct"](0) == "+0,00%"

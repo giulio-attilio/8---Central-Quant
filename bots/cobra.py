@@ -420,6 +420,15 @@ def _cobra_ticker_last_price(ticker):
         return None
     return price if price > 0 and math.isfinite(price) else None
 
+
+def _cobra_position_pnl_sort_key(position):
+    """Sort priced positions first; unknown PnL must not masquerade as zero."""
+    try:
+        pnl = float(position.get("pnl_atual"))
+    except (TypeError, ValueError, OverflowError):
+        return (False, 0.0)
+    return (math.isfinite(pnl), pnl if math.isfinite(pnl) else 0.0)
+
 def safe_load_markets(max_retries=3):
     for attempt in range(max_retries):
         try:
@@ -473,12 +482,16 @@ def fmt_br(v):
         return str(v)
 
 def fmt_pct(v):
+    if v is None:
+        return "indisponível"
     try:
         return f"{float(v):+.2f}%".replace(".", ",")
     except Exception:
         return str(v)
 
 def fmt_r(v):
+    if v is None:
+        return "indisponível"
     try:
         return f"{float(v):.2f}R".replace(".", ",")
     except Exception:
@@ -1635,23 +1648,27 @@ def obter_posicoes_ativas_ordenadas():
         try:
             # USO DA FUNÇÃO SEGURA AQUI TAMBÉM
             ticker = safe_fetch_ticker(symbol)
-            if ticker:
-                price = float(ticker["last"])
+            price = _cobra_ticker_last_price(ticker)
+            if price is not None:
                 p = dict(p)
                 p["preco_atual"] = price
                 p["pnl_atual"] = pnl_pct(p["side"], float(p["entry"]), price)
                 p["r_atual"] = pnl_r(p["side"], float(p["entry"]), float(p.get("initial_sl", p.get("sl"))), price)
             else:
                 p = dict(p)
-                p["pnl_atual"] = 0
-                p["r_atual"] = 0
+                p["preco_atual"] = None
+                p["pnl_atual"] = None
+                p["r_atual"] = None
+                p["price_status"] = "UNAVAILABLE"
             ativos.append(p)
         except Exception:
             p = dict(p)
-            p["pnl_atual"] = 0
-            p["r_atual"] = 0
+            p["preco_atual"] = None
+            p["pnl_atual"] = None
+            p["r_atual"] = None
+            p["price_status"] = "UNAVAILABLE"
             ativos.append(p)
-    ativos.sort(key=lambda x: x.get("pnl_atual", 0), reverse=True)
+    ativos.sort(key=_cobra_position_pnl_sort_key, reverse=True)
     return ativos
 
 def montar_posicoes():
