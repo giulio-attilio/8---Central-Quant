@@ -17,10 +17,18 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from paper_state_storage import resolve_paper_data_dir
+
 
 VERSION = "2026-07-04-EXECUTION-PIPELINE-STATUS-V1"
 
-DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data"))
+
+def _resolve_data_dir() -> Path:
+    """Use the same persistent-data precedence as the PAPER state modules."""
+    return resolve_paper_data_dir(__file__)
+
+
+DATA_DIR = _resolve_data_dir()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 PAPER_POSITIONS_FILE = DATA_DIR / "paper_integrated_positions.json"

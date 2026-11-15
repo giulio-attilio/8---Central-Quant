@@ -354,6 +354,17 @@ foi enviada e nenhum dado ou arquivo de produção foi modificado.
   Shell foi aberta. A saída autenticada fornecida pelo operador às 11:27 BRT
   permanece a evidência de ledger mais recente neste trabalho.
 - O estado local contém os commits `f5df2ea` (hardening PAPER) e `4e4c012`
-  (documentação), mais a correção acima em validação local. A alteração
+  (documentação), e `d4d670a` (listagem fail-closed e este adendo). A alteração
   preexistente do operador em
   `tests/test_paper_executor_integrated_idempotency_v1.py` permanece intocada.
+- A auditoria do caminho foi ampliada ao `execution_pipeline_status.py`,
+  `adaptive_weights.py`, `execution_engine.py` e `execution_orchestrator.py`:
+  todos ainda tinham fallback próprio para `/opt/render/project/src/data`, sem
+  considerar `DATA_DIR=/data` em importações fora do bootstrap de `main.py`.
+  Agora usam o resolvedor comum. Testes conferem que os sete módulos da cadeia
+  PAPER resolvem a mesma pasta nas quatro condições de precedência. Regressão
+  offline `--paper-integrated-disk-guard` após essa ampliação: **53 passaram e
+  12 subtestes passaram**; `--paper-lifecycle-disk-failures`: **5 passaram**;
+  `--paper-lifecycle-integration`: **110 passaram**. As alterações de caminho
+  posteriores a `d4d670a` foram validadas e consolidadas apenas localmente, sem
+  push/deploy; a alteração preexistente do operador continua fora do stage.

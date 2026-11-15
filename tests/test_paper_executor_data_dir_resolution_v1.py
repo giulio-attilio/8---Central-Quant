@@ -1,6 +1,10 @@
 import os
 from pathlib import Path
 
+import adaptive_weights
+import execution_engine
+import execution_orchestrator
+import execution_pipeline_status
 import paper_executor_integrated
 import outcome_evaluator
 import paper_lifecycle
@@ -9,6 +13,10 @@ import paper_lifecycle
 def test_executor_lifecycle_and_outcome_share_the_resolved_storage_path():
     assert paper_executor_integrated.DATA_DIR == paper_lifecycle.DATA_DIR
     assert paper_executor_integrated.DATA_DIR == outcome_evaluator.DATA_DIR
+    assert paper_executor_integrated.DATA_DIR == execution_pipeline_status.DATA_DIR
+    assert paper_executor_integrated.DATA_DIR == adaptive_weights.DATA_DIR
+    assert paper_executor_integrated.DATA_DIR == execution_engine.DATA_DIR
+    assert paper_executor_integrated.DATA_DIR == execution_orchestrator.DATA_DIR
 
 
 def test_central_data_dir_takes_precedence_over_data_dir(monkeypatch, tmp_path):
@@ -18,6 +26,10 @@ def test_central_data_dir_takes_precedence_over_data_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("DATA_DIR", str(generic))
 
     assert paper_executor_integrated._resolve_data_dir() == central
+    assert execution_pipeline_status._resolve_data_dir() == central
+    assert adaptive_weights._resolve_data_dir() == central
+    assert execution_engine._resolve_data_dir() == central
+    assert execution_orchestrator._resolve_data_dir() == central
 
 
 def test_data_dir_is_used_when_central_data_dir_is_unset(monkeypatch, tmp_path):
@@ -26,6 +38,10 @@ def test_data_dir_is_used_when_central_data_dir_is_unset(monkeypatch, tmp_path):
     monkeypatch.setenv("DATA_DIR", str(configured))
 
     assert paper_executor_integrated._resolve_data_dir() == configured
+    assert execution_pipeline_status._resolve_data_dir() == configured
+    assert adaptive_weights._resolve_data_dir() == configured
+    assert execution_engine._resolve_data_dir() == configured
+    assert execution_orchestrator._resolve_data_dir() == configured
 
 
 def test_render_mount_is_used_when_no_environment_path_is_configured(monkeypatch):
@@ -37,8 +53,11 @@ def test_render_mount_is_used_when_no_environment_path_is_configured(monkeypatch
         "isdir",
         lambda path: True if path == "/data" else original_isdir(path),
     )
-
     assert paper_executor_integrated._resolve_data_dir() == Path("/data")
+    assert execution_pipeline_status._resolve_data_dir() == Path("/data")
+    assert adaptive_weights._resolve_data_dir() == Path("/data")
+    assert execution_engine._resolve_data_dir() == Path("/data")
+    assert execution_orchestrator._resolve_data_dir() == Path("/data")
 
 
 def test_local_fallback_is_module_relative_when_render_mount_is_absent(monkeypatch):
@@ -48,6 +67,18 @@ def test_local_fallback_is_module_relative_when_render_mount_is_absent(monkeypat
 
     assert paper_executor_integrated._resolve_data_dir() == (
         Path(paper_executor_integrated.__file__).resolve().parent / "data"
+    )
+    assert execution_pipeline_status._resolve_data_dir() == (
+        Path(execution_pipeline_status.__file__).resolve().parent / "data"
+    )
+    assert adaptive_weights._resolve_data_dir() == (
+        Path(adaptive_weights.__file__).resolve().parent / "data"
+    )
+    assert execution_engine._resolve_data_dir() == (
+        Path(execution_engine.__file__).resolve().parent / "data"
+    )
+    assert execution_orchestrator._resolve_data_dir() == (
+        Path(execution_orchestrator.__file__).resolve().parent / "data"
     )
 
 
