@@ -389,3 +389,9 @@ foi enviada e nenhum dado ou arquivo de produção foi modificado.
   **1 passou, 59 deselected**. Em conjunto com `--c3-dormant-startup` (24 + 3
   subtestes), valida contratos locais selecionados, mas não substitui auditoria
   do estado atual do filesystem de produção nem prova todos os writers externos.
+- A seleção ampla `--registry-writers` executou **60 testes passaram em 74,92 s**;
+  o resultado sustenta os contratos locais de serialização dos writers cobertos,
+  não prova simultaneidade de processos externos em produção. O
+  `--paper-integrated-disk-guard` foi reexecutado com o estado atual do checkout:
+  **53 passaram e 12 subtestes passaram**. O teste modificado pelo operador
+  permaneceu fora de qualquer stage/commit.
