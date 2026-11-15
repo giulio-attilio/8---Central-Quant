@@ -61,9 +61,11 @@ autorize essa migração.
 
 ## Evidência local atual
 
-Worktree: branch `codex/falcon-paper-persist-guard-20261115`, HEAD
-`f24967ad6d7007ee5e58635a363b55f5ab9f715d`. Alterações locais posteriores a
-esse commit estão pendentes e não foram publicadas.
+Worktree: branch `codex/falcon-paper-persist-guard-20261115`, consolidado
+localmente no commit `f5df2eaa49729d6b438b072bfee77242fec75e45`. O arquivo
+`tests/test_paper_executor_integrated_idempotency_v1.py` ainda contém uma
+alteração preexistente do operador, preservada fora do commit. Nada foi enviado
+ao remoto nem implantado.
 
 O ajuste local em `bots/falcon.py` acrescenta um latch persistente para falhas de
 persistência de sinal PAPER: gravação atômica no diretório `CENTRAL_DATA_DIR` ou
@@ -268,10 +270,11 @@ foi enviada e nenhum dado ou arquivo de produção foi modificado.
   — **52 passaram e 12 subtestes passaram em 2,53 s**. A seleção também revalida
   inicialização apenas em fixture temporária, ledger ausente bloqueando e
   ausência de chamada à corretora.
-- `git diff --check` sem erros. A alteração está apenas no worktree local, não
-  commitada nem implantada. O comportamento de produção continua sendo o do
-  SHA Live observado anteriormente até que exista release validado e condições
-  financeiras autorizadas.
+- `git diff --check` sem erros. A alteração está consolidada localmente no
+  commit `f5df2eaa49729d6b438b072bfee77242fec75e45`, sem push ou deploy. O
+  comportamento de produção continua sendo o do SHA Live observado
+  anteriormente até que exista release validado e condições financeiras
+  autorizadas.
 
 ## Recheck de produção somente leitura — 2026-11-15 15:39 UTC
 
