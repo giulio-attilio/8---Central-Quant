@@ -325,6 +325,67 @@ def test_protected_entry_with_ack_persistence_failure_is_consumed_and_registered
     assert open_metadata["disaster_stop_operationally_armed"] is True
 
 
+def test_paper_entry_stops_when_accepted_signal_persistence_requires_reconciliation():
+    events = []
+    health = {}
+    process = _function(
+        "_falcon_process_entry_signal",
+        {
+            "guard_live_flow": lambda *_args, **_kwargs: lambda fn: fn,
+            "RUNTIME_DRAIN": object(),
+            "_falcon_live_entry_flow_enabled": lambda: False,
+            "_falcon_runtime_drain_denial": lambda *_args, **_kwargs: (False, {}),
+            "execute_signal_if_allowed": lambda _sig, positions=None: (
+                True,
+                {"allowed": True, "decision": "PAPER", "sent": False},
+            ),
+            "falcon_persist_accepted_signal": lambda _sig, _positions: {
+                "ok": False,
+                "status": "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED",
+                "reconciliation_required": True,
+            },
+            "HEALTH": health,
+            "redis_list_append": lambda *_args: events.append("redis"),
+            "SIGNALS_KEY": "signals",
+            "record_event": lambda *_args: events.append("event"),
+            "signal_message": lambda _sig: "signal",
+            "execution_decision_text": lambda _decision: "decision",
+            "safe_send_telegram": lambda *_args, **_kwargs: events.append("telegram"),
+            "FALCON_MODE": "PAPER",
+            "funnel_inc": lambda *_args: events.append("funnel"),
+        },
+    )
+    signal = {"id": "PAPER-1", "execution_mode": "PAPER"}
+
+    allowed, decision = process(signal, {})
+
+    assert allowed is False
+    assert decision["status"] == "FALCON_PAPER_PERSISTENCE_RECONCILIATION_REQUIRED"
+    assert decision["reconciliation_required"] is True
+    assert signal["execution_decision"] is decision
+    assert health["falcon_paper_persistence_reconciliation_required"] is True
+    assert events == []
+
+
+def test_paper_reconciliation_latch_blocks_followup_entries_in_same_process():
+    health = {"falcon_paper_persistence_reconciliation_required": True}
+    execute = _function(
+        "execute_signal_if_allowed",
+        {"FALCON_MODE": "PAPER", "HEALTH": health},
+        definition_index=0,
+    )
+    signal = {"id": "PAPER-2"}
+
+    allowed, decision = execute(signal, positions={})
+
+    assert allowed is False
+    assert decision["status"] == "FALCON_PAPER_PERSISTENCE_RECONCILIATION_REQUIRED"
+    assert decision["reconciliation_required"] is True
+    assert signal["execution_mode"] == "PAPER"
+    assert signal["execution_decision"] is decision
+    assert health["last_execution_decision"] is decision
+
+
 def test_registry_open_projects_stop_evidence_in_single_official_write():
     registry = _RegistryProbe()
     health = {}

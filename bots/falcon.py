@@ -4637,6 +4637,23 @@ def execute_signal_if_allowed(sig, positions=None):
     positions = positions if positions is not None else get_positions()
     mode = FALCON_MODE
     sig["execution_mode"] = mode
+    if (
+        mode == "PAPER"
+        and HEALTH.get("falcon_paper_persistence_reconciliation_required") is True
+    ):
+        decision = {
+            "allowed": False,
+            "decision": "DENY",
+            "status": "FALCON_PAPER_PERSISTENCE_RECONCILIATION_REQUIRED",
+            "reasons": ["PAPER_PERSISTENCE_RECONCILIATION_REQUIRED"],
+            "warnings": [],
+            "sent": False,
+            "send_attempted": False,
+            "reconciliation_required": True,
+        }
+        sig["execution_decision"] = decision
+        HEALTH["last_execution_decision"] = decision
+        return False, decision
     if mode == "LIVE" and HEALTH.get(
         "falcon_live_management_reconciliation_ready"
     ) is not True:
@@ -5258,7 +5275,32 @@ def _falcon_process_entry_signal(sig, positions):
     if not allowed:
         return allowed, decision
 
-    falcon_persist_accepted_signal(sig, positions)
+    persistence = falcon_persist_accepted_signal(sig, positions)
+    if (
+        str(sig.get("execution_mode") or "").strip().upper() == "PAPER"
+        and not (isinstance(persistence, dict) and persistence.get("ok") is True)
+    ):
+        persistence_status = (
+            str(persistence.get("status") or "PERSISTENCE_RESULT_INVALID")
+            if isinstance(persistence, dict)
+            else "PERSISTENCE_RESULT_INVALID"
+        )
+        blocked = {
+            "allowed": False,
+            "decision": "DENY",
+            "status": "FALCON_PAPER_PERSISTENCE_RECONCILIATION_REQUIRED",
+            "reasons": ["PAPER_ACCEPTED_SIGNAL_NOT_DURABLY_SYNCHRONIZED"],
+            "warnings": [persistence_status],
+            "sent": False,
+            "send_attempted": False,
+            "reconciliation_required": True,
+            "persistence_status": persistence_status,
+        }
+        sig["execution_decision"] = blocked
+        HEALTH["last_execution_decision"] = blocked
+        HEALTH["last_warning"] = blocked["status"]
+        HEALTH["falcon_paper_persistence_reconciliation_required"] = True
+        return False, blocked
     redis_list_append(SIGNALS_KEY, sig)
     record_event(
         "SIGNAL",
