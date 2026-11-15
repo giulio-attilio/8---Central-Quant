@@ -377,3 +377,15 @@ foi enviada e nenhum dado ou arquivo de produção foi modificado.
   auto-deploy `no`/trigger `off`, `healthCheckPath` vazio. Não houve push ou
   deploy. No checkout, somente permanece modificada a alteração preexistente do
   operador em `tests/test_paper_executor_integrated_idempotency_v1.py`.
+- Evidência adicional para a decisão C3: o Render MCP lista só este web service
+  no workspace confirmado; ele tem `numInstances=1` e `startCommand=python
+  main.py`. No código local, o coordenador de Registry declara `enabled=False`
+  e os contratos de startup/recuperação C3 constroem bindings dormentes. O lock
+  PAPER usa `threading.RLock`, compartilhado entre Executor, Lifecycle e Outcome
+  no mesmo processo. Isso mostra concorrência por threads, mas não evidência de
+  writer/processo/serviço distribuído adicional; a decisão sustentada segue
+  manter C3 dormente e não adicionar complexidade distribuída.
+- O teste estático focado de writers `--registry-lock-audit` terminou com
+  **1 passou, 59 deselected**. Em conjunto com `--c3-dormant-startup` (24 + 3
+  subtestes), valida contratos locais selecionados, mas não substitui auditoria
+  do estado atual do filesystem de produção nem prova todos os writers externos.
