@@ -368,3 +368,12 @@ foi enviada e nenhum dado ou arquivo de produção foi modificado.
   `--paper-lifecycle-integration`: **110 passaram**. As alterações de caminho
   posteriores a `d4d670a` foram validadas e consolidadas apenas localmente, sem
   push/deploy; a alteração preexistente do operador continua fora do stage.
+- Auditoria C3 offline no HEAD local `badf078`: `--c3-dormant-startup` —
+  **24 passaram e 3 subtestes passaram em 495,59 s**. Isso comprova os contratos
+  locais de partida dormente, não uma necessidade de coordenação distribuída nem
+  o comportamento do serviço publicado.
+- Recheck Render MCP nesta continuação: ainda Live no SHA `8c02d376`, uma
+  instância Standard em Oregon, branch `codex/personal-readiness-20261103`,
+  auto-deploy `no`/trigger `off`, `healthCheckPath` vazio. Não houve push ou
+  deploy. No checkout, somente permanece modificada a alteração preexistente do
+  operador em `tests/test_paper_executor_integrated_idempotency_v1.py`.
