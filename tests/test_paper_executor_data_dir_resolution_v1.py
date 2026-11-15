@@ -90,6 +90,34 @@ def test_lifecycle_and_outcome_health_do_not_report_missing_state_as_zero(
     assert outcome["closed_positions"] is None
 
 
+def test_lifecycle_positions_endpoint_fails_closed_for_missing_or_invalid_state(
+    monkeypatch, tmp_path
+):
+    positions = tmp_path / "paper_integrated_positions.json"
+    monkeypatch.setattr(paper_lifecycle, "PAPER_POSITIONS_FILE", positions)
+
+    missing = paper_lifecycle.get_paper_lifecycle_positions()
+    assert missing["ok"] is False
+    assert missing["status"] == "PAPER_STATE_FILES_MISSING"
+    assert missing["count"] is None
+    assert missing["positions"] is None
+    assert not positions.exists()
+
+    positions.write_text("not-json", encoding="utf-8")
+    invalid = paper_lifecycle.get_paper_lifecycle_positions()
+    assert invalid["ok"] is False
+    assert invalid["status"] == "PAPER_STATE_FILES_INVALID"
+    assert invalid["count"] is None
+    assert invalid["positions"] is None
+
+    positions.write_text("[]", encoding="utf-8")
+    empty = paper_lifecycle.get_paper_lifecycle_positions()
+    assert empty["ok"] is True
+    assert empty["status"] == "PAPER_STATE_FILES_PRESENT"
+    assert empty["count"] == 0
+    assert empty["positions"] == []
+
+
 def test_lifecycle_update_and_outcome_eval_fail_closed_when_positions_missing(
     monkeypatch, tmp_path
 ):

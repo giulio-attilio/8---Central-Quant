@@ -572,7 +572,16 @@ def _update_paper_position_price_locked(
 
 
 def get_paper_lifecycle_positions(status: Optional[str] = None) -> Dict[str, Any]:
-    positions = _read_json(PAPER_POSITIONS_FILE, [])
+    positions, state_files_status = read_paper_positions_state(PAPER_POSITIONS_FILE)
+    if state_files_status != "PAPER_STATE_FILES_PRESENT":
+        return {
+            "ok": False,
+            "status": state_files_status,
+            "generated_at": _now_br(),
+            "count": None,
+            "positions": None,
+        }
+
     if status:
         s = str(status).upper().strip()
         positions = [
@@ -582,6 +591,7 @@ def get_paper_lifecycle_positions(status: Optional[str] = None) -> Dict[str, Any
 
     return {
         "ok": True,
+        "status": "PAPER_STATE_FILES_PRESENT",
         "generated_at": _now_br(),
         "count": len(positions),
         "positions": positions,

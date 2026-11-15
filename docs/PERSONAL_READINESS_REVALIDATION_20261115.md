@@ -327,3 +327,33 @@ foi enviada e nenhum dado ou arquivo de produção foi modificado.
 - A diferença local agora inclui também `paper_state_storage.py`,
   `paper_lifecycle.py` e `outcome_evaluator.py`. Continua sem commit/push/deploy;
   runtime e endpoint de produção ainda não refletem estes hardenings.
+
+## Continuação da revalidação — 2026-11-15
+
+- O operador concordou em manter o executor PAPER integrado fail-closed. O JSON
+  recebido às 11:27:24 BRT confirma `paper_execution_enabled=true`,
+  `real_execution_enabled=false`, `PAPER_STATE_FILES_MISSING` e contagens nulas;
+  portanto não prova zero posições PAPER nem permite habilitar esse executor.
+- Nova leitura somente de metadados pelo Render MCP confirma que o serviço
+  permanece Live no SHA `8c02d37607d1f85540a069ffff03a9d221e74504`, deploy
+  `dep-dbrg0mdg1s2s738cs32g`, finalizado em 2026-11-13 12:20:52 UTC. O serviço
+  não está no código local mais novo; nenhum deploy/push foi feito.
+- A revisão do endpoint de consulta do Lifecycle encontrou um último caso de
+  resposta enganosa: `get_paper_lifecycle_positions()` tratava arquivo ausente
+  ou inválido como lista vazia e respondia `ok=true`. A correção local agora
+  retorna `PAPER_STATE_FILES_MISSING`/`INVALID`, `count=null` e `positions=null`;
+  somente `[]` existente e válido responde como zero. Teste de regressão cobre
+  ausência, corrupção e lista vazia legítima.
+- Regressões offline após essa correção: `--paper-integrated-disk-guard` —
+  **53 passaram e 12 subtestes passaram**; `--paper-lifecycle-disk-failures` —
+  **5 passaram, 26 deselected**; `--paper-lifecycle-integration` —
+  **110 passaram, 1 deselected**. `git diff --check` passou. Não houve chamada
+  local à rede, corretora ou Render, nem leitura de secrets.
+- A tentativa de abrir o Dashboard para consultar o Shell falhou durante a
+  inicialização da automação (`failed to write kernel assets`); nenhuma sessão
+  Shell foi aberta. A saída autenticada fornecida pelo operador às 11:27 BRT
+  permanece a evidência de ledger mais recente neste trabalho.
+- O estado local contém os commits `f5df2ea` (hardening PAPER) e `4e4c012`
+  (documentação), mais a correção acima em validação local. A alteração
+  preexistente do operador em
+  `tests/test_paper_executor_integrated_idempotency_v1.py` permanece intocada.
