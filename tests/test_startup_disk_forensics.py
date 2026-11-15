@@ -620,6 +620,16 @@ def test_startup_scan_is_one_shot_and_precedes_runtime_append():
     )
 
 
+def test_paper_executor_inherits_resolved_persistent_data_dir_before_import():
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
+    resolver = source.index("CENTRAL_DATA_DIR = _resolve_central_data_dir()")
+    export = source.index('os.environ["CENTRAL_DATA_DIR"] = str(CENTRAL_DATA_DIR)')
+    paper_import = source.index("from paper_executor_integrated import (")
+
+    assert "os.environ.get(\"CENTRAL_DATA_DIR\") or os.environ.get(\"DATA_DIR\")" in source
+    assert resolver < export < paper_import
+
+
 def test_endpoint_returns_only_cached_result_and_rejects_query():
     cached = {
         "ok": True,

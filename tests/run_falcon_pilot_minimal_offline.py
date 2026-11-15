@@ -1,7 +1,7 @@
 """Run the existing Falcon safety regressions without external access.
 
 Usage: python3 -I tests/run_falcon_pilot_minimal_offline.py
-       [--upstash-sdk-contract|--account-client-order-authority]
+       [--upstash-sdk-contract|--account-client-order-authority|--live-position-risk-gate]
 Some tests import main.py, so runtime auto-start is disabled before collection.
 Pytest is loaded only after network, subprocess and .env-file access are denied.
 """
@@ -198,6 +198,11 @@ if __name__ == "__main__":
             "test_history_eventbus_smoke.py",
             "test_falcon_single_live_execution_path_v1.py",
         )
+    elif sys.argv[1:] == ["--live-position-risk-gate"]:
+        cases = (
+            "test_live_position_reconciliation_risk_gate_v1.py",
+            "test_live_central_risk_gate_fail_closed_v1.py",
+        )
     elif sys.argv[1:] == ["--c3-dormant-startup"]:
         cases = (
             "test_c3_dormant_startup_same_coordinator_v2.py",
@@ -289,6 +294,8 @@ if __name__ == "__main__":
         )
     elif sys.argv[1:] == ["--personal-position-read-fail-closed"]:
         cases = ("test_personal_bot_positions_read_fail_closed_v1.py",)
+    elif sys.argv[1:] == ["--falcon-lifecycle-projection"]:
+        cases = ("test_falcon_lifecycle_observation_projection.py",)
     elif sys.argv[1:] == ["--upstash-sdk-contract"]:
         cases = (
             "test_account_client_order_id_v1.py",
@@ -380,6 +387,8 @@ if __name__ == "__main__":
     elif sys.argv[1:] == ["--personal-execution-safety"]:
         filters = []
     elif sys.argv[1:] == ["--personal-lifecycle-completeness"]:
+        filters = []
+    elif sys.argv[1:] == ["--falcon-lifecycle-projection"]:
         filters = []
     elif sys.argv[1:] == ["--upstash-sdk-contract"]:
         filters = [

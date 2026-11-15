@@ -117,3 +117,84 @@ def test_predator_live_mode_requires_central_risk_even_when_flag_is_disabled():
     assert result["allowed"] is False
     assert result["decision"] == "DENY"
     assert "obrigatório" in result["reasons"][0]
+
+
+def test_meme_risk_manager_timeout_blocks_entry_and_records_only_block():
+    import time
+
+    events = []
+    request_calls = []
+
+    def timeout_post(*args, **kwargs):
+        request_calls.append((args, kwargs))
+        raise TimeoutError("synthetic Risk Manager timeout")
+
+    functions = []
+    tree = ast.parse((ROOT / "bots/meme.py").read_text(encoding="utf-8"))
+    wanted = {
+        "normalizar_decisao_risco",
+        "consultar_central_risk_manager",
+        "anexar_precheck_risco",
+        "registrar_bloqueio_central_risk",
+        "central_risk_allows_entry",
+    }
+    functions = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted
+    ]
+    assert {node.name for node in functions} == wanted
+
+    namespace = {
+        "time": time,
+        "requests": SimpleNamespace(post=timeout_post),
+        "CENTRAL_BASE_URL": "https://central.invalid",
+        "CENTRAL_RISK_TIMEOUT_SECONDS": 10,
+        "central_personal_http_auth": lambda _url: ("synthetic-user", "synthetic-password"),
+        "nome_limpo": lambda value: str(value or "").replace("/USDT", "USDT"),
+        "data_hora_sp_str": lambda: "synthetic-time",
+        "data_hoje_sp_str": lambda: "synthetic-date",
+        "registrar_evento_trade": events.append,
+    }
+    isolated = ast.Module(body=functions, type_ignores=[])
+    exec(
+        compile(ast.fix_missing_locations(isolated), "bots/meme.py:risk_timeout", "exec"),
+        namespace,
+    )
+
+    signal = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "LONG",
+        "signal_type": "MEME",
+        "entry": 100.0,
+        "sl": 95.0,
+        "tp50": 105.0,
+    }
+    allowed = namespace["central_risk_allows_entry"](signal)
+
+    assert allowed is False
+    assert signal["risk_precheck_allowed"] is False
+    assert signal["risk_precheck_decision"] == "ERROR"
+    assert len(request_calls) == 1
+    assert request_calls[0][1]["timeout"] == 10
+    assert events == [{
+        "event": "BLOCK",
+        "date": "synthetic-date",
+        "datetime": "synthetic-time",
+        "bot": "MEME",
+        "symbol": "BTC/USDT:USDT",
+        "symbol_clean": "BTCUSDT:USDT",
+        "side": "LONG",
+        "signal_type": "MEME",
+        "entry": 100.0,
+        "sl": 95.0,
+        "tp50": 105.0,
+        "risk_pct": None,
+        "decision": "ERROR",
+        "allowed": False,
+        "reason": "Erro ao consultar Risk Manager: synthetic Risk Manager timeout",
+        "risk_precheck_allowed": False,
+        "risk_precheck_decision": "ERROR",
+        "risk_precheck_reason": "Erro ao consultar Risk Manager: synthetic Risk Manager timeout",
+        "risk_precheck_at": "synthetic-time",
+        "risk_precheck_ts": signal["risk_precheck_ts"],
+    }]

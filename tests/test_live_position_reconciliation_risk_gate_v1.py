@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "main.py"
@@ -200,8 +202,81 @@ def test_live_risk_decision_applies_divergence_gate_before_computing_allowed():
     end = source.index("def build_execution_report():", start)
     body = source[start:end]
 
+    assert "_risk_bingx_divergence_warning(mode, intended_live)" in body
     assert "_apply_bingx_divergence_gate(" in body
     assert "allowed = len(reasons) == 0" in body
+
+
+def test_effective_can_open_trade_wrappers_reach_base_divergence_decision():
+    source = SOURCE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    wrappers = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "can_open_trade_decision"
+    ]
+    assert len(wrappers) == 4
+
+    base_start = source.index("def can_open_trade_decision(payload: dict):")
+    auto_link = source.index(
+        "_ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_AUTO_REAL_BRIDGE_V1 = can_open_trade_decision"
+    )
+    auto_wrapper = source.index("def can_open_trade_decision(payload: dict):", base_start + 1)
+    pilot_link = source.index(
+        "_ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_REAL_PILOT_GUARD_V1_SAFE = can_open_trade_decision"
+    )
+    pilot_wrapper = source.index("def can_open_trade_decision(payload: dict):", auto_wrapper + 1)
+    falcon_link = source.index(
+        "_ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_FALCON_LIVE_AUDIT_GUARD_V1 = can_open_trade_decision"
+    )
+    final_provider = source.index("def _can_open_trade_decision_v1_final(payload: dict):")
+    public_wrapper = source.index("def can_open_trade_decision(payload: dict):", pilot_wrapper + 1)
+
+    assert base_start < auto_link < auto_wrapper < pilot_link < pilot_wrapper
+    assert pilot_wrapper < falcon_link < final_provider < public_wrapper
+    assert "_risk_bingx_divergence_warning(mode, intended_live)" in source[
+        base_start:auto_link
+    ]
+    assert "original = _ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_FALCON_LIVE_AUDIT_GUARD_V1" in source[
+        final_provider:public_wrapper
+    ]
+    assert "_can_open_trade_decision_v1_final" in source[public_wrapper:]
+
+
+@pytest.mark.parametrize("mode", ["PAPER", "VERIFY"])
+def test_non_live_risk_decisions_skip_authenticated_bingx_position_read(mode):
+    calls = []
+    namespace = {
+        "bingx_divergence_warning_payload": lambda: calls.append("broker-read") or {
+            "active": True,
+            "status": "BROKER_POSITION_READ_ERROR",
+        },
+    }
+    _load_functions({"_risk_bingx_divergence_warning"}, namespace)
+
+    result = namespace["_risk_bingx_divergence_warning"](mode, False)
+
+    assert result["active"] is False
+    assert result["status"] == "SKIPPED_NON_LIVE_MODE"
+    assert result["reconciliation_performed"] is False
+    assert result["broker_read_attempted"] is False
+    assert result["manual_or_external_count"] is None
+    assert result["central_only_count"] is None
+    assert calls == []
+
+
+@pytest.mark.parametrize(("mode", "intended_live"), [("LIVE", False), ("PAPER", True)])
+def test_live_risk_decision_keeps_fail_closed_bingx_read(mode, intended_live):
+    expected = {"active": True, "status": "BROKER_POSITION_READ_ERROR"}
+    calls = []
+    namespace = {
+        "bingx_divergence_warning_payload": lambda: calls.append("broker-read") or expected,
+    }
+    _load_functions({"_risk_bingx_divergence_warning"}, namespace)
+
+    result = namespace["_risk_bingx_divergence_warning"](mode, intended_live)
+
+    assert result is expected
+    assert calls == ["broker-read"]
 
 
 def test_manual_position_awareness_persistence_can_be_disabled_for_risk_reads():

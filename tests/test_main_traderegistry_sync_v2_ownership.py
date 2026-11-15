@@ -194,6 +194,23 @@ def _mark_missing(registry, removed, *, timestamp="2026-09-06T01:00:00-03:00"):
     return namespace["mark_registry_missing_trades"](copy.deepcopy(removed))
 
 
+def test_registry_sync_preview_reports_missing_without_mutating_registry():
+    existing_position = _position()
+    initial_registry = _v1_trade(existing_position)
+    registry = _FakeTradeRegistry(initial_registry)
+
+    result = _sync(registry, {"TURTLE": []}, commit=False)
+
+    assert result["ok"] is True
+    assert result["commit"] is False
+    assert result["removed_count"] == 1
+    assert result["removed"][0]["status"] == "OPEN"
+    assert result["missing_mark_result"] is None
+    assert registry.register_calls == []
+    assert registry.save_calls == []
+    assert registry.registry["open_trades"] == initial_registry
+
+
 @pytest.mark.parametrize("bot", ("TURTLE", "PREDATOR"))
 def test_plain_legacy_candidates_still_sync_to_v1(bot):
     registry = _FakeTradeRegistry()

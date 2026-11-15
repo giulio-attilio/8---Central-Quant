@@ -18662,6 +18662,29 @@ def _apply_bingx_divergence_gate(mode, intended_live, divergence_warning, reason
         warnings.append(divergence_warning.get("message") or "Central x BingX position state is not verified.")
 
 
+def _risk_bingx_divergence_warning(mode, intended_live):
+    """Read authenticated BingX positions only for decisions that can affect LIVE."""
+    normalized_mode = str(mode or "").upper().strip()
+    if bool(intended_live) or normalized_mode == "LIVE":
+        return bingx_divergence_warning_payload()
+    return {
+        "active": False,
+        "status": "SKIPPED_NON_LIVE_MODE",
+        "reconciliation_performed": False,
+        "broker_read_attempted": False,
+        "broker_error_present": None,
+        "central_error_present": None,
+        "manual_or_external_count": None,
+        "central_only_count": None,
+        "only_bingx_count": None,
+        "only_central_count": None,
+        "only_bingx": [],
+        "only_central": [],
+        "policy": "LIVE_FAIL_CLOSED",
+        "message": "Authenticated BingX position reconciliation is reserved for LIVE decisions.",
+    }
+
+
 def build_status_report():
     score_payload = central_health_score_payload() if "central_health_score_payload" in globals() else {"score": None, "status": "N/A"}
     ready = bingx_ready_payload() if "bingx_ready_payload" in globals() else {"ok": None, "status": "N/A"}
@@ -19963,7 +19986,7 @@ def can_open_trade_decision(payload: dict):
     if memory_risk.get("usage_pct") is not None and float(memory_risk.get("usage_pct")) >= MEMORY_ALERT_THRESHOLD_PCT:
         warnings.append(f"memória elevada: {memory_risk.get('usage_pct')}%")
 
-    divergence_warning = bingx_divergence_warning_payload()
+    divergence_warning = _risk_bingx_divergence_warning(mode, intended_live)
     if divergence_warning.get("active"):
         _apply_bingx_divergence_gate(
             mode,
