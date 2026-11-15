@@ -14,6 +14,37 @@ from typing import Any
 PAPER_STATE_LOCK = threading.RLock()
 
 
+def resolve_paper_data_dir(module_file: str) -> Path:
+    """Resolve shared PAPER storage without falling back ahead of Render /data."""
+    configured = os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR")
+    if configured:
+        return Path(configured)
+    try:
+        if os.path.isdir("/data"):
+            return Path("/data")
+    except Exception:
+        pass
+    return Path(module_file).resolve().parent / "data"
+
+
+def read_paper_positions_state(path: Path):
+    """Return positions plus an explicit state status; missing is never empty."""
+    target = Path(path)
+    if not target.is_file():
+        return None, "PAPER_STATE_FILES_MISSING"
+    try:
+        positions = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return None, "PAPER_STATE_FILES_INVALID"
+    if not isinstance(positions, list) or any(
+        not isinstance(position, dict)
+        or position.get("status") not in {"OPEN", "CLOSED"}
+        for position in positions
+    ):
+        return None, "PAPER_STATE_FILES_INVALID"
+    return positions, "PAPER_STATE_FILES_PRESENT"
+
+
 def _fsync_directory(path: Path) -> None:
     """Persist a replaced directory entry where POSIX exposes directory fsync."""
     if os.name == "nt":

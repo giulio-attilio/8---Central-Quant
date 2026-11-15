@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import ast
+import json
+import os
 from pathlib import Path
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -367,6 +370,61 @@ def test_paper_entry_stops_when_accepted_signal_persistence_requires_reconciliat
     assert events == []
 
 
+def test_paper_entry_stays_latched_if_latch_writer_raises_or_returns_invalid_result():
+    expected_statuses = (
+        "PAPER_PERSISTENCE_LATCH_WRITE_FAILED:OSError",
+        "PAPER_PERSISTENCE_LATCH_RESULT_INVALID",
+    )
+    for behavior, expected_status in (("raise", expected_statuses[0]), ("invalid", expected_statuses[1])):
+        events = []
+        health = {}
+
+        def latch_writer(_reason):
+            if behavior == "raise":
+                raise OSError("simulated disk write failure")
+            return None
+
+        process = _function(
+            "_falcon_process_entry_signal",
+            {
+                "guard_live_flow": lambda *_args, **_kwargs: lambda fn: fn,
+                "RUNTIME_DRAIN": object(),
+                "_falcon_live_entry_flow_enabled": lambda: False,
+                "_falcon_runtime_drain_denial": lambda *_args, **_kwargs: (False, {}),
+                "execute_signal_if_allowed": lambda _sig, positions=None: (
+                    True,
+                    {"allowed": True, "decision": "PAPER", "sent": False},
+                ),
+                "falcon_persist_accepted_signal": lambda _sig, _positions: {
+                    "ok": False,
+                    "status": "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED",
+                    "reconciliation_required": True,
+                },
+                "falcon_persist_paper_persistence_latch": latch_writer,
+                "HEALTH": health,
+                "redis_list_append": lambda *_args: events.append("redis"),
+                "SIGNALS_KEY": "signals",
+                "record_event": lambda *_args: events.append("event"),
+                "signal_message": lambda _sig: "signal",
+                "execution_decision_text": lambda _decision: "decision",
+                "safe_send_telegram": lambda *_args, **_kwargs: events.append("telegram"),
+                "FALCON_MODE": "PAPER",
+                "funnel_inc": lambda *_args: events.append("funnel"),
+            },
+        )
+
+        allowed, decision = process(
+            {"id": f"PAPER-{behavior}", "execution_mode": "PAPER"}, {}
+        )
+
+        assert allowed is False
+        assert decision["status"] == "FALCON_PAPER_PERSISTENCE_RECONCILIATION_REQUIRED"
+        assert decision["persistence_latch_status"] == expected_status
+        assert health["falcon_paper_persistence_reconciliation_required"] is True
+        assert health["falcon_paper_persistence_latch_status"] == expected_status
+        assert events == []
+
+
 def test_paper_reconciliation_latch_blocks_followup_entries_in_same_process():
     health = {"falcon_paper_persistence_reconciliation_required": True}
     execute = _function(
@@ -384,6 +442,117 @@ def test_paper_reconciliation_latch_blocks_followup_entries_in_same_process():
     assert signal["execution_mode"] == "PAPER"
     assert signal["execution_decision"] is decision
     assert health["last_execution_decision"] is decision
+
+
+def test_paper_persistence_latch_survives_fresh_runtime_and_fails_closed_on_corruption(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("CENTRAL_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("DATA_DIR", raising=False)
+
+    def runtime(health):
+        namespace = {
+            "HEALTH": health,
+            "FALCON_PAPER_PERSISTENCE_LATCH_VERSION": (
+                "FALCON_PAPER_PERSISTENCE_LATCH_V1"
+            ),
+            "os": os,
+            "json": json,
+            "tempfile": tempfile,
+            "data_hora_sp_str": lambda: "2026-11-15 12:00:00",
+        }
+        namespace["falcon_paper_persistence_latch_path"] = _function(
+            "falcon_paper_persistence_latch_path", {"os": os}
+        )
+        return (
+            _function("falcon_paper_persistence_reconciliation_required", namespace),
+            _function("falcon_persist_paper_persistence_latch", namespace),
+        )
+
+    health_before = {}
+    required_before, persist = runtime(health_before)
+    assert required_before() is False
+
+    persisted = persist("FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED")
+    assert persisted == {
+        "ok": True,
+        "status": "PAPER_PERSISTENCE_LATCH_PERSISTED",
+    }
+
+    health_after_restart = {}
+    required_after_restart, _persist_after_restart = runtime(health_after_restart)
+    assert required_after_restart() is True
+    assert health_after_restart[
+        "falcon_paper_persistence_reconciliation_required"
+    ] is True
+    payload = json.loads(
+        (tmp_path / "falcon_paper_persistence_reconciliation.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert payload["reconciliation_required"] is True
+    assert "signal_id" not in payload
+
+    health_gate = {}
+    required_from_disk, _persist_from_disk = runtime(health_gate)
+    execute = _function(
+        "execute_signal_if_allowed",
+        {
+            "FALCON_MODE": "PAPER",
+            "HEALTH": health_gate,
+            "falcon_paper_persistence_reconciliation_required": required_from_disk,
+        },
+        definition_index=0,
+    )
+    allowed_after_restart, decision_after_restart = execute(
+        {"id": "PAPER-AFTER-RESTART"}, positions={}
+    )
+    assert allowed_after_restart is False
+    assert decision_after_restart[
+        "status"
+    ] == "FALCON_PAPER_PERSISTENCE_RECONCILIATION_REQUIRED"
+
+    (tmp_path / "falcon_paper_persistence_reconciliation.json").write_text(
+        "not-json", encoding="utf-8"
+    )
+    health_corrupt = {}
+    required_corrupt, _persist_corrupt = runtime(health_corrupt)
+    assert required_corrupt() is True
+    assert health_corrupt[
+        "falcon_paper_persistence_reconciliation_required"
+    ] is True
+
+
+def test_paper_persistence_latch_is_exposed_in_falcon_health_payload():
+    health = {"falcon_paper_persistence_latch_status": "PERSISTED"}
+    latch_reads = []
+    payload = _function(
+        "health_payload",
+        {
+            "_ORIGINAL_HEALTH_PAYLOAD_BEFORE_RPM_V1": lambda: {"ok": True},
+            "HEALTH": health,
+            "FALCON_MODE": "PAPER",
+            "falcon_paper_persistence_reconciliation_required": lambda: (
+                latch_reads.append(True) or True
+            ),
+            "falcon_paper_persistence_latch_path": lambda: "/tmp/latch.json",
+            "FALCON_REAL_POSITION_MANAGEMENT_HARDENING_VERSION": "TEST",
+            "FALCON_MANAGEMENT_FAILSAFE_ENABLED": True,
+            "FALCON_MANAGEMENT_STOP_GRACE_SECONDS": 1,
+            "FALCON_TP50_RETRY_SECONDS": 1,
+            "FALCON_STOP_VERIFY_INTERVAL_SECONDS": 1,
+            "FALCON_STOP_VERIFY_PERSIST_SECONDS": 1,
+            "FALCON_MANAGEMENT_ALERT_COOLDOWN_SECONDS": 1,
+            "central_broker": object(),
+        },
+    )
+
+    result = payload()
+
+    assert result["falcon_paper_persistence_reconciliation_required"] is True
+    assert result["falcon_paper_persistence_latch_status"] == "PERSISTED"
+    assert result["falcon_paper_persistence_latch_storage_configured"] is True
+    assert latch_reads == [True]
 
 
 def test_registry_open_projects_stop_evidence_in_single_official_write():

@@ -22,12 +22,17 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from paper_state_storage import PAPER_STATE_LOCK, write_json_atomically
+from paper_state_storage import (
+    PAPER_STATE_LOCK,
+    read_paper_positions_state,
+    resolve_paper_data_dir,
+    write_json_atomically,
+)
 
 
 VERSION = "2026-07-05-PAPER-LIFECYCLE-V1.1-PRICE-RECORDER"
 
-DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data"))
+DATA_DIR = resolve_paper_data_dir(__file__)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 PAPER_POSITIONS_FILE = DATA_DIR / "paper_integrated_positions.json"
@@ -56,13 +61,17 @@ def _read_json(path: Path, default: Any) -> Any:
 
 def _read_positions_for_update() -> tuple[Optional[list], Optional[str]]:
     """Read the canonical PAPER positions file without masking corruption."""
-    if not PAPER_POSITIONS_FILE.exists():
-        return [], None
+    if not PAPER_POSITIONS_FILE.is_file():
+        return None, "PAPER_STATE_FILES_MISSING"
     try:
         payload = json.loads(PAPER_POSITIONS_FILE.read_text(encoding="utf-8"))
     except Exception as exc:
         return None, f"PAPER_POSITIONS_READ_FAILED:{type(exc).__name__}"
-    if not isinstance(payload, list):
+    if not isinstance(payload, list) or any(
+        not isinstance(position, dict)
+        or position.get("status") not in {"OPEN", "CLOSED"}
+        for position in payload
+    ):
         return None, "PAPER_POSITIONS_INVALID_SCHEMA"
     return payload, None
 
@@ -360,22 +369,27 @@ def _emit_history_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def paper_lifecycle_health() -> Dict[str, Any]:
-    positions = _read_json(PAPER_POSITIONS_FILE, [])
+    positions, state_files_status = read_paper_positions_state(PAPER_POSITIONS_FILE)
+    state_files_present = PAPER_POSITIONS_FILE.is_file()
+    state_files_valid = state_files_status == "PAPER_STATE_FILES_PRESENT"
     open_positions = [
         p for p in positions
         if isinstance(p, dict) and p.get("status") == "OPEN"
-    ]
+    ] if state_files_valid else None
 
     return {
-        "ok": True,
+        "ok": bool(not PAPER_LIFECYCLE_ENABLED or state_files_valid),
         "module": "paper_lifecycle",
         "loaded": True,
         "version": VERSION,
         "generated_at": _now_br(),
         "enabled": PAPER_LIFECYCLE_ENABLED,
         "history_enabled": PAPER_LIFECYCLE_HISTORY_ENABLED,
-        "open_positions": len(open_positions),
-        "total_positions": len(positions),
+        "state_files_present": state_files_present,
+        "state_files_valid": state_files_valid,
+        "state_files_status": state_files_status,
+        "open_positions": len(open_positions) if state_files_valid else None,
+        "total_positions": len(positions) if state_files_valid else None,
         "files": {
             "paper_positions": str(PAPER_POSITIONS_FILE),
             "paper_lifecycle_log": str(PAPER_LIFECYCLE_LOG_FILE),

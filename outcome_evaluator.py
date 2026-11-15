@@ -19,7 +19,12 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from paper_state_storage import PAPER_STATE_LOCK, write_json_atomically
+from paper_state_storage import (
+    PAPER_STATE_LOCK,
+    read_paper_positions_state,
+    resolve_paper_data_dir,
+    write_json_atomically,
+)
 
 try:
     from trade_registry import (
@@ -39,7 +44,7 @@ CLOSED_EXECUTION_MARKER_VERSION = (
     "2026-07-23-OUTCOME-EVALUATOR-CLOSED-EXECUTION-IDENTITY-V1"
 )
 
-DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data"))
+DATA_DIR = resolve_paper_data_dir(__file__)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 PAPER_POSITIONS_FILE = DATA_DIR / "paper_integrated_positions.json"
@@ -504,7 +509,11 @@ def _update_bucket(bucket: Dict[str, Any], trade: Dict[str, Any]) -> Dict[str, A
 
 
 def outcome_evaluator_health() -> Dict[str, Any]:
-    positions = _read_json(PAPER_POSITIONS_FILE, [])
+    positions, state_files_status = read_paper_positions_state(PAPER_POSITIONS_FILE)
+    state_files_present = PAPER_POSITIONS_FILE.is_file()
+    state_files_valid = state_files_status == "PAPER_STATE_FILES_PRESENT"
+    if not state_files_valid:
+        positions = []
     closed = [p for p in positions if isinstance(p, dict) and p.get("status") == "CLOSED"]
     stats = _read_json(
         OUTCOME_STATS_FILE,
@@ -533,15 +542,18 @@ def outcome_evaluator_health() -> Dict[str, Any]:
             pending.append(trade)
 
     return {
-        "ok": True,
+        "ok": bool(not OUTCOME_EVALUATOR_ENABLED or state_files_valid),
         "module": "outcome_evaluator",
         "loaded": True,
         "version": VERSION,
         "generated_at": _now_br(),
         "enabled": OUTCOME_EVALUATOR_ENABLED,
-        "closed_positions": len(closed),
-        "pending_evaluation": len(pending),
-        "identity_blocked": len(identity_blocked),
+        "state_files_present": state_files_present,
+        "state_files_valid": state_files_valid,
+        "state_files_status": state_files_status,
+        "closed_positions": len(closed) if state_files_valid else None,
+        "pending_evaluation": len(pending) if state_files_valid else None,
+        "identity_blocked": len(identity_blocked) if state_files_valid else None,
         "closed_identity_helpers_available": CLOSED_IDENTITY_HELPERS_AVAILABLE,
         "files": {
             "paper_positions": str(PAPER_POSITIONS_FILE),
@@ -577,6 +589,14 @@ def _evaluate_closed_paper_trades_locked(force: bool = False) -> Dict[str, Any]:
         "evaluated_closed_execution_keys": [],
         "evaluated_closed_executions": [],
     }
+    if not PAPER_POSITIONS_FILE.is_file():
+        return {
+            "ok": False,
+            "status": "PAPER_STATE_FILES_MISSING",
+            "error_type": "MissingPaperPositions",
+            "generated_at": _now_br(),
+            "version": VERSION,
+        }
     try:
         positions = _read_state_json(PAPER_POSITIONS_FILE, [])
         stats = _read_state_json(OUTCOME_STATS_FILE, default_stats)

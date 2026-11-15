@@ -31,6 +31,7 @@ import json
 import hashlib
 import math
 import secrets
+import tempfile
 import time
 import threading
 import traceback
@@ -1078,6 +1079,111 @@ def save_positions(positions):
             safe_positions = tombstone_filter(safe_positions)
         HEALTH["last_positions_count"] = len(safe_positions)
         return redis_set_json(POSITIONS_KEY, safe_positions)
+
+
+FALCON_PAPER_PERSISTENCE_LATCH_VERSION = "FALCON_PAPER_PERSISTENCE_LATCH_V1"
+
+
+def falcon_paper_persistence_latch_path():
+    data_dir = os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR")
+    if not data_dir:
+        return None
+    return os.path.join(
+        os.path.abspath(data_dir), "falcon_paper_persistence_reconciliation.json"
+    )
+
+
+def falcon_paper_persistence_reconciliation_required():
+    if HEALTH.get("falcon_paper_persistence_reconciliation_required") is True:
+        return True
+    path = falcon_paper_persistence_latch_path()
+    if not path:
+        HEALTH["falcon_paper_persistence_latch_status"] = "DATA_DIR_UNSET"
+        return False
+    try:
+        if not os.path.exists(path):
+            return False
+        if os.path.getsize(path) > 16384:
+            raise ValueError("latch file too large")
+        with open(path, "r", encoding="utf-8") as latch_file:
+            payload = json.load(latch_file)
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != FALCON_PAPER_PERSISTENCE_LATCH_VERSION
+            or payload.get("reconciliation_required") is not True
+        ):
+            raise ValueError("invalid latch payload")
+    except FileNotFoundError:
+        return False
+    except Exception as exc:
+        HEALTH["falcon_paper_persistence_reconciliation_required"] = True
+        HEALTH["falcon_paper_persistence_latch_status"] = (
+            f"READ_FAILED_CLOSED:{type(exc).__name__}"
+        )
+        return True
+    HEALTH["falcon_paper_persistence_reconciliation_required"] = True
+    HEALTH["falcon_paper_persistence_latch_status"] = "RECONCILIATION_REQUIRED"
+    return True
+
+
+def falcon_persist_paper_persistence_latch(reason):
+    path = falcon_paper_persistence_latch_path()
+    if not path:
+        return {"ok": False, "status": "PAPER_PERSISTENCE_LATCH_DATA_DIR_UNSET"}
+    parent = os.path.dirname(path)
+    tmp_path = None
+    try:
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".falcon-paper-persistence-",
+            suffix=".tmp",
+            dir=parent,
+        )
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as latch_file:
+            json.dump(
+                {
+                    "version": FALCON_PAPER_PERSISTENCE_LATCH_VERSION,
+                    "reconciliation_required": True,
+                    "reason": str(reason or "PERSISTENCE_FAILURE")[:120],
+                    "created_at": data_hora_sp_str(),
+                },
+                latch_file,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            latch_file.flush()
+            os.fsync(latch_file.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+        if os.name == "posix":
+            directory_fd = os.open(
+                parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        HEALTH["falcon_paper_persistence_reconciliation_required"] = True
+        HEALTH["falcon_paper_persistence_latch_status"] = "PERSISTED"
+        return {"ok": True, "status": "PAPER_PERSISTENCE_LATCH_PERSISTED"}
+    except Exception as exc:
+        HEALTH["falcon_paper_persistence_reconciliation_required"] = True
+        HEALTH["falcon_paper_persistence_latch_status"] = (
+            f"WRITE_FAILED:{type(exc).__name__}"
+        )
+        return {
+            "ok": False,
+            "status": "PAPER_PERSISTENCE_LATCH_WRITE_FAILED",
+            "error_type": type(exc).__name__,
+        }
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 def register_falcon_trade_registry_open(pos):
@@ -4637,9 +4743,18 @@ def execute_signal_if_allowed(sig, positions=None):
     positions = positions if positions is not None else get_positions()
     mode = FALCON_MODE
     sig["execution_mode"] = mode
+    paper_latch_reader = globals().get(
+        "falcon_paper_persistence_reconciliation_required"
+    )
     if (
         mode == "PAPER"
-        and HEALTH.get("falcon_paper_persistence_reconciliation_required") is True
+        and (
+            HEALTH.get("falcon_paper_persistence_reconciliation_required") is True
+            or (
+                callable(paper_latch_reader)
+                and paper_latch_reader() is True
+            )
+        )
     ):
         decision = {
             "allowed": False,
@@ -5299,7 +5414,32 @@ def _falcon_process_entry_signal(sig, positions):
         sig["execution_decision"] = blocked
         HEALTH["last_execution_decision"] = blocked
         HEALTH["last_warning"] = blocked["status"]
+        # Latch the process before attempting disk I/O so an unexpected writer
+        # failure cannot leave this process eligible for another PAPER entry.
         HEALTH["falcon_paper_persistence_reconciliation_required"] = True
+        latch_writer = globals().get("falcon_persist_paper_persistence_latch")
+        try:
+            latch_result = (
+                latch_writer("FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED")
+                if callable(latch_writer)
+                else {"ok": False, "status": "PAPER_PERSISTENCE_LATCH_WRITER_UNAVAILABLE"}
+            )
+        except Exception as exc:
+            latch_result = {
+                "ok": False,
+                "status": f"PAPER_PERSISTENCE_LATCH_WRITE_FAILED:{type(exc).__name__}",
+            }
+        if not isinstance(latch_result, dict):
+            latch_result = {
+                "ok": False,
+                "status": "PAPER_PERSISTENCE_LATCH_RESULT_INVALID",
+            }
+        latch_status = str(
+            latch_result.get("status") or "PAPER_PERSISTENCE_LATCH_RESULT_INVALID"
+        )
+        blocked["persistence_latch_status"] = latch_status
+        if latch_result.get("ok") is not True:
+            HEALTH["falcon_paper_persistence_latch_status"] = latch_status
         return False, blocked
     redis_list_append(SIGNALS_KEY, sig)
     record_event(
@@ -13871,6 +14011,23 @@ def health_payload():
         payload[field] = HEALTH.get(field)
     payload["falcon_live_management_reconciliation_ready"] = HEALTH.get(
         "falcon_live_management_reconciliation_ready"
+    )
+    paper_latch_reader = globals().get(
+        "falcon_paper_persistence_reconciliation_required"
+    )
+    paper_latch_required = bool(
+        str(FALCON_MODE or "").strip().upper() == "PAPER"
+        and callable(paper_latch_reader)
+        and paper_latch_reader() is True
+    )
+    payload["falcon_paper_persistence_reconciliation_required"] = (
+        paper_latch_required
+    )
+    payload["falcon_paper_persistence_latch_status"] = HEALTH.get(
+        "falcon_paper_persistence_latch_status"
+    )
+    payload["falcon_paper_persistence_latch_storage_configured"] = bool(
+        falcon_paper_persistence_latch_path()
     )
     payload["real_position_management"] = {
         "version": FALCON_REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
