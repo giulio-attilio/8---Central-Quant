@@ -1426,3 +1426,69 @@ foi enviada e nenhum dado ou arquivo de produção foi modificado.
   sincronização do Registry, classificador de modos e fail-closed do executor
   têm cobertura reproduzível relevante. Ainda é cobertura de fixtures isoladas;
   não certifica operação PAPER contínua no Render.
+
+## Revalidação do release, runtime e coordenação — 2026-11-16 14:29 UTC
+
+- Antes da consulta externa, confirmei branch local
+  `codex/falcon-paper-persist-guard-20261115`, HEAD
+  `0130a011b77688594c3d38b2d49e08bcf8f3ec1d` e worktree limpo. O Render MCP,
+  no workspace confirmado `My Workspace`, ainda mostra o serviço
+  `central-robos-bingx` Live no SHA
+  `9436167fe1944da0017252630cb5ac2cbd3eb9aa`; `0130a01` é somente local e não
+  foi enviado ou implantado. Auto-deploy está desligado, há uma instância
+  Standard e disco `/data` de 4 GB; `healthCheckPath` continua vazio.
+- Métricas de 13:28:50 a 14:28:50 UTC: CPU entre 0,174 e 0,495 CPU; memória
+  entre ~0,82 e 0,99 GB; sete pontos disponíveis de latência HTTP p95, entre
+  4 ms e 243 ms. Consulta de logs error e de status HTTP 502/503 nesse intervalo
+  não retornou eventos. São amostras curtas/agregadas; não provam latência
+  sustentada de rotas críticas nem saúde do executor PAPER.
+- No período maior de 00:00 a 14:28 UTC, a série agregada de latência HTTP p95
+  teve buckets de até ~6,81 s. Sem filtro por rota, isso não atribui a demora a
+  `/can_open_trade` nem comprova erro do processo, mas recomenda não declarar
+  latência operacional resolvida apenas pela janela recente mais baixa.
+- O Shell fornecido pelo operador às 14:17 UTC confirma novamente
+  `PAPER_STATE_FILES_MISSING`: os ledgers integrado de posições e de `seen`
+  não existem, com contagens `None`. A função health retornou execução PAPER
+  habilitada e execução REAL desabilitada. Não houve criação, bootstrap,
+  importação ou alteração desses arquivos.
+- O teste offline `--registry-writers` foi repetido sobre o HEAD local atual:
+  **60 passed** em 78,24 s. A leitura do código e do contrato identifica 19
+  superfícies lógicas mapeadas, várias com lock só process-local; isso não
+  demonstra 19 escritores/processos simultâneos em produção. O C3 continua
+  dormente e não há evidência concreta que justifique ativá-lo para a instância
+  única observada.
+- Nenhum push/deploy foi feito: o SHA validado mais recente é somente local e
+  não há confirmação atual de custo zero. Nenhum controle de trading, segredo,
+  variável, disco ou dado de produção foi alterado.
+- Bloqueios atuais: identidade/proveniência factual dos 68 registros abertos
+  V1 (todos `LEGACY_LOGICAL_ONLY`, 25 com colisão) ainda não reconciliada com
+  estados próprios dos bots; ledgers PAPER integrados ausentes; release local
+  não corresponde ao release Live; leitura independente agregada da conta
+  BingX não disponível; não há evidência recente de ciclo completo de entrada,
+  fill, gestão/disaster-stop, fechamento e reconciliação no Render. Manter
+  `ENABLE_REAL_TRADING=false`, `BROKER_DRY_RUN=true` e `FALCON_MODE=PAPER`.
+- Verificação de fonte para o próximo passo: `/central/positions` e
+  `/exposure/v2` passam por `get_open_positions_central()`, que prefere os
+  registros do próprio Registry quando `open_trades` não está vazio; portanto
+  essas rotas não são uma confirmação independente dos registros legados.
+  Os leitores individuais dos bots consultam suas posições próprias (Redis);
+  qualquer comparação por esses leitores deve permanecer somente leitura e a
+  quota/cobrança atual do datastore precisa ser confirmada antes da execução.
+
+## Reteste do bloqueio PAPER e do auditor V1 — 2026-11-16 14:36 UTC
+
+- No HEAD `0130a011b77688594c3d38b2d49e08bcf8f3ec1d`, com o runner offline:
+  `--paper-integrated-disk-guard` — **53 passed, 12 subtests passed**; e
+  `--registry-v2-migration-audit` — **83 passed**. Ambos terminaram sem rede
+  externa e usam fixtures temporárias. Isso valida os bloqueios locais para
+  estado PAPER ausente/inválido e a classificação read-only V1, não altera nem
+  valida arquivos de produção.
+- Inspeção do executor confirma que não há rotina de inicialização automática
+  dos ledgers ausentes: `execute_paper_from_engine` retorna
+  `PAPER_STATE_UNINITIALIZED`. Essa decisão é preservada; não foi criado um
+  inicializador de ledger vazio, pois ainda falta provar a proveniência do
+  estado e a ausência de histórico integrado anterior.
+- A reconciliação individual continua dependendo de ler as posições de cada
+  bot por seus leitores Redis. O custo/quota desse acesso não foi verificado;
+  por isso, nenhuma leitura Redis de produção foi realizada nem recomendada
+  antes dessa verificação.
