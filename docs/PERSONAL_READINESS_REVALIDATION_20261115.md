@@ -1492,3 +1492,20 @@ foi enviada e nenhum dado ou arquivo de produção foi modificado.
   bot por seus leitores Redis. O custo/quota desse acesso não foi verificado;
   por isso, nenhuma leitura Redis de produção foi realizada nem recomendada
   antes dessa verificação.
+
+## Publicação da branch candidata — 2026-11-16 14:38 UTC
+
+- Após confirmar o worktree limpo, identidade Git configurada, branch remota
+  ainda inexistente e ausência de workflows em `.github/workflows`, publiquei
+  `codex/falcon-paper-persist-guard-20261115` em `origin`. O HEAD remoto é
+  `1646262291e0058f800ac6a9584594855611d021`; ele contém o commit de código
+  validado `0130a011b77688594c3d38b2d49e08bcf8f3ec1d` seguido do commit de
+  documentação `1646262`.
+- O push não abriu PR, não fez merge e não acionou deploy. O custo incremental
+  foi considerado zero: somente objetos Git pequenos foram enviados, e não há
+  workflow local que execute build/teste pago. Nenhuma alteração foi feita no
+  Render.
+- Para implantar `0130a01`, ainda é necessária decisão financeira específica:
+  não há confirmação atual de custo zero dos minutos de build/banda. O push
+  apenas torna o SHA acessível no GitHub; não resolve a ausência dos ledgers,
+  não reconcilia os 68 registros legados e não altera controles de trading.
