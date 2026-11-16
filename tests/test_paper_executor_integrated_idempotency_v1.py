@@ -130,6 +130,24 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertFalse(self.positions_file.exists())
         self.assertFalse(self.log_file.exists())
 
+    def test_empty_ledgers_open_only_a_paper_position_without_exchange_order(self):
+        self._initialize_state()
+
+        result = paper_executor.execute_paper_from_engine({"plan": self._plan()})
+
+        self.assertTrue(result["ok"])
+        payload = result["payload"]
+        self.assertEqual(payload["status"], "PAPER_OPENED")
+        self.assertTrue(payload["paper_execution_enabled"])
+        self.assertFalse(payload["real_execution_enabled"])
+        self.assertFalse(payload["exchange_executor_called"])
+        self.assertEqual(len(self._positions()), 1)
+        position = self._positions()[0]
+        self.assertEqual(position["status"], "OPEN")
+        self.assertEqual(position["mode"], "PAPER")
+        self.assertFalse(position["exchange_executor_called"])
+        self.assertIsNone(position["real_exchange_order_id"])
+
     def test_missing_seen_cache_blocks_new_key_but_recovers_existing_key(self):
         position = {
             "idempotency_key": "paper-existing-key",

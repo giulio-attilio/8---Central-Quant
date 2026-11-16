@@ -15273,7 +15273,11 @@ def mark_registry_missing_trades(removed):
         return {"ok": False, "error": str(exc)}
 
 
-def sync_trade_registry_from_open_positions(commit=False):
+def sync_trade_registry_from_open_positions(
+    commit=False,
+    *,
+    include_after_snapshot=True,
+):
     if central_trade_registry is None:
         return {
             "ok": False,
@@ -15649,7 +15653,12 @@ def sync_trade_registry_from_open_positions(commit=False):
         "v2_ownership_missing_mutation_blocked": (
             v2_ownership_missing_mutation_blocked
         ),
-        "after": central_trade_registry_snapshot(include_trades=False) if commit else None,
+        "after": (
+            central_trade_registry_snapshot(include_trades=False)
+            if commit and include_after_snapshot
+            else None
+        ),
+        "after_snapshot_skipped": bool(commit and not include_after_snapshot),
         "note": "GET faz prévia/dry-run. Para importar, use POST com confirm=true ou confirm=SYNC.",
     }
 
@@ -15658,7 +15667,16 @@ def autosync_trade_registry(reason="manual"):
     global TRADE_REGISTRY_AUTOSYNC_STATUS
 
     try:
-        result = sync_trade_registry_from_open_positions(commit=True)
+        if reason == "can_open_trade":
+            # The risk decision consumes the sync result's `ok` flag, not the
+            # post-sync diagnostic snapshot. Avoid re-reading the full Registry
+            # on this latency-sensitive path while keeping sync/mutations intact.
+            result = sync_trade_registry_from_open_positions(
+                commit=True,
+                include_after_snapshot=False,
+            )
+        else:
+            result = sync_trade_registry_from_open_positions(commit=True)
         TRADE_REGISTRY_AUTOSYNC_STATUS = {
             "last_run": data_hora_sp_str(),
             "last_ok": bool(result.get("ok")),
@@ -15675,6 +15693,9 @@ def autosync_trade_registry(reason="manual"):
             "removed": result.get("removed", [])[:50],
             "missing_mark_result": result.get("missing_mark_result"),
             "after": result.get("after"),
+            "after_snapshot_skipped": bool(
+                result.get("after_snapshot_skipped", False)
+            ),
         },
         }
         return result
@@ -17422,10 +17443,35 @@ def _symbol_sector(symbol):
     return "Outros"
 
 
-def _all_open_positions_payload():
-    rows = []
+def _bot_open_positions_snapshot(strict=False):
+    """Read each bot's current open positions once for one decision snapshot."""
+    snapshot = {}
     for key, module in LOADED_BOTS.items():
-        for p in get_open_positions_from_module(module, key=key):
+        try:
+            snapshot[key] = get_open_positions_from_module(
+                module,
+                key=key,
+                raise_on_error=strict,
+            )
+        except Exception:
+            if strict:
+                raise
+            snapshot[key] = []
+    return snapshot
+
+
+def _all_open_positions_payload(positions_by_bot=None):
+    rows = []
+    if not isinstance(positions_by_bot, dict):
+        positions_by_bot = _bot_open_positions_snapshot()
+    for key in LOADED_BOTS:
+        positions = positions_by_bot.get(key, [])
+        if not isinstance(positions, (dict, list)):
+            continue
+        iterable = positions.values() if isinstance(positions, dict) else positions
+        for p in iterable:
+            if not isinstance(p, dict):
+                continue
             symbol = _compact_symbol(p.get("symbol") or p.get("ativo") or p.get("pair"))
             side = str(p.get("side", p.get("direction", ""))).upper()
             rows.append({
@@ -19762,12 +19808,17 @@ def can_open_trade_decision(payload: dict):
         notional = float(margin) * int(leverage)
 
     exposure_snapshot = central_exposure_snapshot()
-    rows = _all_open_positions_payload()
+    bot_positions_snapshot = _bot_open_positions_snapshot()
+    rows = _all_open_positions_payload(bot_positions_snapshot)
     total_pos = int(exposure_snapshot.get("total_positions_open") or 0)
     long_pos = int(exposure_snapshot.get("long_positions_open") or 0)
     short_pos = int(exposure_snapshot.get("short_positions_open") or 0)
 
-    live_rows = _central_live_positions_payload() if "_central_live_positions_payload" in globals() else []
+    live_rows = (
+        _central_live_positions_payload(positions_by_bot=bot_positions_snapshot)
+        if "_central_live_positions_payload" in globals()
+        else []
+    )
     live_total_pos = len(live_rows)
     live_long_pos = sum(1 for r in live_rows if str(r.get("side") or "").upper() in {"LONG", "BUY"})
     live_short_pos = sum(1 for r in live_rows if str(r.get("side") or "").upper() in {"SHORT", "SELL"})
@@ -20161,23 +20212,32 @@ def _broker_open_positions(*, strict=False):
     return rows, None
 
 
-def _central_live_positions_payload(strict=False):
+def _central_live_positions_payload(strict=False, positions_by_bot=None):
     rows = []
+    use_snapshot = isinstance(positions_by_bot, dict)
     for key, module in LOADED_BOTS.items():
-        try:
+        if use_snapshot:
+            positions = positions_by_bot.get(key, [])
+        else:
+            try:
+                if strict:
+                    positions = get_open_positions_from_module(
+                        module,
+                        key=key,
+                        raise_on_error=True,
+                    )
+                else:
+                    positions = get_open_positions_from_module(module)
+            except Exception:
+                if strict:
+                    raise
+                positions = []
+        if not isinstance(positions, (dict, list)):
             if strict:
-                positions = get_open_positions_from_module(
-                    module,
-                    key=key,
-                    raise_on_error=True,
-                )
-            else:
-                positions = get_open_positions_from_module(module)
-        except Exception:
-            if strict:
-                raise
-            positions = []
-        for p in positions:
+                raise TypeError("LOCAL_POSITION_SNAPSHOT_INVALID_TYPE")
+            continue
+        iterable = positions.values() if isinstance(positions, dict) else positions
+        for p in iterable:
             if not isinstance(p, dict):
                 continue
             is_live = (

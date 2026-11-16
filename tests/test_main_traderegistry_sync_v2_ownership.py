@@ -162,7 +162,15 @@ def _v1_trade(position, *, bot="TURTLE"):
     }
 
 
-def _sync(registry, bot_positions, *, commit=True, write_gate=False):
+def _sync(
+    registry,
+    bot_positions,
+    *,
+    commit=True,
+    write_gate=False,
+    include_after_snapshot=True,
+    snapshot_calls=None,
+):
     namespace = {
         "central_trade_registry": registry,
         "TRADE_REGISTRY_IMPORT_ERROR": None,
@@ -178,11 +186,18 @@ def _sync(registry, bot_positions, *, commit=True, write_gate=False):
         "data_hora_sp_str": lambda: "2026-08-11T12:00:00-03:00",
         "_position_runner_r": lambda _position: None,
         "_position_runner_pct": lambda _position: None,
-        "central_trade_registry_snapshot": lambda include_trades=False: {},
+        "central_trade_registry_snapshot": lambda include_trades=False: (
+            snapshot_calls.append(include_trades)
+            if snapshot_calls is not None
+            else None
+        ) or {},
         "memory_profile_step": lambda _label: None,
     }
     _compile_sync_functions(namespace)
-    return namespace["sync_trade_registry_from_open_positions"](commit=commit)
+    return namespace["sync_trade_registry_from_open_positions"](
+        commit=commit,
+        include_after_snapshot=include_after_snapshot,
+    )
 
 
 def _mark_missing(registry, removed, *, timestamp="2026-09-06T01:00:00-03:00"):
@@ -568,11 +583,86 @@ def test_invalid_position_fields_block_missing_mutation_for_existing_registry_tr
     assert registry.save_calls == []
 
 
+def test_sync_can_skip_after_snapshot_without_changing_commit_result():
+    registry = _FakeTradeRegistry()
+    snapshot_calls = []
+
+    result = _sync(
+        registry,
+        {"TURTLE": [_position()]},
+        include_after_snapshot=False,
+        snapshot_calls=snapshot_calls,
+    )
+
+    assert result["ok"] is True
+    assert result["commit"] is True
+    assert result["imported_count"] == 1
+    assert result["after"] is None
+    assert result["after_snapshot_skipped"] is True
+    assert snapshot_calls == []
+    assert len(registry.register_calls) == 1
+
+
+def test_sync_keeps_after_snapshot_by_default_for_commit_callers():
+    registry = _FakeTradeRegistry()
+    snapshot_calls = []
+
+    result = _sync(
+        registry,
+        {"TURTLE": [_position()]},
+        snapshot_calls=snapshot_calls,
+    )
+
+    assert result["ok"] is True
+    assert result["after"] == {}
+    assert result["after_snapshot_skipped"] is False
+    assert snapshot_calls == [False]
+
+
+def test_autosync_skips_after_snapshot_only_for_can_open_hot_path():
+    calls = []
+
+    def sync(*, commit, include_after_snapshot=True):
+        calls.append((commit, include_after_snapshot))
+        return {
+            "ok": True,
+            "candidates_count": 0,
+            "imported_count": 0,
+            "skipped_count": 0,
+            "errors_count": 0,
+            "removed_count": 0,
+            "removed": [],
+            "missing_mark_result": None,
+            "after": None,
+            "after_snapshot_skipped": not include_after_snapshot,
+        }
+
+    namespace = {
+        "TRADE_REGISTRY_AUTOSYNC_STATUS": {},
+        "data_hora_sp_str": lambda: "2026-11-15T12:00:00-03:00",
+        "sync_trade_registry_from_open_positions": sync,
+    }
+    _compile_sync_functions(namespace)
+    namespace["sync_trade_registry_from_open_positions"] = sync
+
+    namespace["autosync_trade_registry"]("can_open_trade")
+    assert namespace["TRADE_REGISTRY_AUTOSYNC_STATUS"]["last_result"][
+        "after_snapshot_skipped"
+    ] is True
+    namespace["autosync_trade_registry"]("manual")
+
+    assert calls == [(True, False), (True, True)]
+    assert namespace["TRADE_REGISTRY_AUTOSYNC_STATUS"]["last_ok"] is True
+    assert namespace["TRADE_REGISTRY_AUTOSYNC_STATUS"]["last_result"][
+        "after_snapshot_skipped"
+    ] is False
+
+
 def test_autosync_status_surfaces_unsuccessful_sync_without_error_details():
     namespace = {
         "TRADE_REGISTRY_AUTOSYNC_STATUS": {},
         "data_hora_sp_str": lambda: "2026-11-04T12:00:00-03:00",
-        "sync_trade_registry_from_open_positions": lambda *, commit: {
+        "sync_trade_registry_from_open_positions": lambda *, commit, **_kwargs: {
             "ok": False,
             "commit": commit,
             "errors_count": 1,
@@ -587,7 +677,7 @@ def test_autosync_status_surfaces_unsuccessful_sync_without_error_details():
         },
     }
     _compile_sync_functions(namespace)
-    namespace["sync_trade_registry_from_open_positions"] = lambda *, commit: {
+    namespace["sync_trade_registry_from_open_positions"] = lambda *, commit, **_kwargs: {
         "ok": False,
         "commit": commit,
         "errors_count": 1,
@@ -613,12 +703,12 @@ def test_autosync_status_sanitizes_unexpected_exception_details():
     namespace = {
         "TRADE_REGISTRY_AUTOSYNC_STATUS": {},
         "data_hora_sp_str": lambda: "2026-11-04T12:00:00-03:00",
-        "sync_trade_registry_from_open_positions": lambda *, commit: (
+        "sync_trade_registry_from_open_positions": lambda *, commit, **_kwargs: (
             _ for _ in ()
         ).throw(RuntimeError("sensitive diagnostic fixture")),
     }
     _compile_sync_functions(namespace)
-    namespace["sync_trade_registry_from_open_positions"] = lambda *, commit: (
+    namespace["sync_trade_registry_from_open_positions"] = lambda *, commit, **_kwargs: (
         _ for _ in ()
     ).throw(RuntimeError("sensitive diagnostic fixture"))
 

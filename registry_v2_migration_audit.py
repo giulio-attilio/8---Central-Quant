@@ -358,26 +358,59 @@ def _audit_mode(
     aliases: Mapping[str, list[Any]],
     strong_ids: Sequence[str],
 ) -> tuple[str, tuple[str, ...], str | None]:
-    claims = []
-    for field in _MODE_FIELDS:
-        value = _single_value(aliases[field])
-        if value:
-            claims.append((field, str(value).strip().upper()))
-    evidence = [f"explicit:{field}={value}" for field, value in claims]
+    execution_value = _single_value(aliases["execution_mode"])
+    registry_value = _single_value(aliases["registry_mode"])
+    execution_mode = str(execution_value).strip().upper() if execution_value else None
+    registry_mode = str(registry_value).strip().upper() if registry_value else None
+    evidence = []
+    if execution_mode:
+        evidence.append(f"explicit:execution_mode={execution_mode}")
+    if registry_mode:
+        # Legacy Registry normalization may infer registry_mode from bot/source
+        # labels. Without execution_mode or corroborating broker evidence, this
+        # field is a classification label, not proof of how the trade executed.
+        evidence.append(f"unverified_registry_mode={registry_mode}")
+
+    mode_families = {
+        "PAPER": "PAPER",
+        "VERIFY": "VERIFY",
+        "LIVE": "REAL",
+        "REAL": "REAL",
+    }
+    execution_family = mode_families.get(execution_mode)
+    registry_family = mode_families.get(registry_mode)
+    if execution_family and registry_family and execution_family != registry_family:
+        return (
+            MODE_CONFLICT,
+            tuple(evidence),
+            "mode_conflict:execution_mode_vs_registry_mode",
+        )
+
     has_broker_evidence = bool(strong_ids)
-    if any(value in {"PAPER", "VERIFY"} for _, value in claims) and has_broker_evidence:
+    if has_broker_evidence and execution_family in {"PAPER", "VERIFY"}:
         evidence.append("broker_evidence:strong_id")
         return MODE_CONFLICT, tuple(evidence), "mode_conflict:paper_or_verify_with_broker_evidence"
-    if any(value in {"LIVE", "REAL"} for _, value in claims) and has_broker_evidence:
+    if has_broker_evidence and execution_family == "REAL":
         evidence.append("broker_evidence:strong_id")
         return REAL, tuple(evidence), None
-    if any(value == "PAPER" for _, value in claims):
+    if has_broker_evidence and not execution_mode and registry_family in {"PAPER", "VERIFY"}:
+        evidence.append("broker_evidence:strong_id")
+        return MODE_CONFLICT, tuple(evidence), "mode_conflict:unverified_paper_or_verify_with_broker_evidence"
+    if has_broker_evidence and not execution_mode and registry_family == "REAL":
+        evidence.append("broker_evidence:strong_id")
+        return REAL, tuple(evidence), None
+
+    # execution_mode is the runtime field; registry_mode alone may have been
+    # synthesized by legacy normalization and must not authorize migration.
+    if execution_family == "PAPER":
         return PAPER, tuple(evidence), None
-    if any(value == "VERIFY" for _, value in claims):
+    if execution_family == "VERIFY":
         return VERIFY, tuple(evidence), None
-    if any(value in {"LIVE", "REAL"} for _, value in claims):
+    if execution_family == "REAL":
         evidence.append("explicit_live_or_real_without_factual_broker_evidence")
         return UNKNOWN, tuple(evidence), None
+    if registry_mode:
+        evidence.append("registry_mode_not_execution_proof")
     return UNKNOWN, tuple(evidence), None
 
 

@@ -356,6 +356,7 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
              mock.patch.object(central_main, "GLOBAL_RISK_MAX_SYMBOL_EXPOSURE", 3), \
              mock.patch.object(central_main, "GLOBAL_RISK_ALLOW_REDUCE_ONLY", False), \
              mock.patch.object(central_main, "autosync_trade_registry", return_value={"ok": True}), \
+             mock.patch.object(central_main, "_bot_open_positions_snapshot", return_value={}), \
              mock.patch.object(central_main, "ENABLE_REAL_TRADING", True), \
              mock.patch.object(central_main, "REAL_TRADING_ALLOWED_BOTS", {"FALCON"}), \
              mock.patch.object(central_main, "_all_open_positions_payload", return_value=[{"bot": "FALCON", "symbol": "BTCUSDT", "side": "LONG"}] * 101), \
@@ -372,6 +373,7 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
 
     def test_can_open_trade_denies_new_entry_when_registry_sync_fails(self):
         with mock.patch.object(central_main, "autosync_trade_registry", return_value={"ok": False}), \
+             mock.patch.object(central_main, "_bot_open_positions_snapshot", return_value={}), \
              mock.patch.object(central_main, "_all_open_positions_payload", return_value=[]), \
              mock.patch.object(central_main, "_central_live_positions_payload", return_value=[]), \
              mock.patch.object(central_main, "central_exposure_snapshot", return_value={"total_positions_open": 0, "long_positions_open": 0, "short_positions_open": 0}), \

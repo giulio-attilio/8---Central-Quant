@@ -1,7 +1,7 @@
 """Run the existing Falcon safety regressions without external access.
 
 Usage: python3 -I tests/run_falcon_pilot_minimal_offline.py
-       [--upstash-sdk-contract|--account-client-order-authority|--live-position-risk-gate]
+       [--upstash-sdk-contract|--account-client-order-authority|--live-position-risk-gate|--position-snapshot-reuse]
 Some tests import main.py, so runtime auto-start is disabled before collection.
 Pytest is loaded only after network, subprocess and .env-file access are denied.
 """
@@ -193,6 +193,8 @@ if __name__ == "__main__":
         cases = ("test_registry_remaining_writers_atomic_rmw_v1.py",)
     elif sys.argv[1:] == ["--registry-sync"]:
         cases = ("test_main_traderegistry_sync_v2_ownership.py",)
+    elif sys.argv[1:] == ["--registry-v2-migration-audit"]:
+        cases = ("test_registry_v2_migration_audit.py",)
     elif sys.argv[1:] == ["--can-open-risk"]:
         cases = (
             "test_history_eventbus_smoke.py",
@@ -202,7 +204,10 @@ if __name__ == "__main__":
         cases = (
             "test_live_position_reconciliation_risk_gate_v1.py",
             "test_live_central_risk_gate_fail_closed_v1.py",
+            "test_main_position_snapshot_reuse_v1.py",
         )
+    elif sys.argv[1:] == ["--position-snapshot-reuse"]:
+        cases = ("test_main_position_snapshot_reuse_v1.py",)
     elif sys.argv[1:] == ["--c3-dormant-startup"]:
         cases = (
             "test_c3_dormant_startup_same_coordinator_v2.py",
@@ -348,6 +353,8 @@ if __name__ == "__main__":
     elif sys.argv[1:] == ["--registry-writers"]:
         filters = []
     elif sys.argv[1:] == ["--registry-sync"]:
+        filters = []
+    elif sys.argv[1:] == ["--registry-v2-migration-audit"]:
         filters = []
     elif sys.argv[1:] == ["--can-open-risk"]:
         filters = [

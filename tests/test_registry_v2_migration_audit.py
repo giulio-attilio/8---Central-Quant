@@ -165,6 +165,45 @@ def test_018_paper_without_broker_evidence(tmp_path):
     assert record.classification == audit.LEGACY_LOGICAL_ONLY
 
 
+@pytest.mark.parametrize("registry_mode", ["PAPER", "VERIFY", "REAL"])
+def test_registry_mode_alone_is_not_execution_proof(tmp_path, registry_mode):
+    record = _record(
+        _audit(
+            tmp_path / f"registry-{registry_mode.lower()}.json",
+            _v1_document(open_trades={"k": _row(registry_mode=registry_mode)}),
+        )
+    )
+    assert record.mode_claim == audit.UNKNOWN
+    assert f"unverified_registry_mode={registry_mode}" in record.mode_evidence
+    assert "registry_mode_not_execution_proof" in record.mode_evidence
+
+
+def test_registry_paper_with_factual_broker_evidence_is_quarantined(tmp_path):
+    record = _record(
+        _audit(
+            tmp_path / "registry-paper-broker.json",
+            _v1_document(open_trades={"k": _row(registry_mode="PAPER", broker_order_id="broker-1")}),
+        )
+    )
+    assert record.mode_claim == audit.MODE_CONFLICT
+    assert record.classification == audit.MODE_CONFLICT
+    assert record.recommendation == audit.QUARANTINE
+    assert record.errors == ("mode_conflict:unverified_paper_or_verify_with_broker_evidence",)
+
+
+def test_execution_and_registry_mode_disagreement_is_quarantined(tmp_path):
+    record = _record(
+        _audit(
+            tmp_path / "mode-disagreement.json",
+            _v1_document(open_trades={"k": _row(execution_mode="PAPER", registry_mode="REAL")}),
+        )
+    )
+    assert record.mode_claim == audit.MODE_CONFLICT
+    assert record.classification == audit.MODE_CONFLICT
+    assert record.recommendation == audit.QUARANTINE
+    assert record.errors == ("mode_conflict:execution_mode_vs_registry_mode",)
+
+
 def test_019_live_with_broker_evidence_real_candidate(tmp_path):
     row = _row(execution_mode="LIVE", broker_order_id="broker-1")
     record = _record(_audit(tmp_path / "live.json", _v1_document(open_trades={"k": row})))
