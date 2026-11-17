@@ -49,3 +49,36 @@ def test_predator_paper_audit_writers_use_guarded_storage_only():
         assert "_write_central_paper_audit_json" in called
         assert "_append_central_paper_audit_event" in called
         assert not direct_io.intersection(called), name
+
+
+def test_trade_close_outcome_state_io_uses_guarded_storage_only():
+    source = (Path(__file__).resolve().parents[1] / "main.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    guarded_readers = (
+        "_rp_v13_closed_pairs_from_outcome_files_with_status",
+        "trade_close_outcome_v1_health_route",
+        "trade_close_outcome_v1_log_route",
+    )
+    for name in guarded_readers:
+        called = _called_names(functions[name])
+        assert "_paper_file_exists" in called, name
+        assert "_read_guarded_paper_text" in called, name
+        assert not {"exists", "read_text"}.intersection(called), name
+
+    json_writer = _called_names(functions["_tco_v1_atomic_write_json"])
+    assert "_write_central_paper_audit_json" in json_writer
+    assert not {"mkdir", "write_text", "write_bytes", "open", "replace"}.intersection(
+        json_writer
+    )
+
+    event_writer = _called_names(functions["_tco_v1_append_event"])
+    assert "_append_central_paper_audit_event" in event_writer
+    assert not {"mkdir", "open"}.intersection(event_writer)

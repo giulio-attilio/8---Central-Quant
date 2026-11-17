@@ -9500,8 +9500,8 @@ def _rp_v13_closed_pairs_from_outcome_files_with_status():
     # Eventos preservam todos os outcomes salvos; latest preserva apenas o último, mas serve como fallback.
     try:
         path = globals().get("TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE")
-        if path and Path(path).exists():
-            for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if path and _paper_file_exists(path):
+            for line in _read_guarded_paper_text(Path(path), encoding="utf-8").splitlines():
                 line = line.strip()
                 if not line:
                     continue
@@ -9523,8 +9523,8 @@ def _rp_v13_closed_pairs_from_outcome_files_with_status():
         read_errors.append("TRADE_CLOSE_OUTCOME_EVENTS_READ_ERROR")
     try:
         path = globals().get("TRADE_CLOSE_OUTCOME_V1_LATEST_FILE")
-        if path and Path(path).exists():
-            outcome = json.loads(Path(path).read_text(encoding="utf-8"))
+        if path and _paper_file_exists(path):
+            outcome = json.loads(_read_guarded_paper_text(Path(path), encoding="utf-8"))
             if not isinstance(outcome, dict):
                 read_errors.append("TRADE_CLOSE_OUTCOME_LATEST_INVALID")
                 outcome = None
@@ -11016,18 +11016,18 @@ def _tco_v1_norm_bot(value):
 
 
 def _tco_v1_atomic_write_json(path, payload):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    _write_central_paper_audit_json(
+        path,
+        payload,
+    )
 
 
 def _tco_v1_append_event(event):
     try:
-        TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        _append_central_paper_audit_event(
+            TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE,
+            json.dumps(event, ensure_ascii=False, default=str) + "\n",
+        )
         return True
     except Exception:
         return False
@@ -11823,8 +11823,13 @@ def trade_close_outcome_v1_health_route():
     status = trade_close_outcome_v1_registry_status()
     latest = None
     try:
-        if TRADE_CLOSE_OUTCOME_V1_LATEST_FILE.exists():
-            latest = json.loads(TRADE_CLOSE_OUTCOME_V1_LATEST_FILE.read_text(encoding="utf-8"))
+        if _paper_file_exists(TRADE_CLOSE_OUTCOME_V1_LATEST_FILE):
+            latest = json.loads(
+                _read_guarded_paper_text(
+                    TRADE_CLOSE_OUTCOME_V1_LATEST_FILE,
+                    encoding="utf-8",
+                )
+            )
     except Exception as exc:
         latest = {"ok": False, "error": str(exc)}
     return {
@@ -11862,8 +11867,11 @@ def trade_close_outcome_v1_log_route():
     limit = int(_tco_v1_float(request.args.get("limit"), 50) or 50)
     rows = []
     try:
-        if TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE.exists():
-            lines = TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE.read_text(encoding="utf-8").splitlines()[-limit:]
+        if _paper_file_exists(TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE):
+            lines = _read_guarded_paper_text(
+                TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE,
+                encoding="utf-8",
+            ).splitlines()[-limit:]
             for line in lines:
                 try:
                     rows.append(json.loads(line))
