@@ -31,7 +31,13 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional, List, Tuple
 
-from paper_state_storage import resolve_paper_data_dir
+from paper_state_storage import (
+    append_paper_text,
+    ensure_paper_data_dir,
+    paper_file_exists,
+    read_paper_text,
+    resolve_paper_data_dir,
+)
 
 try:
     from account_client_order_id import (
@@ -107,7 +113,7 @@ def _resolve_data_dir() -> Path:
 
 
 DATA_DIR = _resolve_data_dir()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+PAPER_DATA_DIR_READY = ensure_paper_data_dir(DATA_DIR)
 
 EXECUTION_ENGINE_LOG_FILE = DATA_DIR / "execution_engine_log.jsonl"
 EXECUTION_AUDIT_LOG_FILE = DATA_DIR / "execution_audit_log.jsonl"
@@ -162,9 +168,11 @@ def _now_br() -> str:
 
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        append_paper_text(
+            path,
+            json.dumps(payload, ensure_ascii=False, default=str) + "\n",
+            encoding="utf-8",
+        )
     except Exception:
         pass
 
@@ -200,10 +208,19 @@ def read_execution_audit_log(limit: int = 50) -> Dict[str, Any]:
     except Exception:
         limit = 50
 
-    if not EXECUTION_AUDIT_LOG_FILE.exists():
-        return {"ok": True, "generated_at": _now_br(), "count": 0, "items": [], "file": str(EXECUTION_AUDIT_LOG_FILE)}
-
-    lines = EXECUTION_AUDIT_LOG_FILE.read_text(encoding="utf-8").splitlines()[-limit:]
+    try:
+        if not paper_file_exists(EXECUTION_AUDIT_LOG_FILE):
+            return {"ok": True, "generated_at": _now_br(), "count": 0, "items": [], "file": str(EXECUTION_AUDIT_LOG_FILE)}
+        lines = read_paper_text(EXECUTION_AUDIT_LOG_FILE, encoding="utf-8").splitlines()[-limit:]
+    except Exception:
+        return {
+            "ok": False,
+            "status": "EXECUTION_AUDIT_LOG_READ_FAILED",
+            "generated_at": _now_br(),
+            "count": 0,
+            "items": [],
+            "file": str(EXECUTION_AUDIT_LOG_FILE),
+        }
     items = []
     for line in lines:
         try:
@@ -852,18 +869,20 @@ def _recent_duplicate_execution(symbol: str, side: str, bot: str, window_seconds
 
     checked = 0
     matches = []
+    storage_error_status = None
 
     for path in [EXECUTION_AUDIT_LOG_FILE, EXECUTION_ENGINE_LOG_FILE]:
         try:
-            if not path.exists():
+            if not paper_file_exists(path):
                 continue
-            lines = path.read_text(encoding="utf-8").splitlines()[-300:]
+            lines = read_paper_text(path, encoding="utf-8").splitlines()[-300:]
             for line in reversed(lines):
                 checked += 1
                 try:
                     item = json.loads(line)
                 except Exception:
-                    continue
+                    storage_error_status = "EXECUTION_LOGS_INVALID"
+                    break
 
                 epoch = _to_float(item.get("epoch"))
                 if epoch is not None and now - epoch > window_seconds:
@@ -890,9 +909,11 @@ def _recent_duplicate_execution(symbol: str, side: str, bot: str, window_seconds
                         })
                         break
         except Exception:
-            continue
+            storage_error_status = storage_error_status or "EXECUTION_LOGS_READ_FAILED"
 
     return {
+        "ok": storage_error_status is None,
+        "status": storage_error_status or "OK",
         "checked": checked,
         "duplicates": matches,
         "duplicate": bool(matches),
@@ -1054,7 +1075,9 @@ def execution_confirmation_guard(
         window_seconds=EXECUTION_CONFIRMATION_BLOCK_DUPLICATE_WINDOW_SECONDS,
     )
     checks["duplicate_check"] = duplicate
-    if duplicate.get("duplicate"):
+    if duplicate.get("ok") is not True:
+        reasons.append("verificação de duplicidade indisponível; execução bloqueada")
+    elif duplicate.get("duplicate"):
         reasons.append("execução parecida detectada na janela de duplicidade")
 
     allowed = not reasons
@@ -1814,20 +1837,28 @@ def execution_engine_real_pilot_test(dry_run: bool = True) -> Dict[str, Any]:
 
 
 def read_execution_engine_log(limit: int = 20) -> Dict[str, Any]:
-    if not EXECUTION_ENGINE_LOG_FILE.exists():
-        return {
-            "ok": True,
-            "generated_at": _now_br(),
-            "count": 0,
-            "items": [],
-        }
-
     try:
         limit = max(1, min(int(limit), 200))
     except Exception:
         limit = 20
 
-    lines = EXECUTION_ENGINE_LOG_FILE.read_text(encoding="utf-8").splitlines()
+    try:
+        if not paper_file_exists(EXECUTION_ENGINE_LOG_FILE):
+            return {
+                "ok": True,
+                "generated_at": _now_br(),
+                "count": 0,
+                "items": [],
+            }
+        lines = read_paper_text(EXECUTION_ENGINE_LOG_FILE, encoding="utf-8").splitlines()
+    except Exception:
+        return {
+            "ok": False,
+            "status": "EXECUTION_ENGINE_LOG_READ_FAILED",
+            "generated_at": _now_br(),
+            "count": 0,
+            "items": [],
+        }
     selected = lines[-limit:]
 
     items = []

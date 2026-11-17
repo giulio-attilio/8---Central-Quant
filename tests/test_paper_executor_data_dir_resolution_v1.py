@@ -423,3 +423,93 @@ def test_outcome_evaluation_does_not_recreate_positions_if_ledger_disappears_aft
     assert not positions.exists()
     assert not stats.exists()
     assert not log.exists()
+
+
+def test_execution_engine_logs_delegate_to_guarded_storage(monkeypatch, tmp_path):
+    engine_log = tmp_path / "execution_engine_log.jsonl"
+    audit_log = tmp_path / "execution_audit_log.jsonl"
+    appended = []
+    monkeypatch.setattr(execution_engine, "EXECUTION_ENGINE_LOG_FILE", engine_log)
+    monkeypatch.setattr(execution_engine, "EXECUTION_AUDIT_LOG_FILE", audit_log)
+    monkeypatch.setattr(
+        execution_engine,
+        "append_paper_text",
+        lambda path, content, **kwargs: appended.append((path, content, kwargs)),
+    )
+
+    execution_engine._append_jsonl(engine_log, {"event": "TEST_ONLY"})
+
+    assert appended == [
+        (engine_log, '{"event": "TEST_ONLY"}\n', {"encoding": "utf-8"})
+    ]
+
+    monkeypatch.setattr(execution_engine, "paper_file_exists", lambda _path: True)
+    monkeypatch.setattr(
+        execution_engine,
+        "read_paper_text",
+        lambda path, **_kwargs: '{"event": "TEST_ONLY"}\n',
+    )
+    assert execution_engine.read_execution_engine_log()["items"] == [
+        {"event": "TEST_ONLY"}
+    ]
+    assert execution_engine.read_execution_audit_log()["items"] == [
+        {"event": "TEST_ONLY"}
+    ]
+
+
+def test_execution_engine_log_read_errors_fail_closed_for_duplicate_check(
+    monkeypatch,
+):
+    def unavailable(_path):
+        raise OSError("synthetic storage failure")
+
+    monkeypatch.setattr(execution_engine, "paper_file_exists", unavailable)
+    result = execution_engine._recent_duplicate_execution(
+        symbol="BTCUSDT", side="LONG", bot="FALCON"
+    )
+    assert result["ok"] is False
+    assert result["status"] == "EXECUTION_LOGS_READ_FAILED"
+    assert result["duplicate"] is False
+
+
+def test_execution_engine_malformed_log_fails_closed_for_duplicate_check(
+    monkeypatch,
+):
+    private_marker = "synthetic-malformed-log-value"
+    monkeypatch.setattr(execution_engine, "paper_file_exists", lambda _path: True)
+    monkeypatch.setattr(
+        execution_engine,
+        "read_paper_text",
+        lambda _path, **_kwargs: private_marker,
+    )
+
+    result = execution_engine._recent_duplicate_execution(
+        symbol="BTCUSDT", side="LONG", bot="FALCON"
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "EXECUTION_LOGS_INVALID"
+    assert result["duplicate"] is False
+    assert private_marker not in repr(result)
+
+
+def test_confirmation_guard_blocks_when_duplicate_log_read_is_unavailable(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        execution_engine,
+        "_recent_duplicate_execution",
+        lambda **_kwargs: {"ok": False, "status": "EXECUTION_LOGS_READ_FAILED"},
+    )
+    result = execution_engine.execution_confirmation_guard(
+        payload={},
+        mode="LIVE",
+        dry_run=False,
+        real_guard={"ok": True},
+        execution_auth_token="synthetic-test-token",
+    )
+
+    assert result["allowed"] is False
+    assert "verificação de duplicidade indisponível; execução bloqueada" in result[
+        "reasons"
+    ]
