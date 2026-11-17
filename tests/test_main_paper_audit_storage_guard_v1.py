@@ -29,9 +29,13 @@ def test_predator_paper_audit_writers_use_guarded_storage_only():
     verifier = functions["_verify_central_paper_audit_path"]
     json_writer = functions["_write_central_paper_audit_json"]
     event_writer = functions["_append_central_paper_audit_event"]
+    json_reader = functions["_pppa_v1_read_json_records"]
     assert "_paper_data_mount_verified" in _called_names(verifier)
     assert "_write_guarded_paper_json" in _called_names(json_writer)
     assert "_append_guarded_paper_text" in _called_names(event_writer)
+    assert "_paper_file_exists" in _called_names(json_reader)
+    assert "_read_guarded_paper_text" in _called_names(json_reader)
+    assert not {"exists", "read_text"}.intersection(_called_names(json_reader))
 
     callers = (
         "predator_pnl_paper_audit_v1_status",

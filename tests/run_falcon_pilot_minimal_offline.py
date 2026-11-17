@@ -242,6 +242,7 @@ if __name__ == "__main__":
             "test_execution_pipeline_status_paper_state_v1.py",
             "test_adaptive_weights_data_dir_guard_v1.py",
             "test_paper_state_storage_render_paths_v1.py",
+            "test_main_paper_audit_storage_guard_v1.py",
             "test_outcome_evaluator_closed_identity_v1.py",
         )
     elif sys.argv[1:] == ["--paper-lifecycle-disk-failures"]:

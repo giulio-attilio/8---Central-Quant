@@ -104,7 +104,9 @@ os.environ["CENTRAL_DATA_DIR"] = str(CENTRAL_DATA_DIR)
 
 from paper_state_storage import (
     append_paper_text as _append_guarded_paper_text,
+    paper_file_exists as _paper_file_exists,
     paper_data_mount_verified as _paper_data_mount_verified,
+    read_paper_text as _read_guarded_paper_text,
     write_json_atomically as _write_guarded_paper_json,
 )
 
@@ -48436,10 +48438,10 @@ def _pppa_v1_read_jsonl_tail(path, limit=1000):
 
 def _pppa_v1_read_json_records(path, limit=1000):
     p = Path(str(path))
-    if not p.exists():
-        return []
     try:
-        obj = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+        if not _paper_file_exists(p):
+            return []
+        obj = json.loads(_read_guarded_paper_text(p, encoding="utf-8"))
     except Exception:
         return []
     records = []
