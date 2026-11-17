@@ -32,6 +32,37 @@ _BOT_KEYS = (
     ("TURTLE", "turtle_pro:positions"),
 )
 
+# Only expose fixed, reviewed validation labels in production-shell output.
+# Never print exception text from snapshots: malformed values may contain
+# trade identifiers, arbitrary user strings, or other production data.
+_SAFE_PREVIEW_ERROR_CODES = {
+    "registry_snapshot_object_required": "REGISTRY_SNAPSHOT_OBJECT_REQUIRED",
+    "registry_open_trades_invalid": "REGISTRY_OPEN_TRADES_INVALID",
+    "registry_closed_trades_invalid": "REGISTRY_CLOSED_TRADES_INVALID",
+    "registry_open_trades_row_invalid": "REGISTRY_OPEN_TRADES_ROW_INVALID",
+    "registry_closed_trades_row_invalid": "REGISTRY_CLOSED_TRADES_ROW_INVALID",
+    "source_snapshot_object_required": "SOURCE_SNAPSHOT_OBJECT_REQUIRED",
+    "source_positions_by_bot_invalid": "SOURCE_POSITIONS_BY_BOT_INVALID",
+    "source_status_by_bot_invalid": "SOURCE_STATUS_BY_BOT_INVALID",
+    "source_status_bot_set_incomplete": "SOURCE_STATUS_BOT_SET_INCOMPLETE",
+    "source_bot_name_invalid": "SOURCE_BOT_NAME_INVALID",
+    "source_positions_bot_unknown": "SOURCE_POSITIONS_BOT_UNKNOWN",
+    "source_positions_missing_for_ok_bot": "SOURCE_POSITIONS_MISSING_FOR_OK_BOT",
+    "source_positions_for_bot_invalid": "SOURCE_POSITIONS_FOR_BOT_INVALID",
+    "source_position_invalid": "SOURCE_POSITION_INVALID",
+    "source_bot_key_conflict": "SOURCE_BOT_KEY_CONFLICT",
+    "source_bot_alias_conflict": "SOURCE_BOT_ALIAS_CONFLICT",
+}
+
+
+def _safe_preview_error_code(exc: Exception) -> str:
+    """Return a fixed diagnostic code without exposing exception details."""
+    if isinstance(exc, ValueError):
+        return _SAFE_PREVIEW_ERROR_CODES.get(str(exc), "UNCLASSIFIED_VALUE_ERROR")
+    if isinstance(exc, TypeError):
+        return "UNCLASSIFIED_TYPE_ERROR"
+    return "UNCLASSIFIED_PREVIEW_ERROR"
+
 
 def _registry_path(path: str | Path | None = None) -> Path:
     if path is not None:
@@ -195,10 +226,11 @@ def capture_paper_registry_sources(
     source = _source_snapshot(redis_client)
     try:
         preview = preview_paper_registry_sources(registry, source)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
         return {
             "ok": False,
             "status": "SOURCE_SNAPSHOT_INVALID",
+            "validation_error_code": _safe_preview_error_code(exc),
             "source_status_by_bot": source["source_status_by_bot"],
             "all_rows_ineligible_for_import": True,
             "writes_performed": False,

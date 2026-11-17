@@ -395,6 +395,48 @@ def test_mget_wrong_result_count_fails_closed(tmp_path):
     assert report["all_rows_ineligible_for_import"] is True
 
 
+def test_invalid_source_row_exposes_only_fixed_error_code(tmp_path):
+    registry = _registry(tmp_path / "trade_registry.json")
+    private_marker = "private-production-row-value"
+    values = _source_values()
+    values[0] = json.dumps({"legacy-position-key": private_marker})
+    redis = FakeRedis(values=values)
+
+    report = capture_paper_registry_sources(redis_client=redis, registry_path=registry)
+
+    serialized = json.dumps(report)
+    assert report["ok"] is False
+    assert report["status"] == "SOURCE_SNAPSHOT_INVALID"
+    assert report["validation_error_code"] == "SOURCE_POSITION_INVALID"
+    assert report["all_rows_ineligible_for_import"] is True
+    assert report["writes_performed"] is False
+    assert redis.calls == [_KEYS]
+    assert private_marker not in serialized
+    assert "legacy-position-key" not in serialized
+
+
+def test_unclassified_preview_exception_never_echoes_exception_text(monkeypatch, tmp_path):
+    registry = _registry(tmp_path / "trade_registry.json")
+    private_marker = "private-exception-payload"
+    redis = FakeRedis()
+
+    def fail_preview(_registry, _source):
+        raise ValueError(private_marker)
+
+    monkeypatch.setattr(
+        paper_registry_source_capture,
+        "preview_paper_registry_sources",
+        fail_preview,
+    )
+    report = capture_paper_registry_sources(redis_client=redis, registry_path=registry)
+
+    serialized = json.dumps(report)
+    assert report["status"] == "SOURCE_SNAPSHOT_INVALID"
+    assert report["validation_error_code"] == "UNCLASSIFIED_VALUE_ERROR"
+    assert report["writes_performed"] is False
+    assert private_marker not in serialized
+
+
 def test_cli_does_not_read_upstash_without_explicit_flag(monkeypatch, capsys):
     def unexpected_read(**_kwargs):
         raise AssertionError("Upstash must not be contacted without --read-upstash")
