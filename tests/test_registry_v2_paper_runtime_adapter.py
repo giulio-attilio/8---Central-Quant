@@ -1377,9 +1377,13 @@ def test_adapter_source_guards_keep_core_wal_as_the_only_mutation_boundary():
     assert "broker" not in imports
     assert "requests" not in imports
     assert "upstash_redis" not in imports
+    assert "paper_state_storage" in imports
     assert core_call_names == {"register_trade_v2", "update_trade_v2", "close_trade_v2"}
     assert "partial_close_trade_v2" not in source
     assert "TempWalLock" not in source
+    assert "paper_state_storage.open_paper_binary" in source
+    assert 'open(self._lock_path, "a+b")' not in source
+    assert "persistent_paper_storage_not_verified" in source
     assert "mkdir(" not in source
     assert ".write_text(" not in source
     assert ".write_bytes(" not in source

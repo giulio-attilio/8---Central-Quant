@@ -17,7 +17,14 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict
 
-from paper_state_storage import resolve_paper_data_dir
+from paper_state_storage import (
+    append_paper_text,
+    ensure_paper_data_dir,
+    paper_data_mount_verified,
+    read_paper_text,
+    resolve_paper_data_dir,
+    write_json_atomically,
+)
 
 
 VERSION = "2026-07-04-ADAPTIVE-WEIGHTS-V1"
@@ -29,7 +36,7 @@ def _resolve_data_dir() -> Path:
 
 
 DATA_DIR = _resolve_data_dir()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+ensure_paper_data_dir(DATA_DIR)
 
 OUTCOME_STATS_FILE = DATA_DIR / "outcome_stats.json"
 ADAPTIVE_WEIGHTS_FILE = DATA_DIR / "adaptive_weights.json"
@@ -46,21 +53,32 @@ def _now_br() -> str:
 
 
 def _read_json(path: Path, default: Any) -> Any:
+    if not paper_data_mount_verified(path):
+        return default
     if not path.exists():
         return default
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(read_paper_text(path, encoding="utf-8"))
     except Exception:
         return default
 
 
-def _write_json(path: Path, payload: Any) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+def _write_json(path: Path, payload: Any) -> bool:
+    return write_json_atomically(path, payload)
 
 
-def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> bool:
+    if not paper_data_mount_verified(path):
+        return False
+    try:
+        append_paper_text(
+            path,
+            json.dumps(payload, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        return True
+    except Exception:
+        return False
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -150,18 +168,25 @@ def _score_bucket(stats: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def adaptive_weights_health() -> Dict[str, Any]:
-    outcome = _read_json(OUTCOME_STATS_FILE, {})
-    weights = _read_json(ADAPTIVE_WEIGHTS_FILE, {})
+    paths_verified = all(paper_data_mount_verified(path) for path in (
+        OUTCOME_STATS_FILE,
+        ADAPTIVE_WEIGHTS_FILE,
+        ADAPTIVE_WEIGHTS_LOG_FILE,
+    ))
+    outcome = _read_json(OUTCOME_STATS_FILE, {}) if paths_verified else {}
+    weights = _read_json(ADAPTIVE_WEIGHTS_FILE, {}) if paths_verified else {}
 
     return {
-        "ok": True,
+        "ok": paths_verified,
+        "status": "READY" if paths_verified else "PAPER_DATA_MOUNT_NOT_VERIFIED",
+        "data_mount_verified": paths_verified,
         "module": "adaptive_weights",
         "loaded": True,
         "version": VERSION,
         "generated_at": _now_br(),
         "enabled": ADAPTIVE_WEIGHTS_ENABLED,
-        "outcome_stats_exists": OUTCOME_STATS_FILE.exists(),
-        "weights_exists": ADAPTIVE_WEIGHTS_FILE.exists(),
+        "outcome_stats_exists": paths_verified and OUTCOME_STATS_FILE.exists(),
+        "weights_exists": paths_verified and ADAPTIVE_WEIGHTS_FILE.exists(),
         "outcome_updated_at": outcome.get("updated_at"),
         "weights_updated_at": weights.get("updated_at"),
         "min_trades_for_confidence": MIN_TRADES_FOR_CONFIDENCE,
@@ -184,6 +209,14 @@ def build_adaptive_weights(commit: bool = True) -> Dict[str, Any]:
         return {
             "ok": False,
             "status": "ADAPTIVE_WEIGHTS_DISABLED",
+            "version": VERSION,
+            "generated_at": _now_br(),
+        }
+
+    if not paper_data_mount_verified(OUTCOME_STATS_FILE):
+        return {
+            "ok": False,
+            "status": "PAPER_DATA_MOUNT_NOT_VERIFIED",
             "version": VERSION,
             "generated_at": _now_br(),
         }
@@ -225,18 +258,37 @@ def build_adaptive_weights(commit: bool = True) -> Dict[str, Any]:
 
     if commit:
         result["updated_at"] = _now_br()
-        _write_json(ADAPTIVE_WEIGHTS_FILE, result)
-        _append_jsonl(ADAPTIVE_WEIGHTS_LOG_FILE, {
+        if not _write_json(ADAPTIVE_WEIGHTS_FILE, result):
+            return {
+                "ok": False,
+                "status": "ADAPTIVE_WEIGHTS_PERSISTENCE_FAILED",
+                "version": VERSION,
+                "generated_at": _now_br(),
+            }
+        if not _append_jsonl(ADAPTIVE_WEIGHTS_LOG_FILE, {
             "event": "ADAPTIVE_WEIGHTS_BUILT",
             "version": VERSION,
             "generated_at": _now_br(),
             "result": result,
-        })
+        }):
+            return {
+                "ok": False,
+                "status": "ADAPTIVE_WEIGHTS_AUDIT_LOG_FAILED",
+                "version": VERSION,
+                "generated_at": _now_br(),
+            }
 
     return result
 
 
 def get_adaptive_weights() -> Dict[str, Any]:
+    if not paper_data_mount_verified(ADAPTIVE_WEIGHTS_FILE):
+        return {
+            "ok": False,
+            "status": "PAPER_DATA_MOUNT_NOT_VERIFIED",
+            "generated_at": _now_br(),
+            "weights": None,
+        }
     weights = _read_json(ADAPTIVE_WEIGHTS_FILE, None)
     if weights is None:
         weights = build_adaptive_weights(commit=False)
@@ -249,6 +301,14 @@ def get_adaptive_weights() -> Dict[str, Any]:
 
 
 def read_adaptive_weights_log(limit: int = 20) -> Dict[str, Any]:
+    if not paper_data_mount_verified(ADAPTIVE_WEIGHTS_LOG_FILE):
+        return {
+            "ok": False,
+            "status": "PAPER_DATA_MOUNT_NOT_VERIFIED",
+            "generated_at": _now_br(),
+            "count": None,
+            "items": None,
+        }
     if not ADAPTIVE_WEIGHTS_LOG_FILE.exists():
         return {
             "ok": True,
@@ -257,7 +317,7 @@ def read_adaptive_weights_log(limit: int = 20) -> Dict[str, Any]:
             "items": [],
         }
 
-    lines = ADAPTIVE_WEIGHTS_LOG_FILE.read_text(encoding="utf-8").splitlines()
+    lines = read_paper_text(ADAPTIVE_WEIGHTS_LOG_FILE, encoding="utf-8").splitlines()
     selected = lines[-max(1, int(limit)):]
 
     items = []

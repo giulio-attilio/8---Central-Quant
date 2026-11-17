@@ -32,9 +32,16 @@ import math
 import os
 from collections import OrderedDict, defaultdict
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from history_memory_guard import AUTOMATIC_MAX_BYTES, AUTOMATIC_MAX_RECORDS, iter_jsonl_tail
+from paper_state_storage import (
+    append_paper_text,
+    open_paper_text,
+    paper_data_mount_verified,
+    write_json_atomically,
+)
 from trade_registry import (
     STRONG_IDENTITY_ALIASES,
     closed_trade_identity_state,
@@ -158,27 +165,27 @@ def _read_jsonl(path: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
 
 
 def _read_json(path: str) -> Any:
-    if not os.path.exists(path):
+    target = Path(path)
+    if not paper_data_mount_verified(target) or not target.exists():
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open_paper_text(target, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
 
 
 def _write_json(path: str, payload: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
-    os.replace(tmp, path)
+    if not write_json_atomically(Path(path), payload):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED_OR_WRITE_FAILED")
 
 
 def _append_jsonl(path: str, payload: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    append_paper_text(
+        Path(path),
+        json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _flatten_payload(row: Dict[str, Any]) -> Dict[str, Any]:

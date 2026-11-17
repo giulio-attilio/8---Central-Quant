@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from history_memory_guard import AUTOMATIC_MAX_BYTES, AUTOMATIC_MAX_RECORDS, iter_jsonl_tail
+from paper_state_storage import append_paper_text
 
 
 VERSION = "2026-07-12-PREDATOR-DAILY-SUMMARY-FROM-EVENT-LOG-V1"
@@ -57,9 +58,11 @@ def append_predator_event(event: Dict[str, Any]) -> Dict[str, Any]:
     path = event_log_path()
     try:
         with _lock:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(_safe(row), ensure_ascii=False) + "\n")
+            append_paper_text(
+                path,
+                json.dumps(_safe(row), ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
         return {"ok": True, "status": "APPENDED", "path": str(path), "event_key": row["event_key"]}
     except OSError as exc:
         _state["last_error"] = str(exc)

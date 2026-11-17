@@ -25,6 +25,11 @@ from typing import Any, Dict, Optional
 
 from paper_state_storage import (
     PAPER_STATE_LOCK,
+    append_paper_text,
+    ensure_paper_data_dir,
+    paper_data_mount_verified,
+    paper_file_exists,
+    read_paper_text,
     resolve_paper_data_dir,
     write_json_atomically,
 )
@@ -38,7 +43,25 @@ def _resolve_data_dir() -> Path:
 
 
 DATA_DIR = _resolve_data_dir()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _paper_data_mount_verified(*, platform_name: str | None = None) -> bool:
+    """Reject /data state when Render's persistent disk is not mounted."""
+    return paper_data_mount_verified(DATA_DIR, platform_name=platform_name)
+
+
+def _paper_file_access_verified(path: Path) -> bool:
+    """Verify both the configured data root and this exact file path."""
+    return _paper_data_mount_verified() and paper_data_mount_verified(Path(path))
+
+
+def _ensure_paper_data_dir() -> bool:
+    # Do not create an ephemeral /data directory if a configured Render disk
+    # failed to mount. Execution and health guards remain fail-closed as well.
+    return ensure_paper_data_dir(DATA_DIR)
+
+
+_ensure_paper_data_dir()
 
 PAPER_POSITIONS_FILE = DATA_DIR / "paper_integrated_positions.json"
 PAPER_LOG_FILE = DATA_DIR / "paper_integrated_executor_log.jsonl"
@@ -52,6 +75,14 @@ _PAPER_EXECUTION_LOCK = PAPER_STATE_LOCK
 
 def _paper_persistence_guard() -> Dict[str, Any]:
     """Fail closed when persistent storage cannot safely accept a PAPER entry."""
+    if not _paper_data_mount_verified():
+        return {
+            "allowed": False,
+            "status": "PAPER_DATA_MOUNT_NOT_VERIFIED",
+            "free_bytes": None,
+            "minimum_free_bytes": PAPER_MIN_FREE_DISK_BYTES,
+            "error_type": None,
+        }
     try:
         free_bytes = int(shutil.disk_usage(DATA_DIR).free)
     except Exception as exc:
@@ -77,19 +108,29 @@ def _now_br() -> str:
 
 
 def _read_json(path: Path, default: Any) -> Any:
-    if not path.exists():
+    if not _paper_file_access_verified(path):
         return default
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        if not paper_file_exists(path):
+            return default
+        return json.loads(read_paper_text(path, encoding="utf-8"))
     except Exception:
         return default
 
 
-def _read_state_json(path: Path, default: Any) -> Any:
+def _read_state_json(
+    path: Path, default: Any, *, required: bool = False
+) -> Any:
     """Read execution state strictly so corruption cannot masquerade as empty state."""
-    if not path.exists():
+    if not _paper_file_access_verified(path):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
+    if required:
+        # Open directly: a required ledger disappearing after a prior presence
+        # check must raise, never be reinterpreted as an empty default.
+        return json.loads(read_paper_text(path, encoding="utf-8"))
+    if not paper_file_exists(path):
         return default
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(read_paper_text(path, encoding="utf-8"))
 
 
 def _paper_state_shape_is_valid(positions: Any, seen: Any) -> bool:
@@ -128,9 +169,15 @@ def _write_json(path: Path, payload: Any) -> bool:
     return write_json_atomically(path, payload)
 
 
-def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> bool:
+    if not _paper_file_access_verified(path):
+        return False
+    append_paper_text(
+        path,
+        json.dumps(payload, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return True
 
 
 def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -362,8 +409,29 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     with _PAPER_EXECUTION_LOCK:
-        positions_file_present = PAPER_POSITIONS_FILE.is_file()
-        seen_file_present = PAPER_SEEN_FILE.is_file()
+        if not (
+            _paper_file_access_verified(PAPER_POSITIONS_FILE)
+            and _paper_file_access_verified(PAPER_SEEN_FILE)
+        ):
+            result = {
+                "ok": False,
+                "status": "PAPER_DATA_MOUNT_NOT_VERIFIED",
+                "reason": "caminho do estado PAPER não foi validado; execução bloqueada",
+                "version": VERSION,
+                "generated_at": _now_br(),
+                "errors": ["PAPER_DATA_MOUNT_NOT_VERIFIED"],
+                "warnings": validation["warnings"],
+                "exchange_executor_called": False,
+                "paper_executor_called": True,
+            }
+            return {"ok": False, "payload": result}
+
+        try:
+            positions_file_present = paper_file_exists(PAPER_POSITIONS_FILE)
+            seen_file_present = paper_file_exists(PAPER_SEEN_FILE)
+        except OSError:
+            positions_file_present = False
+            seen_file_present = False
         if not positions_file_present:
             result = {
                 "ok": False,
@@ -380,8 +448,12 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
             return {"ok": False, "payload": result}
 
         try:
-            seen = _read_state_json(PAPER_SEEN_FILE, {}) if seen_file_present else {}
-            positions = _read_state_json(PAPER_POSITIONS_FILE, [])
+            seen = _read_state_json(
+                PAPER_SEEN_FILE, {}, required=seen_file_present
+            ) if seen_file_present else {}
+            positions = _read_state_json(
+                PAPER_POSITIONS_FILE, [], required=True
+            )
         except Exception:
             seen, positions = None, None
         if not _paper_state_shape_is_valid(positions, seen):
@@ -534,17 +606,35 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def paper_integrated_health() -> Dict[str, Any]:
-    positions_file_present = PAPER_POSITIONS_FILE.is_file()
-    seen_file_present = PAPER_SEEN_FILE.is_file()
+    positions_path_verified = _paper_file_access_verified(PAPER_POSITIONS_FILE)
+    seen_path_verified = _paper_file_access_verified(PAPER_SEEN_FILE)
+    # Presence is informational; content is read only after both path guards pass.
+    try:
+        positions_file_present = paper_file_exists(PAPER_POSITIONS_FILE)
+        seen_file_present = paper_file_exists(PAPER_SEEN_FILE)
+    except OSError:
+        positions_file_present = False
+        seen_file_present = False
+        positions_path_verified = False
+        seen_path_verified = False
     state_files_present = positions_file_present and seen_file_present
-    state_files_status = "PAPER_STATE_FILES_MISSING"
+    mount_verified = (
+        _paper_data_mount_verified()
+        and positions_path_verified
+        and seen_path_verified
+    )
+    state_files_status = (
+        "PAPER_STATE_FILES_MISSING" if mount_verified else "PAPER_DATA_MOUNT_NOT_VERIFIED"
+    )
     positions = None
     seen = None
     state_files_valid = False
-    if state_files_present:
+    if state_files_present and mount_verified:
         try:
-            positions = _read_state_json(PAPER_POSITIONS_FILE, [])
-            seen = _read_state_json(PAPER_SEEN_FILE, {})
+            positions = _read_state_json(
+                PAPER_POSITIONS_FILE, [], required=True
+            )
+            seen = _read_state_json(PAPER_SEEN_FILE, {}, required=True)
         except Exception:
             state_files_status = "PAPER_STATE_FILES_INVALID"
         else:
@@ -566,7 +656,7 @@ def paper_integrated_health() -> Dict[str, Any]:
         total_count = open_count = closed_count = pending_outcome_count = seen_count = None
 
     return {
-        "ok": bool(not PAPER_EXECUTION_ENABLED or state_files_valid),
+        "ok": bool(not PAPER_EXECUTION_ENABLED or (mount_verified and state_files_valid)),
         "module": "paper_executor_integrated",
         "loaded": True,
         "version": VERSION,
@@ -576,6 +666,7 @@ def paper_integrated_health() -> Dict[str, Any]:
         "state_files_present": state_files_present,
         "state_files_valid": state_files_valid,
         "state_files_status": state_files_status,
+        "data_mount_verified": mount_verified,
         "open_positions": open_count,
         "closed_positions": closed_count,
         "pending_outcome": pending_outcome_count,
@@ -607,7 +698,18 @@ def get_paper_integrated_open_positions() -> Dict[str, Any]:
             "positions": None,
         }
 
-    positions = _read_state_json(PAPER_POSITIONS_FILE, [])
+    try:
+        positions = _read_state_json(
+            PAPER_POSITIONS_FILE, [], required=True
+        )
+    except Exception:
+        return {
+            "ok": False,
+            "status": "PAPER_STATE_FILES_INVALID",
+            "generated_at": _now_br(),
+            "count": None,
+            "positions": None,
+        }
     open_positions = [p for p in positions if p.get("status") == "OPEN"]
 
     return {
@@ -619,15 +721,33 @@ def get_paper_integrated_open_positions() -> Dict[str, Any]:
 
 
 def read_paper_integrated_log(limit: int = 20) -> Dict[str, Any]:
-    if not PAPER_LOG_FILE.exists():
+    if not _paper_file_access_verified(PAPER_LOG_FILE):
+        return {
+            "ok": False,
+            "status": "PAPER_DATA_MOUNT_NOT_VERIFIED",
+            "generated_at": _now_br(),
+            "count": None,
+            "items": None,
+        }
+    if not paper_file_exists(PAPER_LOG_FILE):
         return {
             "ok": True,
+            "status": "PAPER_LOG_MISSING",
             "generated_at": _now_br(),
             "count": 0,
             "items": [],
         }
 
-    lines = PAPER_LOG_FILE.read_text(encoding="utf-8").splitlines()
+    try:
+        lines = read_paper_text(PAPER_LOG_FILE, encoding="utf-8").splitlines()
+    except Exception:
+        return {
+            "ok": False,
+            "status": "PAPER_LOG_READ_FAILED",
+            "generated_at": _now_br(),
+            "count": None,
+            "items": None,
+        }
     selected = lines[-max(1, int(limit)):]
 
     items = []

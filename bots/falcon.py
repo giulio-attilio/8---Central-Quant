@@ -31,7 +31,6 @@ import json
 import hashlib
 import math
 import secrets
-import tempfile
 import time
 import threading
 import traceback
@@ -39,6 +38,11 @@ from datetime import datetime, timezone, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 import requests
+from paper_state_storage import (
+    paper_data_mount_verified,
+    read_paper_text,
+    write_json_atomically,
+)
 from personal_http_auth import central_personal_http_auth
 from runtime_drain_v1 import RUNTIME_DRAIN, guard_live_flow, runtime_drain_blocked_result
 from telegram_notification_policy import send_automatic_telegram
@@ -1098,23 +1102,32 @@ def falcon_paper_persistence_reconciliation_required():
         return True
     path = falcon_paper_persistence_latch_path()
     if not path:
-        HEALTH["falcon_paper_persistence_latch_status"] = "DATA_DIR_UNSET"
-        return False
+        HEALTH["falcon_paper_persistence_reconciliation_required"] = True
+        HEALTH["falcon_paper_persistence_latch_status"] = "DATA_DIR_UNSET_FAIL_CLOSED"
+        return True
+    if not paper_data_mount_verified(path):
+        HEALTH["falcon_paper_persistence_reconciliation_required"] = True
+        HEALTH["falcon_paper_persistence_latch_status"] = "DATA_MOUNT_UNVERIFIED_FAIL_CLOSED"
+        return True
     try:
-        if not os.path.exists(path):
-            return False
-        if os.path.getsize(path) > 16384:
-            raise ValueError("latch file too large")
-        with open(path, "r", encoding="utf-8") as latch_file:
-            payload = json.load(latch_file)
+        raw = read_paper_text(path, encoding="utf-8", max_bytes=16384)
+    except FileNotFoundError:
+        HEALTH["falcon_paper_persistence_latch_status"] = "NO_LATCH"
+        return False
+    except Exception as exc:
+        HEALTH["falcon_paper_persistence_reconciliation_required"] = True
+        HEALTH["falcon_paper_persistence_latch_status"] = (
+            f"READ_FAILED_CLOSED:{type(exc).__name__}"
+        )
+        return True
+    try:
+        payload = json.loads(raw)
         if (
             not isinstance(payload, dict)
             or payload.get("version") != FALCON_PAPER_PERSISTENCE_LATCH_VERSION
             or payload.get("reconciliation_required") is not True
         ):
             raise ValueError("invalid latch payload")
-    except FileNotFoundError:
-        return False
     except Exception as exc:
         HEALTH["falcon_paper_persistence_reconciliation_required"] = True
         HEALTH["falcon_paper_persistence_latch_status"] = (
@@ -1129,42 +1142,25 @@ def falcon_paper_persistence_reconciliation_required():
 def falcon_persist_paper_persistence_latch(reason):
     path = falcon_paper_persistence_latch_path()
     if not path:
+        HEALTH["falcon_paper_persistence_reconciliation_required"] = True
+        HEALTH["falcon_paper_persistence_latch_status"] = "DATA_DIR_UNSET_FAIL_CLOSED"
         return {"ok": False, "status": "PAPER_PERSISTENCE_LATCH_DATA_DIR_UNSET"}
-    parent = os.path.dirname(path)
-    tmp_path = None
+    if not paper_data_mount_verified(path):
+        HEALTH["falcon_paper_persistence_reconciliation_required"] = True
+        HEALTH["falcon_paper_persistence_latch_status"] = "DATA_MOUNT_UNVERIFIED_FAIL_CLOSED"
+        return {"ok": False, "status": "PAPER_PERSISTENCE_LATCH_MOUNT_UNVERIFIED"}
     try:
-        os.makedirs(parent, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=".falcon-paper-persistence-",
-            suffix=".tmp",
-            dir=parent,
+        persisted = write_json_atomically(
+            path,
+            {
+                "version": FALCON_PAPER_PERSISTENCE_LATCH_VERSION,
+                "reconciliation_required": True,
+                "reason": str(reason or "PERSISTENCE_FAILURE")[:120],
+                "created_at": data_hora_sp_str(),
+            },
         )
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as latch_file:
-            json.dump(
-                {
-                    "version": FALCON_PAPER_PERSISTENCE_LATCH_VERSION,
-                    "reconciliation_required": True,
-                    "reason": str(reason or "PERSISTENCE_FAILURE")[:120],
-                    "created_at": data_hora_sp_str(),
-                },
-                latch_file,
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-            latch_file.flush()
-            os.fsync(latch_file.fileno())
-        os.replace(tmp_path, path)
-        tmp_path = None
-        if os.name == "posix":
-            directory_fd = os.open(
-                parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            )
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+        if persisted is not True:
+            raise OSError("PAPER_PERSISTENCE_LATCH_ATOMIC_WRITE_FAILED")
         HEALTH["falcon_paper_persistence_reconciliation_required"] = True
         HEALTH["falcon_paper_persistence_latch_status"] = "PERSISTED"
         return {"ok": True, "status": "PAPER_PERSISTENCE_LATCH_PERSISTED"}
@@ -1178,12 +1174,6 @@ def falcon_persist_paper_persistence_latch(reason):
             "status": "PAPER_PERSISTENCE_LATCH_WRITE_FAILED",
             "error_type": type(exc).__name__,
         }
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
 
 
 def register_falcon_trade_registry_open(pos):

@@ -1,5 +1,8 @@
+import json
 import os
+import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import adaptive_weights
 import execution_engine
@@ -8,6 +11,7 @@ import execution_pipeline_status
 import paper_executor_integrated
 import outcome_evaluator
 import paper_lifecycle
+import paper_state_storage
 
 
 def test_executor_lifecycle_and_outcome_share_the_resolved_storage_path():
@@ -80,6 +84,223 @@ def test_local_fallback_is_module_relative_when_render_mount_is_absent(monkeypat
     assert execution_orchestrator._resolve_data_dir() == (
         Path(execution_orchestrator.__file__).resolve().parent / "data"
     )
+
+
+def test_paper_executor_persistence_guard_rejects_unmounted_render_data(monkeypatch):
+    monkeypatch.setattr(paper_executor_integrated, "DATA_DIR", Path("/data"))
+    monkeypatch.setattr(paper_executor_integrated, "_paper_data_mount_verified", lambda: False)
+    monkeypatch.setattr(
+        paper_executor_integrated.shutil,
+        "disk_usage",
+        lambda _path: (_ for _ in ()).throw(AssertionError("must not trust ephemeral disk")),
+    )
+
+    result = paper_executor_integrated._paper_persistence_guard()
+
+    assert result["allowed"] is False
+    assert result["status"] == "PAPER_DATA_MOUNT_NOT_VERIFIED"
+    assert result["free_bytes"] is None
+
+
+def test_paper_health_does_not_trust_state_files_without_render_mount(monkeypatch, tmp_path):
+    positions = tmp_path / "paper_integrated_positions.json"
+    seen = tmp_path / "paper_integrated_seen.json"
+    positions.write_text("[]", encoding="utf-8")
+    seen.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(paper_executor_integrated, "DATA_DIR", Path("/data"))
+    monkeypatch.setattr(paper_executor_integrated, "PAPER_POSITIONS_FILE", positions)
+    monkeypatch.setattr(paper_executor_integrated, "PAPER_SEEN_FILE", seen)
+    monkeypatch.setattr(paper_executor_integrated, "PAPER_EXECUTION_ENABLED", True)
+    monkeypatch.setattr(paper_executor_integrated, "_paper_data_mount_verified", lambda: False)
+
+    health = paper_executor_integrated.paper_integrated_health()
+
+    assert health["ok"] is False
+    assert health["state_files_present"] is True
+    assert health["state_files_valid"] is False
+    assert health["state_files_status"] == "PAPER_DATA_MOUNT_NOT_VERIFIED"
+    assert health["data_mount_verified"] is False
+    assert health["open_positions"] is None
+
+
+def test_render_persistent_mount_check_rejects_missing_mount_on_posix(monkeypatch):
+    monkeypatch.setattr(paper_executor_integrated, "DATA_DIR", Path("/data"))
+    monkeypatch.setattr(paper_executor_integrated.os.path, "ismount", lambda _path: False)
+
+    assert paper_executor_integrated._paper_data_mount_verified(platform_name="posix") is False
+
+
+def test_mount_guard_rejects_resolved_path_escape_from_persistent_data(monkeypatch, tmp_path):
+    data_root = tmp_path / "persistent"
+    outside = tmp_path / "ephemeral"
+    data_root.mkdir()
+    outside.mkdir()
+    target = data_root / "paper" / "nested" / "trade_registry.json"
+    original_resolve = paper_state_storage.Path.resolve
+
+    def resolve_with_symlink_escape(path, *args, **kwargs):
+        if path == target:
+            return outside / "trade_registry.json"
+        if path == data_root:
+            return data_root
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(paper_state_storage.Path, "resolve", resolve_with_symlink_escape)
+    monkeypatch.setattr(paper_state_storage.os.path, "ismount", lambda _path: True)
+
+    verified = paper_state_storage.paper_data_mount_verified(
+        target,
+        platform_name="posix",
+        data_root=data_root,
+    )
+
+    assert verified is False
+
+
+def test_mount_guard_rejects_data_root_symlink(monkeypatch, tmp_path):
+    data_root = tmp_path / "persistent-link"
+    target = data_root / "paper" / "positions.json"
+    original_is_symlink = Path.is_symlink
+    monkeypatch.setattr(
+        paper_state_storage.Path,
+        "is_symlink",
+        lambda path: True if path == data_root else original_is_symlink(path),
+    )
+    monkeypatch.setattr(paper_state_storage.os.path, "ismount", lambda _path: True)
+
+    verified = paper_state_storage.paper_data_mount_verified(
+        target,
+        platform_name="posix",
+        data_root=data_root,
+    )
+
+    assert verified is False
+
+
+def test_mount_guard_rejects_nested_mount_on_different_device(monkeypatch, tmp_path):
+    data_root = tmp_path / "persistent"
+    nested_mount = data_root / "paper"
+    nested_mount.mkdir(parents=True)
+    target = nested_mount / "positions.json"
+    original_lstat = Path.lstat
+    root_device = data_root.stat().st_dev
+
+    def lstat_with_nested_device(path):
+        if path == nested_mount:
+            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_dev=root_device + 1)
+        return original_lstat(path)
+
+    monkeypatch.setattr(paper_state_storage.Path, "lstat", lstat_with_nested_device)
+    monkeypatch.setattr(paper_state_storage.os.path, "ismount", lambda _path: True)
+
+    verified = paper_state_storage.paper_data_mount_verified(
+        target,
+        platform_name="posix",
+        data_root=data_root,
+    )
+
+    assert verified is False
+
+
+def test_import_directory_initializer_does_not_create_unmounted_data_path(monkeypatch, tmp_path):
+    target = tmp_path / "would-be-ephemeral-data"
+    monkeypatch.setattr(paper_executor_integrated, "DATA_DIR", target)
+    monkeypatch.setattr(paper_executor_integrated, "_paper_data_mount_verified", lambda: False)
+    monkeypatch.setattr(paper_executor_integrated, "ensure_paper_data_dir", lambda _path: False)
+
+    assert paper_executor_integrated._ensure_paper_data_dir() is False
+    assert not target.exists()
+
+
+def test_shared_directory_initializer_does_not_create_when_mount_missing(monkeypatch, tmp_path):
+    target = tmp_path / "would-be-ephemeral-data"
+    monkeypatch.setattr(
+        paper_state_storage,
+        "paper_data_mount_verified",
+        lambda _path, **_kwargs: False,
+    )
+
+    assert paper_state_storage.ensure_paper_data_dir(target) is False
+    assert not target.exists()
+
+
+def test_blocked_or_invalid_paper_request_does_not_create_ephemeral_log(monkeypatch, tmp_path):
+    log_path = tmp_path / "paper_integrated_executor_log.jsonl"
+    monkeypatch.setattr(paper_executor_integrated, "DATA_DIR", Path("/data"))
+    monkeypatch.setattr(paper_executor_integrated, "PAPER_LOG_FILE", log_path)
+    monkeypatch.setattr(paper_executor_integrated, "_paper_data_mount_verified", lambda: False)
+
+    monkeypatch.setattr(paper_executor_integrated, "PAPER_EXECUTION_ENABLED", False)
+    blocked = paper_executor_integrated.execute_paper_from_engine({})
+    assert blocked["payload"]["status"] == "PAPER_BLOCKED"
+    assert not log_path.exists()
+
+    monkeypatch.setattr(paper_executor_integrated, "PAPER_EXECUTION_ENABLED", True)
+    invalid = paper_executor_integrated.execute_paper_from_engine({})
+    assert invalid["payload"]["status"] == "PAPER_INVALID_PLAN"
+    assert not log_path.exists()
+
+
+def test_shared_paper_state_io_fails_closed_when_mount_is_unverified(monkeypatch, tmp_path):
+    positions = tmp_path / "paper_integrated_positions.json"
+    original = '[{"status":"OPEN"}]'
+    positions.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(
+        paper_state_storage,
+        "paper_data_mount_verified",
+        lambda _path, **_kwargs: False,
+    )
+
+    state, status = paper_state_storage.read_paper_positions_state(positions)
+    written = paper_state_storage.write_json_atomically(positions, [])
+
+    assert state is None
+    assert status == "PAPER_DATA_MOUNT_NOT_VERIFIED"
+    assert written is False
+    assert positions.read_text(encoding="utf-8") == original
+
+
+def test_lifecycle_and_outcome_fail_closed_without_mount(monkeypatch, tmp_path):
+    positions = tmp_path / "paper_integrated_positions.json"
+    original = json.dumps([{
+        "trade_id": "paper-test-trade",
+        "idempotency_key": "paper-test-idem",
+        "status": "OPEN",
+        "entry": 100.0,
+        "sl_initial": 95.0,
+        "sl_current": 95.0,
+    }])
+    positions.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(paper_lifecycle, "DATA_DIR", Path("/data"))
+    monkeypatch.setattr(paper_lifecycle, "PAPER_POSITIONS_FILE", positions)
+    monkeypatch.setattr(paper_lifecycle, "PAPER_LIFECYCLE_ENABLED", True)
+    monkeypatch.setattr(outcome_evaluator, "DATA_DIR", Path("/data"))
+    monkeypatch.setattr(outcome_evaluator, "PAPER_POSITIONS_FILE", positions)
+    monkeypatch.setattr(outcome_evaluator, "OUTCOME_EVALUATOR_ENABLED", True)
+    monkeypatch.setattr(
+        paper_state_storage,
+        "paper_data_mount_verified",
+        lambda _path, **_kwargs: False,
+    )
+    monkeypatch.setattr(paper_lifecycle, "paper_data_mount_verified", lambda *_a, **_k: False)
+    monkeypatch.setattr(outcome_evaluator, "paper_data_mount_verified", lambda *_a, **_k: False)
+
+    lifecycle_health = paper_lifecycle.paper_lifecycle_health()
+    outcome_health = outcome_evaluator.outcome_evaluator_health()
+    lifecycle_update = paper_lifecycle.update_paper_position_price(
+        trade_id="paper-test-trade", price=101.0
+    )
+    outcome_update = outcome_evaluator.evaluate_closed_paper_trades()
+    outcome_stats = outcome_evaluator.get_outcome_stats()
+
+    assert lifecycle_health["ok"] is False
+    assert lifecycle_health["state_files_status"] == "PAPER_DATA_MOUNT_NOT_VERIFIED"
+    assert outcome_health["ok"] is False
+    assert outcome_health["state_files_status"] == "PAPER_DATA_MOUNT_NOT_VERIFIED"
+    assert lifecycle_update["error"] == "PAPER_DATA_MOUNT_NOT_VERIFIED"
+    assert outcome_update["status"] == "PAPER_DATA_MOUNT_NOT_VERIFIED"
+    assert outcome_stats["status"] == "PAPER_DATA_MOUNT_NOT_VERIFIED"
+    assert positions.read_text(encoding="utf-8") == original
 
 
 def test_lifecycle_and_outcome_health_do_not_report_missing_state_as_zero(
@@ -171,3 +392,34 @@ def test_lifecycle_update_and_outcome_eval_fail_closed_when_positions_missing(
     assert not positions.exists()
     assert not lifecycle_log.exists()
     assert not stats.exists()
+
+
+def test_outcome_evaluation_does_not_recreate_positions_if_ledger_disappears_after_check(
+    monkeypatch, tmp_path
+):
+    positions = tmp_path / "paper_integrated_positions.json"
+    positions.write_text("[]", encoding="utf-8")
+    stats = tmp_path / "outcome_stats.json"
+    log = tmp_path / "outcome.jsonl"
+    monkeypatch.setattr(outcome_evaluator, "PAPER_POSITIONS_FILE", positions)
+    monkeypatch.setattr(outcome_evaluator, "OUTCOME_STATS_FILE", stats)
+    monkeypatch.setattr(outcome_evaluator, "OUTCOME_LOG_FILE", log)
+    monkeypatch.setattr(outcome_evaluator, "OUTCOME_EVALUATOR_ENABLED", True)
+    original_read = outcome_evaluator._read_state_json
+
+    def remove_required_ledger_before_open(path, default, *, required=False):
+        if Path(path) == positions and required:
+            positions.unlink(missing_ok=True)
+        return original_read(path, default, required=required)
+
+    monkeypatch.setattr(
+        outcome_evaluator, "_read_state_json", remove_required_ledger_before_open
+    )
+
+    result = outcome_evaluator.evaluate_closed_paper_trades()
+
+    assert result["ok"] is False
+    assert result["status"] == "OUTCOME_STATE_INVALID"
+    assert not positions.exists()
+    assert not stats.exists()
+    assert not log.exists()

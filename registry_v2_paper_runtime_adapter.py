@@ -23,6 +23,7 @@ import registry_execution_schema as schema
 import registry_v2_bot_contract as bot_contract
 import registry_v2_core as core
 import registry_v2_wal as wal
+import paper_state_storage
 
 
 REGISTRY_V2_PAPER_WRITE_ENABLED_ENV = "REGISTRY_V2_PAPER_WRITE_ENABLED"
@@ -238,7 +239,9 @@ class _RuntimeRegistryLock:
             raise _RuntimeRegistryLockTimeout("process_local_lock_timeout")
         self._thread_locked = True
         try:
-            self._lock_file = open(self._lock_path, "a+b")
+            self._lock_file = paper_state_storage.open_paper_binary(
+                self._lock_path, "a+b"
+            )
             self._ensure_lock_byte(self._lock_file)
             self._acquire_platform_lock(self._lock_file, deadline)
             self._platform_locked = True
@@ -1355,6 +1358,16 @@ class RegistryV2PaperRuntimeAdapter:
                 mode,
                 operation,
                 errors=("storage_dir_must_be_existing_absolute_directory",),
+            )
+        if not paper_state_storage.paper_data_mount_verified(directory):
+            return None, RegistryV2PaperRuntimeResult(
+                False,
+                REGISTRY_V2_PAPER_RUNTIME_STORAGE_INVALID,
+                True,
+                False,
+                mode,
+                operation,
+                errors=("persistent_paper_storage_not_verified",),
             )
         return (
             wal.RegistryV2WalStorage(

@@ -21,6 +21,12 @@ from typing import Any, Dict, Optional
 
 from paper_state_storage import (
     PAPER_STATE_LOCK,
+    append_paper_text,
+    ensure_paper_data_dir,
+    open_paper_text,
+    paper_data_mount_verified,
+    paper_file_exists,
+    read_paper_text,
     read_paper_positions_state,
     resolve_paper_data_dir,
     write_json_atomically,
@@ -45,7 +51,7 @@ CLOSED_EXECUTION_MARKER_VERSION = (
 )
 
 DATA_DIR = resolve_paper_data_dir(__file__)
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+ensure_paper_data_dir(DATA_DIR)
 
 PAPER_POSITIONS_FILE = DATA_DIR / "paper_integrated_positions.json"
 OUTCOME_LOG_FILE = DATA_DIR / "outcome_evaluator_log.jsonl"
@@ -59,19 +65,29 @@ def _now_br() -> str:
 
 
 def _read_json(path: Path, default: Any) -> Any:
-    if not path.exists():
+    if not paper_data_mount_verified(path):
         return default
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        if not paper_file_exists(path):
+            return default
+        return json.loads(read_paper_text(path, encoding="utf-8"))
     except Exception:
         return default
 
 
-def _read_state_json(path: Path, default: Any) -> Any:
+def _read_state_json(
+    path: Path, default: Any, *, required: bool = False
+) -> Any:
     """Read mutable PAPER state strictly so corruption is never treated as empty."""
-    if not path.exists():
+    if not paper_data_mount_verified(path):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
+    if required:
+        # A required position ledger disappearing after a presence check is an
+        # error, not an empty portfolio that may later be written back.
+        return json.loads(read_paper_text(path, encoding="utf-8"))
+    if not paper_file_exists(path):
         return default
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(read_paper_text(path, encoding="utf-8"))
 
 
 def _write_json(path: Path, payload: Any) -> bool:
@@ -79,10 +95,13 @@ def _write_json(path: Path, payload: Any) -> bool:
 
 
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+    if not paper_data_mount_verified(DATA_DIR) or not paper_data_mount_verified(path):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
+    append_paper_text(
+        path,
+        json.dumps(payload, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _outcome_event_id(outcome: Dict[str, Any]) -> str:
@@ -97,10 +116,12 @@ def _outcome_event_id(outcome: Dict[str, Any]) -> str:
 
 def _existing_outcome_event_ids(path: Path) -> set[str]:
     """Read event IDs once per evaluation, deriving IDs for legacy rows too."""
-    if not path.exists():
+    if not paper_data_mount_verified(path):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
+    if not paper_file_exists(path):
         return set()
     event_ids = set()
-    with path.open("r", encoding="utf-8") as handle:
+    with open_paper_text(path, "r", encoding="utf-8") as handle:
         for line in handle:
             try:
                 event = json.loads(line)
@@ -510,7 +531,19 @@ def _update_bucket(bucket: Dict[str, Any], trade: Dict[str, Any]) -> Dict[str, A
 
 def outcome_evaluator_health() -> Dict[str, Any]:
     positions, state_files_status = read_paper_positions_state(PAPER_POSITIONS_FILE)
-    state_files_present = PAPER_POSITIONS_FILE.is_file()
+    positions_path_verified = paper_data_mount_verified(PAPER_POSITIONS_FILE)
+    stats_path_verified = paper_data_mount_verified(OUTCOME_STATS_FILE)
+    mount_verified = (
+        paper_data_mount_verified(DATA_DIR)
+        and positions_path_verified
+        and stats_path_verified
+    )
+    # Presence is informational; contents are trusted only when the path guard passes.
+    try:
+        state_files_present = paper_file_exists(PAPER_POSITIONS_FILE)
+    except OSError:
+        state_files_present = False
+        state_files_status = "PAPER_DATA_MOUNT_NOT_VERIFIED"
     state_files_valid = state_files_status == "PAPER_STATE_FILES_PRESENT"
     if not state_files_valid:
         positions = []
@@ -522,7 +555,7 @@ def outcome_evaluator_health() -> Dict[str, Any]:
             "evaluated_closed_execution_keys": [],
             "evaluated_closed_executions": [],
         },
-    )
+    ) if mount_verified else {}
     stats = stats if isinstance(stats, dict) else {}
     legacy_ambiguous_trade_ids = _legacy_marker_ambiguous_trade_ids(
         positions, stats
@@ -542,7 +575,7 @@ def outcome_evaluator_health() -> Dict[str, Any]:
             pending.append(trade)
 
     return {
-        "ok": bool(not OUTCOME_EVALUATOR_ENABLED or state_files_valid),
+        "ok": bool(not OUTCOME_EVALUATOR_ENABLED or (mount_verified and state_files_valid)),
         "module": "outcome_evaluator",
         "loaded": True,
         "version": VERSION,
@@ -551,6 +584,7 @@ def outcome_evaluator_health() -> Dict[str, Any]:
         "state_files_present": state_files_present,
         "state_files_valid": state_files_valid,
         "state_files_status": state_files_status,
+        "data_mount_verified": mount_verified,
         "closed_positions": len(closed) if state_files_valid else None,
         "pending_evaluation": len(pending) if state_files_valid else None,
         "identity_blocked": len(identity_blocked) if state_files_valid else None,
@@ -577,6 +611,19 @@ def _evaluate_closed_paper_trades_locked(force: bool = False) -> Dict[str, Any]:
             "version": VERSION,
         }
 
+    if not (
+        paper_data_mount_verified(DATA_DIR)
+        and paper_data_mount_verified(PAPER_POSITIONS_FILE)
+        and paper_data_mount_verified(OUTCOME_STATS_FILE)
+        and paper_data_mount_verified(OUTCOME_LOG_FILE)
+    ):
+        return {
+            "ok": False,
+            "status": "PAPER_DATA_MOUNT_NOT_VERIFIED",
+            "generated_at": _now_br(),
+            "version": VERSION,
+        }
+
     default_stats = {
         "version": VERSION,
         "updated_at": None,
@@ -589,7 +636,11 @@ def _evaluate_closed_paper_trades_locked(force: bool = False) -> Dict[str, Any]:
         "evaluated_closed_execution_keys": [],
         "evaluated_closed_executions": [],
     }
-    if not PAPER_POSITIONS_FILE.is_file():
+    try:
+        positions_file_present = paper_file_exists(PAPER_POSITIONS_FILE)
+    except OSError:
+        positions_file_present = False
+    if not positions_file_present:
         return {
             "ok": False,
             "status": "PAPER_STATE_FILES_MISSING",
@@ -598,8 +649,14 @@ def _evaluate_closed_paper_trades_locked(force: bool = False) -> Dict[str, Any]:
             "version": VERSION,
         }
     try:
-        positions = _read_state_json(PAPER_POSITIONS_FILE, [])
-        stats = _read_state_json(OUTCOME_STATS_FILE, default_stats)
+        positions = _read_state_json(
+            PAPER_POSITIONS_FILE, [], required=True
+        )
+        stats = _read_state_json(
+            OUTCOME_STATS_FILE,
+            default_stats,
+            required=paper_file_exists(OUTCOME_STATS_FILE),
+        )
     except Exception as exc:
         return {
             "ok": False,
@@ -798,35 +855,74 @@ def evaluate_closed_paper_trades(force: bool = False) -> Dict[str, Any]:
 
 
 def get_outcome_stats() -> Dict[str, Any]:
-    stats = _read_json(OUTCOME_STATS_FILE, {
-        "version": VERSION,
-        "updated_at": None,
-        "global": _empty_bucket(),
-        "by_bot": {},
-        "by_setup": {},
-        "by_symbol": {},
-        "by_side": {},
-        "evaluated_trade_ids": [],
-        "evaluated_closed_execution_keys": [],
-        "evaluated_closed_executions": [],
-    })
+    if not (
+        paper_data_mount_verified(DATA_DIR)
+        and paper_data_mount_verified(OUTCOME_STATS_FILE)
+    ):
+        return {
+            "ok": False,
+            "status": "PAPER_DATA_MOUNT_NOT_VERIFIED",
+            "generated_at": _now_br(),
+            "stats": None,
+        }
+    if not paper_file_exists(OUTCOME_STATS_FILE):
+        return {
+            "ok": False,
+            "status": "OUTCOME_STATS_MISSING",
+            "generated_at": _now_br(),
+            "stats": None,
+        }
+    try:
+        stats = json.loads(read_paper_text(OUTCOME_STATS_FILE, encoding="utf-8"))
+    except Exception:
+        return {
+            "ok": False,
+            "status": "OUTCOME_STATS_INVALID",
+            "generated_at": _now_br(),
+            "stats": None,
+        }
+    if not isinstance(stats, dict):
+        return {
+            "ok": False,
+            "status": "OUTCOME_STATS_INVALID",
+            "generated_at": _now_br(),
+            "stats": None,
+        }
     return {
         "ok": True,
+        "status": "OUTCOME_STATS_PRESENT",
         "generated_at": _now_br(),
         "stats": stats,
     }
 
 
 def read_outcome_log(limit: int = 20) -> Dict[str, Any]:
-    if not OUTCOME_LOG_FILE.exists():
+    if not paper_data_mount_verified(OUTCOME_LOG_FILE):
+        return {
+            "ok": False,
+            "status": "PAPER_DATA_MOUNT_NOT_VERIFIED",
+            "generated_at": _now_br(),
+            "count": None,
+            "items": None,
+        }
+    if not paper_file_exists(OUTCOME_LOG_FILE):
         return {
             "ok": True,
+            "status": "OUTCOME_LOG_MISSING",
             "generated_at": _now_br(),
             "count": 0,
             "items": [],
         }
-
-    lines = OUTCOME_LOG_FILE.read_text(encoding="utf-8").splitlines()
+    try:
+        lines = read_paper_text(OUTCOME_LOG_FILE, encoding="utf-8").splitlines()
+    except Exception:
+        return {
+            "ok": False,
+            "status": "OUTCOME_LOG_READ_FAILED",
+            "generated_at": _now_br(),
+            "count": None,
+            "items": None,
+        }
     selected = lines[-max(1, int(limit)):]
 
     items = []
@@ -838,6 +934,7 @@ def read_outcome_log(limit: int = 20) -> Dict[str, Any]:
 
     return {
         "ok": True,
+        "status": "OUTCOME_LOG_PRESENT",
         "generated_at": _now_br(),
         "count": len(items),
         "items": items,

@@ -24,12 +24,20 @@ import time
 import re
 from datetime import datetime
 from pathlib import Path
+from paper_state_storage import (
+    ensure_paper_data_dir,
+    open_paper_binary,
+    open_paper_text,
+    paper_data_mount_verified,
+    resolve_paper_data_dir,
+    write_json_atomically,
+)
 
 VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.1.8"
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("CENTRAL_DATA_DIR", str(BASE_DIR / "data")))
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR = resolve_paper_data_dir(__file__)
+ensure_paper_data_dir(DATA_DIR)
 
 TIMELINE_FILE = Path(os.environ.get("EXECUTIVE_POLICY_TIMELINE_FILE", str(DATA_DIR / "executive_policy_timeline.jsonl")))
 STATE_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_STATE_FILE", str(DATA_DIR / "executive_policy_learning_state.json")))
@@ -72,25 +80,42 @@ def _safe_int(value, default=0):
 
 
 def _read_json(path, default):
+    value, status = _read_json_with_status(path)
+    return value if status == "READ_OK" else default
+
+
+def _read_json_with_status(path):
+    """Read JSON through the PAPER storage guard and preserve failure state."""
+    path = Path(path)
     try:
-        if not Path(path).exists():
-            return default
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        mount_verified = paper_data_mount_verified(path)
     except Exception:
-        return default
+        mount_verified = False
+    if not mount_verified:
+        return None, "PAPER_DATA_MOUNT_NOT_VERIFIED"
+    try:
+        with open_paper_text(path, "r", encoding="utf-8") as f:
+            return json.load(f), "READ_OK"
+    except FileNotFoundError:
+        return None, "MISSING"
+    except json.JSONDecodeError:
+        return None, "INVALID_JSON"
+    except UnicodeError:
+        return None, "INVALID_ENCODING"
+    except Exception:
+        return None, "READ_FAILED"
 
 
 def _write_json(path, payload):
-    tmp = str(path) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
-    os.replace(tmp, path)
+    if not write_json_atomically(Path(path), payload):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED_OR_WRITE_FAILED")
 
 
 def _append_log(event):
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
+        if not paper_data_mount_verified(LOG_FILE):
+            return
+        with open_paper_text(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
     except Exception:
         pass
@@ -366,7 +391,7 @@ def _iter_new_timeline_events(offset, max_events):
 
     new_offset = offset
     try:
-        with open(TIMELINE_FILE, "rb") as f:
+        with open_paper_binary(TIMELINE_FILE, "rb") as f:
             try:
                 f.seek(max(0, int(offset)))
             except Exception:
@@ -763,7 +788,7 @@ def read_executive_policy_learning_log(limit=20):
         return {"ok": True, "items": [], "log_file": str(LOG_FILE)}
 
     try:
-        with open(LOG_FILE, "rb") as f:
+        with open_paper_binary(LOG_FILE, "rb") as f:
             f.seek(0, os.SEEK_END)
             end = f.tell()
             block = 4096
@@ -877,7 +902,7 @@ def seed_executive_policy_learning_events(commit=True):
     ]
 
     if commit:
-        with open(TIMELINE_FILE, "a", encoding="utf-8") as f:
+        with open_paper_text(TIMELINE_FILE, "a", encoding="utf-8") as f:
             for event in events:
                 f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 
@@ -1034,7 +1059,7 @@ def _read_new_jsonl(path, offset, max_items):
 
     new_offset = offset
     try:
-        with open(path, "rb") as f:
+        with open_paper_binary(path, "rb") as f:
             try:
                 f.seek(max(0, int(offset)))
             except Exception:
@@ -1072,7 +1097,7 @@ def _read_all_policy_events_light(limit=5000):
 
     events = []
     try:
-        with open(TIMELINE_FILE, "rb") as f:
+        with open_paper_binary(TIMELINE_FILE, "rb") as f:
             # Se arquivo for muito grande, lê apenas o final.
             try:
                 f.seek(0, os.SEEK_END)
@@ -1547,7 +1572,7 @@ def run_executive_policy_learning_v2(context=None, commit=True, max_decisions=No
     }
 
     try:
-        with open(V2_LOG_FILE, "a", encoding="utf-8") as f:
+        with open_paper_text(V2_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
     except Exception:
         pass
@@ -1870,7 +1895,7 @@ def rebuild_executive_policy_effect(commit=True, max_decisions=None):
     result["previous_summary"] = old_effect.get("summary") or {}
 
     try:
-        with open(V2_LOG_FILE, "a", encoding="utf-8") as f:
+        with open_paper_text(V2_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps({
                 "event": "POLICY_EFFECT_REBUILD",
                 **result,
@@ -1985,7 +2010,7 @@ def seed_policy_effect_decision(commit=True):
         except Exception:
             probe = None
         try:
-            with open(DECISION_LOG_FILE, "a", encoding="utf-8") as f:
+            with open_paper_text(DECISION_LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(line)
             if probe is not None:
                 probe.finish(True)
@@ -2015,7 +2040,7 @@ def seed_policy_effect_decision(commit=True):
     }
 
     try:
-        with open(V2_LOG_FILE, "a", encoding="utf-8") as f:
+        with open_paper_text(V2_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps({
                 "event": "POLICY_EFFECT_DECISION_SEED",
                 **result,
@@ -2131,7 +2156,7 @@ def _read_all_policy_events_light(limit=5000):
     events = []
     skipped_test_seeds = 0
     try:
-        with open(TIMELINE_FILE, "rb") as f:
+        with open_paper_binary(TIMELINE_FILE, "rb") as f:
             try:
                 f.seek(0, os.SEEK_END)
                 size = f.tell()
@@ -2522,7 +2547,7 @@ def run_executive_policy_learning_v2(context=None, commit=True, max_decisions=No
     }
 
     try:
-        with open(V2_LOG_FILE, "a", encoding="utf-8") as f:
+        with open_paper_text(V2_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
     except Exception:
         pass
@@ -2771,7 +2796,7 @@ def _jsonl_line_count(path):
         path = Path(path)
         if not path.exists():
             return 0
-        with open(path, "r", encoding="utf-8") as f:
+        with open_paper_text(path, "r", encoding="utf-8") as f:
             return sum(1 for line in f if line.strip())
     except Exception:
         return 0
@@ -3001,7 +3026,7 @@ def run_executive_policy_learning_v2(context=None, commit=True, max_decisions=No
     }
 
     try:
-        with open(V2_LOG_FILE, "a", encoding="utf-8") as f:
+        with open_paper_text(V2_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
     except Exception:
         pass
@@ -3095,7 +3120,7 @@ def rebuild_executive_policy_effect(commit=True, max_decisions=None):
     result["previous_summary"] = old_effect.get("summary") or {}
 
     try:
-        with open(V2_LOG_FILE, "a", encoding="utf-8") as f:
+        with open_paper_text(V2_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps({
                 "event": "POLICY_EFFECT_REBUILD",
                 **result,
@@ -3398,13 +3423,22 @@ def _extract_outcome_payload(event):
     }
 
 
-def _read_jsonl_tail_items(path, max_items=POLICY_OUTCOME_MAX_EVENTS, max_bytes=6 * 1024 * 1024):
+def _read_jsonl_tail_items_with_status(
+    path,
+    max_items=POLICY_OUTCOME_MAX_EVENTS,
+    max_bytes=6 * 1024 * 1024,
+):
     items = []
+    invalid_lines = 0
+    path = Path(path)
     try:
-        path = Path(path)
-        if not path.exists():
-            return []
-        with open(path, "rb") as f:
+        mount_verified = paper_data_mount_verified(path)
+    except Exception:
+        mount_verified = False
+    if not mount_verified:
+        return items, "PAPER_DATA_MOUNT_NOT_VERIFIED", invalid_lines
+    try:
+        with open_paper_binary(path, "rb") as f:
             try:
                 f.seek(0, os.SEEK_END)
                 size = f.tell()
@@ -3423,9 +3457,23 @@ def _read_jsonl_tail_items(path, max_items=POLICY_OUTCOME_MAX_EVENTS, max_bytes=
                     if isinstance(obj, dict):
                         items.append(obj)
                 except Exception:
+                    invalid_lines += 1
                     continue
+    except FileNotFoundError:
+        return items, "MISSING", invalid_lines
     except Exception:
-        return []
+        return items, "READ_FAILED", invalid_lines
+    status = "PARTIAL_INVALID_LINES" if invalid_lines else "READ_OK"
+    return items, status, invalid_lines
+
+
+def _read_jsonl_tail_items(path, max_items=POLICY_OUTCOME_MAX_EVENTS, max_bytes=6 * 1024 * 1024):
+    """Compatibility wrapper for callers that only need parsed items."""
+    items, _status, _invalid_lines = _read_jsonl_tail_items_with_status(
+        path,
+        max_items=max_items,
+        max_bytes=max_bytes,
+    )
     return items
 
 
@@ -3522,22 +3570,40 @@ def _load_policy_outcome_index():
     total_outcomes = 0
 
     for path in _policy_outcome_candidate_paths():
-        exists = Path(path).exists()
-        source_info = {"path": str(path), "exists": bool(exists), "events": 0, "outcomes": 0}
-        if not exists:
-            sources.append(source_info)
-            continue
-
-        events = []
+        source_info = {
+            "path": str(path),
+            "exists": None,
+            "read_status": "NOT_READ",
+            "invalid_lines": 0,
+            "events": 0,
+            "outcomes": 0,
+        }
         try:
             if str(path).endswith(".jsonl"):
-                events = _read_jsonl_tail_items(path, max_items=POLICY_OUTCOME_MAX_EVENTS)
+                events, read_status, invalid_lines = _read_jsonl_tail_items_with_status(
+                    path,
+                    max_items=POLICY_OUTCOME_MAX_EVENTS,
+                )
+                source_info["invalid_lines"] = invalid_lines
             elif str(path).endswith(".json"):
-                raw = _read_json(path, {})
-                events = _flatten_json_container(raw)
+                raw, read_status = _read_json_with_status(path)
+                if read_status == "READ_OK":
+                    events = _flatten_json_container(raw)
+                else:
+                    events = []
+            else:
+                events = []
+                read_status = "UNSUPPORTED_SOURCE_FORMAT"
         except Exception:
             events = []
+            read_status = "READ_FAILED"
 
+        source_info["read_status"] = read_status
+        source_info["exists"] = (
+            None
+            if read_status in {"NOT_READ", "PAPER_DATA_MOUNT_NOT_VERIFIED"}
+            else read_status != "MISSING"
+        )
         source_info["events"] = len(events)
         total_events += len(events)
 
@@ -4097,7 +4163,7 @@ def run_executive_policy_learning_v2(context=None, commit=True, max_decisions=No
     }
 
     try:
-        with open(V2_LOG_FILE, "a", encoding="utf-8") as f:
+        with open_paper_text(V2_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
     except Exception:
         pass
@@ -4373,7 +4439,7 @@ def rebuild_executive_policy_effect(commit=True, max_decisions=None):
     result["previous_summary"] = old_effect.get("summary") or {}
 
     try:
-        with open(V2_LOG_FILE, "a", encoding="utf-8") as f:
+        with open_paper_text(V2_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps({
                 "event": "POLICY_EFFECT_REBUILD_V2_2",
                 **result,

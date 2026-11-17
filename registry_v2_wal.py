@@ -11,11 +11,12 @@ import copy
 import hashlib
 import json
 import os
-import tempfile
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import paper_state_storage
 
 EVENT_PREPARED = "EVENT_PREPARED"
 SNAPSHOT_COMMITTED = "SNAPSHOT_COMMITTED"
@@ -233,18 +234,20 @@ def compute_snapshot_digest(snapshot: Mapping[str, Any]) -> str:
 
 def read_journal(storage: RegistryV2WalStorage) -> tuple[WalEvent, ...]:
     path = Path(storage.journal_path)
-    if not path.exists():
+    if not paper_state_storage.paper_file_exists(path):
         return ()
-    return _parse_journal_bytes(path.read_bytes())
+    with paper_state_storage.open_paper_binary(path, "rb") as handle:
+        return _parse_journal_bytes(handle.read())
 
 
 def repair_truncated_journal_tail_for_recovery(storage: RegistryV2WalStorage) -> bool:
     """Remove only an unterminated, non-JSON tail after a fully valid prefix."""
 
     path = Path(storage.journal_path)
-    if not path.exists():
+    if not paper_state_storage.paper_file_exists(path):
         return False
-    raw = path.read_bytes()
+    with paper_state_storage.open_paper_binary(path, "rb") as handle:
+        raw = handle.read()
     if not raw or raw.endswith(b"\n"):
         return False
     last_newline = raw.rfind(b"\n")
@@ -268,7 +271,7 @@ def repair_truncated_journal_tail_for_recovery(storage: RegistryV2WalStorage) ->
         pass
     else:
         raise ValueError("journal_truncated_tail_complete_record")
-    with path.open("r+b") as handle:
+    with paper_state_storage.open_paper_binary(path, "r+b") as handle:
         handle.truncate(last_newline + 1)
         handle.flush()
         os.fsync(handle.fileno())
@@ -599,29 +602,17 @@ def _materialize_snapshot(
 
 def _atomic_write_snapshot(storage: RegistryV2WalStorage, snapshot: Mapping[str, Any], fault_hook: Callable[[str], None] | None, event: WalEvent | None) -> None:
     target = Path(storage.snapshot_path)
-    parent = target.parent
-    fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(parent))
-    temp_path = Path(temp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(canonical_json(snapshot))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        _fault(fault_hook, AFTER_TEMP_FSYNC)
-        os.replace(temp_path, target)
-        _fsync_directory(parent)
-    except Exception:
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    payload = (canonical_json(snapshot) + "\n").encode("utf-8")
+    paper_state_storage.write_paper_bytes_atomically(
+        target,
+        payload,
+        after_temp_fsync=lambda: _fault(fault_hook, AFTER_TEMP_FSYNC),
+    )
 
 
 def _append_event(storage: RegistryV2WalStorage, event: WalEvent) -> None:
     path = Path(storage.journal_path)
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
+    with paper_state_storage.open_paper_text(path, "a", encoding="utf-8") as handle:
         handle.write(canonical_json(event.to_dict()))
         handle.write("\n")
         handle.flush()
@@ -630,9 +621,9 @@ def _append_event(storage: RegistryV2WalStorage, event: WalEvent) -> None:
 
 def _load_snapshot_if_present(storage: RegistryV2WalStorage) -> dict[str, Any] | None:
     path = Path(storage.snapshot_path)
-    if not path.exists():
+    if not paper_state_storage.paper_file_exists(path):
         return None
-    with path.open("r", encoding="utf-8") as handle:
+    with paper_state_storage.open_paper_text(path, "r", encoding="utf-8") as handle:
         value = json.load(handle, parse_constant=_reject_non_finite)
     if not isinstance(value, Mapping):
         raise ValueError("snapshot_mapping_required")
@@ -819,15 +810,9 @@ def _fault(fault_hook: Callable[[str], None] | None, stage: str) -> None:
 
 def _fsync_directory(path: Path) -> None:
     try:
-        fd = os.open(str(path), os.O_RDONLY)
+        paper_state_storage.fsync_paper_directory(path)
     except (AttributeError, OSError):
         return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
 
 
 __all__ = (

@@ -1,7 +1,7 @@
 """Run the existing Falcon safety regressions without external access.
 
 Usage: python3 -I tests/run_falcon_pilot_minimal_offline.py
-       [--upstash-sdk-contract|--account-client-order-authority|--live-position-risk-gate|--position-snapshot-reuse]
+       [--upstash-sdk-contract|--account-client-order-authority|--live-position-risk-gate|--position-snapshot-reuse|--paper-registry-source-preview|--paper-registry-source-capture|--history-memory-state-io|--personal-lifecycle-no-ccxt]
 Some tests import main.py, so runtime auto-start is disabled before collection.
 Pytest is loaded only after network, subprocess and .env-file access are denied.
 """
@@ -195,6 +195,15 @@ if __name__ == "__main__":
         cases = ("test_main_traderegistry_sync_v2_ownership.py",)
     elif sys.argv[1:] == ["--registry-v2-migration-audit"]:
         cases = ("test_registry_v2_migration_audit.py",)
+    elif sys.argv[1:] == ["--paper-registry-source-preview"]:
+        cases = ("test_paper_registry_source_preview.py",)
+    elif sys.argv[1:] == ["--paper-registry-source-capture"]:
+        cases = ("test_paper_registry_source_capture.py",)
+    elif sys.argv[1:] == ["--history-memory-state-io"]:
+        cases = (
+            "test_history_events_memory_containment.py",
+            "test_real_pnl_r_mapper_closed_identity_v1.py",
+        )
     elif sys.argv[1:] == ["--can-open-risk"]:
         cases = (
             "test_history_eventbus_smoke.py",
@@ -231,6 +240,8 @@ if __name__ == "__main__":
             "test_paper_executor_integrated_idempotency_v1.py",
             "test_paper_executor_data_dir_resolution_v1.py",
             "test_execution_pipeline_status_paper_state_v1.py",
+            "test_adaptive_weights_data_dir_guard_v1.py",
+            "test_paper_state_storage_render_paths_v1.py",
             "test_outcome_evaluator_closed_identity_v1.py",
         )
     elif sys.argv[1:] == ["--paper-lifecycle-disk-failures"]:
@@ -298,6 +309,22 @@ if __name__ == "__main__":
             "test_real_trade_lifecycle_missing_from_bots_close_v1.py",
             "test_live_position_reconciliation_risk_gate_v1.py",
         )
+    elif sys.argv[1:] == ["--personal-lifecycle-no-ccxt"]:
+        # Preserve an explicit offline lifecycle subset when ccxt is not
+        # installed. The three omitted broker modules are not represented as
+        # tested by this selection and remain covered only by the full mode.
+        cases = (
+            "test_broker_managed_close_timeout_semantics_v1.py",
+            "test_personal_bot_positions_read_fail_closed_v1.py",
+            "test_falcon_initial_stop_failure_containment_v1.py",
+            "test_falcon_disaster_stop_failure_forensics_v1.py",
+            "test_falcon_terminal_disaster_stop_emergency_recovery_v1.py",
+            "test_falcon_positions_read_fail_closed_v1.py",
+            "test_falcon_central_only_reconciliation.py",
+            "test_falcon_manual_close_outcome_reconciliation_v1.py",
+            "test_real_trade_lifecycle_missing_from_bots_close_v1.py",
+            "test_live_position_reconciliation_risk_gate_v1.py",
+        )
     elif sys.argv[1:] == ["--personal-position-read-fail-closed"]:
         cases = ("test_personal_bot_positions_read_fail_closed_v1.py",)
     elif sys.argv[1:] == ["--falcon-lifecycle-projection"]:
@@ -356,6 +383,12 @@ if __name__ == "__main__":
         filters = []
     elif sys.argv[1:] == ["--registry-v2-migration-audit"]:
         filters = []
+    elif sys.argv[1:] == ["--paper-registry-source-preview"]:
+        filters = []
+    elif sys.argv[1:] == ["--paper-registry-source-capture"]:
+        filters = []
+    elif sys.argv[1:] == ["--history-memory-state-io"]:
+        filters = []
     elif sys.argv[1:] == ["--can-open-risk"]:
         filters = [
             "-k",
@@ -396,6 +429,8 @@ if __name__ == "__main__":
         filters = []
     elif sys.argv[1:] == ["--personal-lifecycle-completeness"]:
         filters = []
+    elif sys.argv[1:] == ["--personal-lifecycle-no-ccxt"]:
+        filters = []
     elif sys.argv[1:] == ["--falcon-lifecycle-projection"]:
         filters = []
     elif sys.argv[1:] == ["--upstash-sdk-contract"]:
@@ -422,6 +457,10 @@ if __name__ == "__main__":
         filters = []
     else:
         filters = ["-k", "not test_shadow_validation_append_is_idempotent_across_processes"] if cases is EXTRA_CASES else []
+    if sys.argv[1:] == ["--history-memory-state-io"]:
+        # The suite runner forbids subprocess creation; this test's isolated
+        # child-process import check is exercised separately outside the runner.
+        filters.extend(["-k", "not test_no_test_uses_real_data_network_redis_or_broker"])
     pytest_args = ["-q", "-p", "no:cacheprovider"]
     # The unittest-based C3 startup integration tests use pytest's trace-option
     # lookup in pytest's unittest adapter, so keep the built-in debugging

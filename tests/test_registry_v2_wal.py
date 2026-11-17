@@ -136,16 +136,16 @@ def _source_tree():
 def test_read_journal_reads_once_and_returns_the_parsed_result(tmp_path, monkeypatch):
     storage = _storage(tmp_path)
     storage.journal_path.write_bytes(b"opaque-journal-bytes")
-    original_read_bytes = Path.read_bytes
+    original_open_binary = wal.paper_state_storage.open_paper_binary
     read_calls = []
     parsed = ("parsed-event-1", "parsed-event-2")
 
-    def counting_read_bytes(path):
+    def counting_open_binary(path, mode="rb"):
         if path == storage.journal_path:
             read_calls.append(path)
-        return original_read_bytes(path)
+        return original_open_binary(path, mode)
 
-    monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
+    monkeypatch.setattr(wal.paper_state_storage, "open_paper_binary", counting_open_binary)
     monkeypatch.setattr(wal, "_parse_journal_bytes", lambda raw: parsed)
 
     assert wal.read_journal(storage) is parsed
@@ -1476,3 +1476,19 @@ def test_156_pending_prepared_without_snapshot_has_no_recovery_callback(tmp_path
     assert result.state == wal.SNAPSHOT_INVALID
     assert calls == []
     assert storage.journal_path.read_bytes() == before
+
+
+def test_wal_file_io_is_routed_through_shared_paper_storage_guard():
+    source = MODULE_PATH.read_text(encoding="utf-8")
+
+    assert "import paper_state_storage" in source
+    assert "paper_state_storage.paper_file_exists" in source
+    assert "paper_state_storage.open_paper_binary" in source
+    assert "paper_state_storage.open_paper_text" in source
+    assert "paper_state_storage.write_paper_bytes_atomically" in source
+    assert "paper_state_storage.fsync_paper_directory" in source
+    assert "path.read_bytes()" not in source
+    assert "path.open(" not in source
+    assert "path.exists()" not in source
+    assert "tempfile.mkstemp(" not in source
+    assert "os.replace(" not in source

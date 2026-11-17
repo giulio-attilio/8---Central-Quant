@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 
 import pytest
@@ -72,6 +73,7 @@ def _write_positions(module, positions):
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="directory-anchored append fsync is POSIX-only")
 def test_outcome_event_append_flushes_and_fsyncs(evaluator, monkeypatch):
     fsync_calls = []
     monkeypatch.setattr(evaluator.os, "fsync", lambda fd: fsync_calls.append(fd))
@@ -219,6 +221,7 @@ def test_outcome_log_failure_is_reported_and_retry_finishes_once(
     assert len(events) == 1
 
 
+@pytest.mark.skipif(os.name == "nt", reason="directory-anchored append fsync is POSIX-only")
 def test_outcome_log_fsync_failure_is_reported_and_retry_finishes_once(
     evaluator, monkeypatch
 ):

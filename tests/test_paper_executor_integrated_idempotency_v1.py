@@ -130,6 +130,72 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertFalse(self.positions_file.exists())
         self.assertFalse(self.log_file.exists())
 
+    def test_position_ledger_disappearing_after_presence_check_fails_closed(self):
+        self._initialize_state()
+        original_read = paper_executor._read_state_json
+
+        def remove_required_ledger_before_open(path, default, *, required=False):
+            if Path(path) == self.positions_file and required:
+                self.positions_file.unlink(missing_ok=True)
+            return original_read(path, default, required=required)
+
+        with mock.patch.object(
+            paper_executor,
+            "_read_state_json",
+            side_effect=remove_required_ledger_before_open,
+        ):
+            result = paper_executor.execute_paper_from_engine(
+                {"plan": self._plan("paper-ledger-disappeared-v1")}
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["payload"]["status"], "PAPER_STATE_INVALID")
+        self.assertFalse(self.positions_file.exists())
+        self.assertEqual(json.loads(self.seen_file.read_text(encoding="utf-8")), {})
+        self.assertFalse(self.log_file.exists())
+
+    def test_open_positions_endpoint_fails_closed_if_ledger_disappears_after_health(self):
+        self._initialize_state()
+        original_read = paper_executor._read_state_json
+        removed = False
+
+        def remove_after_health(path, default, *, required=False):
+            nonlocal removed
+            if Path(path) == self.positions_file and required and not removed:
+                # The first required read is inside health; remove it only after
+                # health has completed, immediately before the endpoint's read.
+                removed = True
+                return original_read(path, default, required=required)
+            if Path(path) == self.positions_file and required:
+                self.positions_file.unlink(missing_ok=True)
+            return original_read(path, default, required=required)
+
+        with mock.patch.object(
+            paper_executor, "_read_state_json", side_effect=remove_after_health
+        ):
+            result = paper_executor.get_paper_integrated_open_positions()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "PAPER_STATE_FILES_INVALID")
+        self.assertIsNone(result["count"])
+        self.assertIsNone(result["positions"])
+
+    def test_executor_blocks_when_exact_state_file_path_is_not_verified(self):
+        self._initialize_state()
+        original_guard = paper_executor._paper_file_access_verified
+
+        def guard(path):
+            return False if Path(path) == self.positions_file else original_guard(path)
+
+        with mock.patch.object(paper_executor, "_paper_file_access_verified", side_effect=guard):
+            result = paper_executor.execute_paper_from_engine({"plan": self._plan()})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["payload"]["status"], "PAPER_DATA_MOUNT_NOT_VERIFIED")
+        self.assertEqual(self._positions(), [])
+        self.assertEqual(json.loads(self.seen_file.read_text(encoding="utf-8")), {})
+        self.assertFalse(self.log_file.exists())
+
     def test_empty_ledgers_open_only_a_paper_position_without_exchange_order(self):
         self._initialize_state()
 
@@ -506,8 +572,8 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         original_read = paper_executor._read_state_json
         shared_lock = paper_state_storage.PAPER_STATE_LOCK
 
-        def pause_after_positions_read(path, default):
-            value = original_read(path, default)
+        def pause_after_positions_read(path, default, *, required=False):
+            value = original_read(path, default, required=required)
             if Path(path) == self.positions_file:
                 position_read.set()
                 if not release_entry.wait(timeout=5):
@@ -573,8 +639,8 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         original_read = outcome_evaluator._read_state_json
         shared_lock = paper_state_storage.PAPER_STATE_LOCK
 
-        def pause_after_positions_read(path, default):
-            value = original_read(path, default)
+        def pause_after_positions_read(path, default, *, required=False):
+            value = original_read(path, default, required=required)
             if Path(path) == self.positions_file:
                 position_read.set()
                 if not release_evaluation.wait(timeout=5):

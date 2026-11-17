@@ -102,6 +102,31 @@ CENTRAL_DATA_DIR = _resolve_central_data_dir()
 # guard must not silently fall back to the ephemeral source directory.
 os.environ["CENTRAL_DATA_DIR"] = str(CENTRAL_DATA_DIR)
 
+from paper_state_storage import (
+    append_paper_text as _append_guarded_paper_text,
+    paper_data_mount_verified as _paper_data_mount_verified,
+    write_json_atomically as _write_guarded_paper_json,
+)
+
+
+def _verify_central_paper_audit_path(path):
+    """Require each auxiliary PAPER audit path to remain on verified storage."""
+    if not _paper_data_mount_verified(CENTRAL_DATA_DIR) or not _paper_data_mount_verified(path):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
+
+
+def _write_central_paper_audit_json(path, payload):
+    path = Path(path)
+    _verify_central_paper_audit_path(path)
+    if not _write_guarded_paper_json(path, payload):
+        raise OSError("PAPER_AUDIT_JSON_WRITE_FAILED")
+
+
+def _append_central_paper_audit_event(path, event_text):
+    path = Path(path)
+    _verify_central_paper_audit_path(path)
+    _append_guarded_paper_text(path, event_text, encoding="utf-8")
+
 # Deve permanecer antes dos imports operacionais, do Startup Disk Forensics,
 # do mkdir do data dir e de qualquer writer configurado pela Central. O módulo
 # só pode alterar CENTRAL_DATA_DIR/timeline.jsonl com flag explícita ativa.
@@ -49334,21 +49359,19 @@ def predator_pnl_paper_audit_v1_status(include_samples=True, limit=1200):
         samples_stage.__exit__(None, None, None)
     try:
         latest_path = Path(PREDATOR_PNL_PAPER_AUDIT_V1_LATEST_FILE)
-        latest_path.parent.mkdir(parents=True, exist_ok=True)
+        latest_payload = _pppa_v1_public(payload)
         with predator_audit_stage(audit_name, "serialize_latest_payload") as stage:
-            serialized_latest = json.dumps(_pppa_v1_public(payload), ensure_ascii=False, indent=2)
+            serialized_latest = json.dumps(latest_payload, ensure_ascii=False, indent=2)
             stage.finish(serialized_latest, objects_produced=1, serialized_chars=len(serialized_latest))
-        with predator_audit_stage(audit_name, "export_latest_payload") as stage:
-            latest_path.write_text(serialized_latest, encoding="utf-8")
-            stage.finish(records_processed=1, objects_produced=0)
         event_path = Path(PREDATOR_PNL_PAPER_AUDIT_V1_EVENTS_FILE)
-        event_path.parent.mkdir(parents=True, exist_ok=True)
         with predator_audit_stage(audit_name, "serialize_event_export") as stage:
             serialized_event = json.dumps({"event": "PREDATOR_PNL_PAPER_AUDIT_RUN", "generated_at": payload.get("generated_at"), "status": status, "ok": ok, "real_sent_or_live_event_count": len(real_events), "paper_pnl": pnl}, ensure_ascii=False) + "\n"
             stage.finish(serialized_event, objects_produced=1, serialized_chars=len(serialized_event))
+        with predator_audit_stage(audit_name, "export_latest_payload") as stage:
+            _write_central_paper_audit_json(latest_path, latest_payload)
+            stage.finish(records_processed=1, objects_produced=0)
         with predator_audit_stage(audit_name, "export_event_journal") as stage:
-            with event_path.open("a", encoding="utf-8") as fh:
-                fh.write(serialized_event)
+            _append_central_paper_audit_event(event_path, serialized_event)
             stage.finish(records_processed=1, objects_produced=0)
     except Exception as exc:
         payload.setdefault("warnings", []).append(f"Falha ao gravar auditoria Predator: {exc}")
@@ -50026,21 +50049,19 @@ def predator_paper_lifecycle_audit_v1_status(include_samples=True, limit=1500, u
         samples_stage.__exit__(None, None, None)
     try:
         latest_path = Path(PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_LATEST_FILE)
-        latest_path.parent.mkdir(parents=True, exist_ok=True)
+        latest_payload = _ppla_v1_public(payload)
         with predator_audit_stage(audit_name, "serialize_lifecycle_latest") as stage:
-            serialized_latest = json.dumps(_ppla_v1_public(payload), ensure_ascii=False, indent=2)
+            serialized_latest = json.dumps(latest_payload, ensure_ascii=False, indent=2)
             stage.finish(serialized_latest, objects_produced=1, serialized_chars=len(serialized_latest))
-        with predator_audit_stage(audit_name, "export_lifecycle_latest") as stage:
-            latest_path.write_text(serialized_latest, encoding="utf-8")
-            stage.finish(records_processed=1, objects_produced=0)
         event_path = Path(PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_EVENTS_FILE)
-        event_path.parent.mkdir(parents=True, exist_ok=True)
         with predator_audit_stage(audit_name, "serialize_lifecycle_event") as stage:
             serialized_event = json.dumps({"event": "PREDATOR_PAPER_LIFECYCLE_AUDIT_RUN", "generated_at": payload.get("generated_at"), "status": status, "ok": ok, "counts": payload.get("counts"), "reasons": reasons[:5], "warnings": warnings[:5]}, ensure_ascii=False) + "\n"
             stage.finish(serialized_event, objects_produced=1, serialized_chars=len(serialized_event))
+        with predator_audit_stage(audit_name, "export_lifecycle_latest") as stage:
+            _write_central_paper_audit_json(latest_path, latest_payload)
+            stage.finish(records_processed=1, objects_produced=0)
         with predator_audit_stage(audit_name, "export_lifecycle_event") as stage:
-            with event_path.open("a", encoding="utf-8") as fh:
-                fh.write(serialized_event)
+            _append_central_paper_audit_event(event_path, serialized_event)
             stage.finish(records_processed=1, objects_produced=0)
     except Exception as exc:
         payload.setdefault("warnings", []).append(f"Falha ao gravar auditoria lifecycle Predator: {exc}")
@@ -50828,12 +50849,12 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
     if commit:
         try:
             latest_path = Path(PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_LATEST_FILE)
-            latest_path.parent.mkdir(parents=True, exist_ok=True)
-            latest_path.write_text(json.dumps(_pprsf_v1_public(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+            latest_payload = _pprsf_v1_public(payload)
             event_path = Path(PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_EVENTS_FILE)
-            event_path.parent.mkdir(parents=True, exist_ok=True)
-            with event_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({
+            _write_central_paper_audit_json(latest_path, latest_payload)
+            _append_central_paper_audit_event(
+                event_path,
+                json.dumps({
                     "event": "PREDATOR_PAPER_REGISTRY_SYNC_FIX_RUN",
                     "generated_at": payload.get("generated_at"),
                     "status": status,
@@ -50845,7 +50866,8 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
                     "closed_repaired_count": len(closed_repaired),
                     "errors": errors[:5],
                     "warnings": warnings[:5],
-                }, ensure_ascii=False) + "\n")
+                }, ensure_ascii=False) + "\n",
+            )
         except Exception:
             pass
     return payload
@@ -51239,12 +51261,13 @@ def predator_registry_orphan_open_fix_v1_status(commit=False, ack=None, include_
     if commit:
         try:
             latest_path = Path(PREDATOR_ORPHAN_OPEN_FIX_V1_LATEST_FILE)
-            latest_path.parent.mkdir(parents=True, exist_ok=True)
-            latest_path.write_text(json.dumps(_pprsf_v1_public(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+            latest_payload = _pprsf_v1_public(payload)
             event_path = Path(PREDATOR_ORPHAN_OPEN_FIX_V1_EVENTS_FILE)
-            event_path.parent.mkdir(parents=True, exist_ok=True)
-            with event_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps({"event": "PREDATOR_ORPHAN_OPEN_FIX_V1_RUN", "generated_at": generated_at, "status": status, "committed": committed, "planned": len(planned), "repaired": len(repaired), "errors": errors[:5]}, ensure_ascii=False) + "\n")
+            _write_central_paper_audit_json(latest_path, latest_payload)
+            _append_central_paper_audit_event(
+                event_path,
+                json.dumps({"event": "PREDATOR_ORPHAN_OPEN_FIX_V1_RUN", "generated_at": generated_at, "status": status, "committed": committed, "planned": len(planned), "repaired": len(repaired), "errors": errors[:5]}, ensure_ascii=False) + "\n",
+            )
         except Exception as exc:
             payload.setdefault("warnings", []).append(f"Falha ao gravar auditoria do orphan fix: {exc}")
     return payload

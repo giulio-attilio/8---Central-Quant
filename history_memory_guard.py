@@ -10,6 +10,8 @@ import threading
 import time
 from pathlib import Path
 
+from paper_state_storage import open_paper_binary
+
 
 MIB = 1024 * 1024
 AUTOMATIC_MAX_RECORDS = 2_000
@@ -194,24 +196,26 @@ def iter_jsonl_tail(
         if not stat.S_ISREG(source_stat.st_mode):
             raise ValueError("history source must be a regular file")
 
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(str(source), flags)
+        safe_handle = None
+        descriptor = None
         try:
+            safe_handle = open_paper_binary(source, "rb")
+            descriptor = safe_handle.fileno()
             opened_stat = os.fstat(descriptor)
             if not stat.S_ISREG(opened_stat.st_mode):
                 raise ValueError("history source must be a regular file")
             source_size = int(opened_stat.st_size)
             metadata["source_size_bytes"] = source_size
             if source_size == 0:
-                os.close(descriptor)
+                safe_handle.close()
+                safe_handle = None
                 descriptor = None
                 result = {"records": [], **metadata}
                 probe.finish(0, False)
                 return result
 
-            handle = os.fdopen(descriptor, "rb", closefd=True)
+            handle = safe_handle
+            safe_handle = None
             descriptor = None
             chunks = []
             cursor = source_size
@@ -247,8 +251,8 @@ def iter_jsonl_tail(
             if len(data) < expected_bytes:
                 metadata["partial"] = True
         finally:
-            if descriptor is not None:
-                os.close(descriptor)
+            if safe_handle is not None:
+                safe_handle.close()
 
         metadata["bytes_read"] = len(data)
         metadata["partial"] = bool(metadata["partial"] or start > 0)

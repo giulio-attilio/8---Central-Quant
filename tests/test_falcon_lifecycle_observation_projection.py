@@ -4,7 +4,9 @@ import ast
 import json
 import os
 from pathlib import Path
-import tempfile
+import pytest
+
+import paper_state_storage
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -458,7 +460,9 @@ def test_paper_persistence_latch_survives_fresh_runtime_and_fails_closed_on_corr
             ),
             "os": os,
             "json": json,
-            "tempfile": tempfile,
+            "paper_data_mount_verified": paper_state_storage.paper_data_mount_verified,
+            "read_paper_text": paper_state_storage.read_paper_text,
+            "write_json_atomically": paper_state_storage.write_json_atomically,
             "data_hora_sp_str": lambda: "2026-11-15 12:00:00",
         }
         namespace["falcon_paper_persistence_latch_path"] = _function(
@@ -521,6 +525,70 @@ def test_paper_persistence_latch_survives_fresh_runtime_and_fails_closed_on_corr
     assert health_corrupt[
         "falcon_paper_persistence_reconciliation_required"
     ] is True
+
+
+def test_paper_persistence_latch_fails_closed_without_configured_data_dir(
+    monkeypatch,
+):
+    monkeypatch.delenv("CENTRAL_DATA_DIR", raising=False)
+    monkeypatch.delenv("DATA_DIR", raising=False)
+    health = {}
+    path_reader = _function("falcon_paper_persistence_latch_path", {"os": os})
+    namespace = {
+        "HEALTH": health,
+        "FALCON_PAPER_PERSISTENCE_LATCH_VERSION": "FALCON_PAPER_PERSISTENCE_LATCH_V1",
+        "falcon_paper_persistence_latch_path": path_reader,
+        "paper_data_mount_verified": lambda _path: True,
+        "read_paper_text": lambda *_args, **_kwargs: pytest.fail("must not read"),
+    }
+
+    required = _function(
+        "falcon_paper_persistence_reconciliation_required", namespace
+    )
+    writer = _function("falcon_persist_paper_persistence_latch", {
+        **namespace,
+        "write_json_atomically": lambda *_args, **_kwargs: pytest.fail("must not write"),
+        "data_hora_sp_str": lambda: "2026-11-17 12:00:00",
+    })
+
+    assert required() is True
+    assert health["falcon_paper_persistence_latch_status"] == "DATA_DIR_UNSET_FAIL_CLOSED"
+    assert writer("test") == {
+        "ok": False,
+        "status": "PAPER_PERSISTENCE_LATCH_DATA_DIR_UNSET",
+    }
+
+
+def test_paper_persistence_latch_fails_closed_when_mount_is_unverified(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("CENTRAL_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("DATA_DIR", raising=False)
+    health = {}
+    path_reader = _function("falcon_paper_persistence_latch_path", {"os": os})
+    calls = []
+    namespace = {
+        "HEALTH": health,
+        "FALCON_PAPER_PERSISTENCE_LATCH_VERSION": "FALCON_PAPER_PERSISTENCE_LATCH_V1",
+        "falcon_paper_persistence_latch_path": path_reader,
+        "paper_data_mount_verified": lambda _path: False,
+        "read_paper_text": lambda *_args, **_kwargs: calls.append("read"),
+        "write_json_atomically": lambda *_args, **_kwargs: calls.append("write"),
+        "data_hora_sp_str": lambda: "2026-11-17 12:00:00",
+    }
+
+    required = _function(
+        "falcon_paper_persistence_reconciliation_required", namespace
+    )
+    writer = _function("falcon_persist_paper_persistence_latch", namespace)
+
+    assert required() is True
+    assert health["falcon_paper_persistence_latch_status"] == "DATA_MOUNT_UNVERIFIED_FAIL_CLOSED"
+    assert writer("test") == {
+        "ok": False,
+        "status": "PAPER_PERSISTENCE_LATCH_MOUNT_UNVERIFIED",
+    }
+    assert calls == []
 
 
 def test_paper_persistence_latch_is_exposed_in_falcon_health_payload():

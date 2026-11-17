@@ -24,6 +24,11 @@ from typing import Any, Dict, Optional
 
 from paper_state_storage import (
     PAPER_STATE_LOCK,
+    append_paper_text,
+    ensure_paper_data_dir,
+    paper_data_mount_verified,
+    paper_file_exists,
+    read_paper_text,
     read_paper_positions_state,
     resolve_paper_data_dir,
     write_json_atomically,
@@ -33,7 +38,7 @@ from paper_state_storage import (
 VERSION = "2026-07-05-PAPER-LIFECYCLE-V1.1-PRICE-RECORDER"
 
 DATA_DIR = resolve_paper_data_dir(__file__)
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+ensure_paper_data_dir(DATA_DIR)
 
 PAPER_POSITIONS_FILE = DATA_DIR / "paper_integrated_positions.json"
 PAPER_LIFECYCLE_LOG_FILE = DATA_DIR / "paper_lifecycle_log.jsonl"
@@ -51,20 +56,27 @@ def _now_br() -> str:
 
 
 def _read_json(path: Path, default: Any) -> Any:
-    if not path.exists():
+    if not paper_data_mount_verified(path):
         return default
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        if not paper_file_exists(path):
+            return default
+        return json.loads(read_paper_text(path, encoding="utf-8"))
     except Exception:
         return default
 
 
 def _read_positions_for_update() -> tuple[Optional[list], Optional[str]]:
     """Read the canonical PAPER positions file without masking corruption."""
-    if not PAPER_POSITIONS_FILE.is_file():
-        return None, "PAPER_STATE_FILES_MISSING"
+    if not paper_data_mount_verified(PAPER_POSITIONS_FILE):
+        return None, "PAPER_DATA_MOUNT_NOT_VERIFIED"
     try:
-        payload = json.loads(PAPER_POSITIONS_FILE.read_text(encoding="utf-8"))
+        if not paper_file_exists(PAPER_POSITIONS_FILE):
+            return None, "PAPER_STATE_FILES_MISSING"
+    except OSError:
+        return None, "PAPER_DATA_MOUNT_NOT_VERIFIED"
+    try:
+        payload = json.loads(read_paper_text(PAPER_POSITIONS_FILE, encoding="utf-8"))
     except Exception as exc:
         return None, f"PAPER_POSITIONS_READ_FAILED:{type(exc).__name__}"
     if not isinstance(payload, list) or any(
@@ -82,12 +94,14 @@ def _write_json(path: Path, payload: Any) -> bool:
 
 
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> bool:
+    if not paper_data_mount_verified(DATA_DIR) or not paper_data_mount_verified(path):
+        return False
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        append_paper_text(
+            path,
+            json.dumps(payload, ensure_ascii=False, default=str) + "\n",
+            encoding="utf-8",
+        )
         return True
     except Exception:
         return False
@@ -370,7 +384,11 @@ def _emit_history_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def paper_lifecycle_health() -> Dict[str, Any]:
     positions, state_files_status = read_paper_positions_state(PAPER_POSITIONS_FILE)
-    state_files_present = PAPER_POSITIONS_FILE.is_file()
+    try:
+        state_files_present = paper_file_exists(PAPER_POSITIONS_FILE)
+    except OSError:
+        state_files_present = False
+        state_files_status = "PAPER_DATA_MOUNT_NOT_VERIFIED"
     state_files_valid = state_files_status == "PAPER_STATE_FILES_PRESENT"
     open_positions = [
         p for p in positions
@@ -599,7 +617,15 @@ def get_paper_lifecycle_positions(status: Optional[str] = None) -> Dict[str, Any
 
 
 def read_paper_lifecycle_log(limit: int = 20) -> Dict[str, Any]:
-    if not PAPER_LIFECYCLE_LOG_FILE.exists():
+    if not paper_data_mount_verified(DATA_DIR) or not paper_data_mount_verified(PAPER_LIFECYCLE_LOG_FILE):
+        return {
+            "ok": False,
+            "status": "PAPER_DATA_MOUNT_NOT_VERIFIED",
+            "generated_at": _now_br(),
+            "count": None,
+            "items": None,
+        }
+    if not paper_file_exists(PAPER_LIFECYCLE_LOG_FILE):
         return {
             "ok": True,
             "generated_at": _now_br(),
@@ -607,7 +633,7 @@ def read_paper_lifecycle_log(limit: int = 20) -> Dict[str, Any]:
             "items": [],
         }
 
-    lines = PAPER_LIFECYCLE_LOG_FILE.read_text(encoding="utf-8").splitlines()
+    lines = read_paper_text(PAPER_LIFECYCLE_LOG_FILE, encoding="utf-8").splitlines()
     selected = lines[-max(1, int(limit)):]
 
     items = []

@@ -69,6 +69,14 @@ class ExecutionPipelinePaperStateTest(unittest.TestCase):
         self.assertEqual(result["positions"]["open"], 0)
         self.assertEqual(result["positions"]["state_files_status"], "PAPER_STATE_FILES_PRESENT")
 
+    def test_outcome_summary_does_not_turn_unverified_mount_into_zero_trades(self):
+        with mock.patch.object(pipeline, "paper_data_mount_verified", return_value=False):
+            result = pipeline._outcome_summary()
+
+        self.assertEqual(result["status"], "PAPER_DATA_MOUNT_NOT_VERIFIED")
+        self.assertIsNone(result["trades"])
+        self.assertIsNone(result["wins"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,12 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from paper_state_storage import resolve_paper_data_dir
+from paper_state_storage import (
+    ensure_paper_data_dir,
+    paper_data_mount_verified,
+    read_paper_text,
+    resolve_paper_data_dir,
+)
 
 
 VERSION = "2026-07-04-EXECUTION-PIPELINE-STATUS-V1"
@@ -29,7 +34,7 @@ def _resolve_data_dir() -> Path:
 
 
 DATA_DIR = _resolve_data_dir()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+ensure_paper_data_dir(DATA_DIR)
 
 PAPER_POSITIONS_FILE = DATA_DIR / "paper_integrated_positions.json"
 OUTCOME_STATS_FILE = DATA_DIR / "outcome_stats.json"
@@ -86,15 +91,6 @@ def _now_br() -> str:
     return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
 
-def _read_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-
-
 def _safe_call(fn):
     if not callable(fn):
         return None
@@ -135,13 +131,69 @@ def _positions_summary(paper_health: Any) -> Dict[str, Any]:
 
 
 def _outcome_summary() -> Dict[str, Any]:
-    stats = _read_json(OUTCOME_STATS_FILE, {})
+    if not paper_data_mount_verified(OUTCOME_STATS_FILE):
+        return {
+            "exists": None,
+            "status": "PAPER_DATA_MOUNT_NOT_VERIFIED",
+            "updated_at": None,
+            "trades": None,
+            "wins": None,
+            "losses": None,
+            "win_rate_pct": None,
+            "tp50_hit_rate_pct": None,
+            "pnl_total_pct": None,
+            "r_total": None,
+            "r_avg": None,
+        }
+    if not OUTCOME_STATS_FILE.is_file():
+        return {
+            "exists": False,
+            "status": "OUTCOME_STATS_MISSING",
+            "updated_at": None,
+            "trades": None,
+            "wins": None,
+            "losses": None,
+            "win_rate_pct": None,
+            "tp50_hit_rate_pct": None,
+            "pnl_total_pct": None,
+            "r_total": None,
+            "r_avg": None,
+        }
+    try:
+        stats = json.loads(read_paper_text(OUTCOME_STATS_FILE, encoding="utf-8"))
+    except Exception:
+        return {
+            "exists": True,
+            "status": "OUTCOME_STATS_INVALID",
+            "updated_at": None,
+            "trades": None,
+            "wins": None,
+            "losses": None,
+            "win_rate_pct": None,
+            "tp50_hit_rate_pct": None,
+            "pnl_total_pct": None,
+            "r_total": None,
+            "r_avg": None,
+        }
     global_stats = stats.get("global") if isinstance(stats, dict) else {}
     if not isinstance(global_stats, dict):
-        global_stats = {}
+        return {
+            "exists": True,
+            "status": "OUTCOME_STATS_INVALID",
+            "updated_at": None,
+            "trades": None,
+            "wins": None,
+            "losses": None,
+            "win_rate_pct": None,
+            "tp50_hit_rate_pct": None,
+            "pnl_total_pct": None,
+            "r_total": None,
+            "r_avg": None,
+        }
 
     return {
         "exists": OUTCOME_STATS_FILE.exists(),
+        "status": "OK",
         "updated_at": stats.get("updated_at") if isinstance(stats, dict) else None,
         "trades": global_stats.get("trades", 0),
         "wins": global_stats.get("wins", 0),
@@ -156,6 +208,20 @@ def _outcome_summary() -> Dict[str, Any]:
 
 def _adaptive_summary() -> Dict[str, Any]:
     weights_payload = _safe_call(get_adaptive_weights)
+    if not isinstance(weights_payload, dict) or weights_payload.get("ok") is False:
+        return {
+            "exists": None,
+            "status": (weights_payload or {}).get("status")
+            if isinstance(weights_payload, dict)
+            else "ADAPTIVE_WEIGHTS_UNAVAILABLE",
+            "updated_at": None,
+            "source_outcome_updated_at": None,
+            "trades": None,
+            "confidence": None,
+            "recommended_action": None,
+            "suggested_weight": None,
+            "reason": None,
+        }
     weights = {}
     if isinstance(weights_payload, dict):
         weights = weights_payload.get("weights") or {}

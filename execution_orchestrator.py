@@ -30,7 +30,14 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from paper_state_storage import resolve_paper_data_dir
+from paper_state_storage import (
+    append_paper_text,
+    ensure_paper_data_dir,
+    paper_data_mount_verified,
+    read_paper_text,
+    resolve_paper_data_dir,
+    write_json_atomically,
+)
 
 
 VERSION = "2026-07-11-EXECUTION-ORCHESTRATOR-V1.2-IDENTITY-ATOMIC-SEEN"
@@ -41,7 +48,7 @@ def _resolve_data_dir() -> Path:
 
 
 DATA_DIR = _resolve_data_dir()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR_READY = ensure_paper_data_dir(DATA_DIR)
 
 EXECUTION_LOG_FILE = DATA_DIR / "execution_orchestrator_log.jsonl"
 EXECUTION_SEEN_FILE = DATA_DIR / "execution_orchestrator_seen.json"
@@ -56,12 +63,14 @@ def _now_br() -> str:
 
 
 def _load_seen() -> Dict[str, Any]:
+    if not paper_data_mount_verified(EXECUTION_SEEN_FILE):
+        raise OSError("EXECUTION_SEEN_DATA_MOUNT_NOT_VERIFIED")
     if not EXECUTION_SEEN_FILE.exists():
-        return {}
-    try:
-        return json.loads(EXECUTION_SEEN_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+        raise FileNotFoundError("EXECUTION_SEEN_STATE_MISSING")
+    seen = json.loads(read_paper_text(EXECUTION_SEEN_FILE, encoding="utf-8"))
+    if not isinstance(seen, dict):
+        raise ValueError("EXECUTION_SEEN_STATE_INVALID")
+    return seen
 
 
 def _save_seen(data: Dict[str, Any]) -> None:
@@ -71,13 +80,10 @@ def _save_seen(data: Dict[str, Any]) -> None:
     Evita arquivo parcialmente escrito caso o processo seja interrompido
     durante a gravação.
     """
-    EXECUTION_SEEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temp_file = EXECUTION_SEEN_FILE.with_suffix(EXECUTION_SEEN_FILE.suffix + ".tmp")
-    temp_file.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temp_file.replace(EXECUTION_SEEN_FILE)
+    if not isinstance(data, dict):
+        raise ValueError("EXECUTION_SEEN_STATE_INVALID")
+    if not write_json_atomically(EXECUTION_SEEN_FILE, data):
+        raise OSError("EXECUTION_SEEN_STATE_PERSISTENCE_ERROR")
 
 
 _BROKER_EXECUTION_STATE_VALUES = {
@@ -291,24 +297,27 @@ def find_falcon_pending_broker_states(limit: int = 32) -> Dict[str, Any]:
         bounded_limit = 32
     try:
         with _SEEN_LOCK:
-            if not EXECUTION_SEEN_FILE.exists():
-                return {
-                    "ok": True,
-                    "status": "FALCON_ENGINE_BROKER_LEDGER_EMPTY",
-                    "pending": [],
-                    "pending_count": 0,
-                    "read_bounded": True,
-                }
-            size = EXECUTION_SEEN_FILE.stat().st_size
-            if size > _FALCON_BROKER_STATE_SCAN_MAX_BYTES:
+            if not paper_data_mount_verified(EXECUTION_SEEN_FILE):
                 return {
                     "ok": False,
-                    "status": "FALCON_ENGINE_BROKER_LEDGER_SIZE_LIMIT_EXCEEDED",
+                    "status": "FALCON_ENGINE_BROKER_LEDGER_MOUNT_NOT_VERIFIED",
                     "pending": [],
                     "pending_count": None,
                     "read_bounded": True,
                 }
-            raw = EXECUTION_SEEN_FILE.read_text(encoding="utf-8")
+            if not EXECUTION_SEEN_FILE.exists():
+                return {
+                    "ok": False,
+                    "status": "FALCON_ENGINE_BROKER_LEDGER_MISSING",
+                    "pending": [],
+                    "pending_count": None,
+                    "read_bounded": True,
+                }
+            raw = read_paper_text(
+                EXECUTION_SEEN_FILE,
+                encoding="utf-8",
+                max_bytes=_FALCON_BROKER_STATE_SCAN_MAX_BYTES,
+            )
             seen = json.loads(raw)
         if not isinstance(seen, dict):
             return {
@@ -381,8 +390,15 @@ def find_falcon_pending_broker_states(limit: int = 32) -> Dict[str, Any]:
 
 
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    if not paper_data_mount_verified(path):
+        raise OSError("EXECUTION_ORCHESTRATOR_DATA_MOUNT_NOT_VERIFIED")
+    if not ensure_paper_data_dir(path.parent):
+        raise OSError("EXECUTION_ORCHESTRATOR_DATA_DIR_NOT_READY")
+    append_paper_text(
+        path,
+        json.dumps(payload, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -623,20 +639,26 @@ def orchestrate_execution(
     idem_key = plan["idempotency_key"]
     legacy_idem_key = plan.get("legacy_idempotency_key")
 
-    with _SEEN_LOCK:
-        seen = _load_seen()
-        previous_key = None
-        if idem_key in seen:
-            previous_key = idem_key
-        elif legacy_idem_key and legacy_idem_key in seen:
-            previous_key = legacy_idem_key
+    try:
+        with _SEEN_LOCK:
+            seen = _load_seen()
+            previous_key = None
+            if idem_key in seen:
+                previous_key = idem_key
+            elif legacy_idem_key and legacy_idem_key in seen:
+                previous_key = legacy_idem_key
 
-        if previous_key:
-            plan["ok"] = False
-            plan["status"] = "DUPLICATE_BLOCKED"
-            plan["errors"].append("intenção idempotente já registrada")
-            plan["previous_seen_at"] = (seen.get(previous_key) or {}).get("seen_at")
-            plan["previous_idempotency_key"] = previous_key
+            if previous_key:
+                plan["ok"] = False
+                plan["status"] = "DUPLICATE_BLOCKED"
+                plan["errors"].append("intenção idempotente já registrada")
+                plan["previous_seen_at"] = (seen.get(previous_key) or {}).get("seen_at")
+                plan["previous_idempotency_key"] = previous_key
+    except Exception as exc:
+        plan["ok"] = False
+        plan["status"] = "EXECUTION_SEEN_STATE_UNAVAILABLE"
+        plan["errors"].append(type(exc).__name__)
+        return {"ok": False, "payload": plan}
 
     execution_origin = payload.get("_execution_attempt_audit_v1") if isinstance(payload.get("_execution_attempt_audit_v1"), dict) else {}
     event = {
@@ -663,25 +685,31 @@ def orchestrate_execution(
     if plan["status"] == "READY_FOR_EXECUTION":
         plan["idempotency_reserved"] = not dry_run
         if not dry_run:
-            with _SEEN_LOCK:
-                seen = _load_seen()
-                # Revalida dentro do lock para reduzir corrida entre threads.
-                if idem_key in seen or (legacy_idem_key and legacy_idem_key in seen):
-                    plan["ok"] = False
-                    plan["status"] = "DUPLICATE_BLOCKED"
-                    plan["errors"].append("intenção idempotente registrada por chamada concorrente")
-                else:
-                    seen[idem_key] = {
-                        "seen_at": _now_br(),
-                        "symbol": plan["payload"].get("symbol"),
-                        "side": plan["payload"].get("side"),
-                        "bot": plan["payload"].get("bot"),
-                        "setup": plan["payload"].get("setup"),
-                        "mode": plan["mode"],
-                        "identity": plan.get("identity"),
-                        "legacy_idempotency_key": legacy_idem_key,
-                    }
-                    _save_seen(seen)
+            try:
+                with _SEEN_LOCK:
+                    seen = _load_seen()
+                    # Revalida dentro do lock para reduzir corrida entre threads.
+                    if idem_key in seen or (legacy_idem_key and legacy_idem_key in seen):
+                        plan["ok"] = False
+                        plan["status"] = "DUPLICATE_BLOCKED"
+                        plan["errors"].append("intenção idempotente registrada por chamada concorrente")
+                    else:
+                        seen[idem_key] = {
+                            "seen_at": _now_br(),
+                            "symbol": plan["payload"].get("symbol"),
+                            "side": plan["payload"].get("side"),
+                            "bot": plan["payload"].get("bot"),
+                            "setup": plan["payload"].get("setup"),
+                            "mode": plan["mode"],
+                            "identity": plan.get("identity"),
+                            "legacy_idempotency_key": legacy_idem_key,
+                        }
+                        _save_seen(seen)
+            except Exception as exc:
+                plan["ok"] = False
+                plan["status"] = "EXECUTION_SEEN_STATE_PERSISTENCE_ERROR"
+                plan["errors"].append(type(exc).__name__)
+                plan["idempotency_reserved"] = False
     else:
         plan["idempotency_reserved"] = False
 
@@ -692,7 +720,19 @@ def orchestrate_execution(
 
 
 def execution_health() -> Dict[str, Any]:
-    seen = _load_seen()
+    try:
+        seen = _load_seen()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "module": "execution_orchestrator",
+            "loaded": True,
+            "version": VERSION,
+            "generated_at": _now_br(),
+            "status": "EXECUTION_SEEN_STATE_UNAVAILABLE",
+            "error_type": type(exc).__name__,
+            "seen_count": None,
+        }
 
     return {
         "ok": True,
@@ -724,7 +764,7 @@ def read_execution_log(limit: int = 20) -> Dict[str, Any]:
             "count": 0,
         }
 
-    lines = EXECUTION_LOG_FILE.read_text(encoding="utf-8").splitlines()
+    lines = read_paper_text(EXECUTION_LOG_FILE, encoding="utf-8").splitlines()
     selected = lines[-max(1, int(limit)):]
 
     items = []
