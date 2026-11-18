@@ -82,3 +82,13 @@ def test_trade_close_outcome_state_io_uses_guarded_storage_only():
     event_writer = _called_names(functions["_tco_v1_append_event"])
     assert "_append_central_paper_audit_event" in event_writer
     assert not {"mkdir", "open"}.intersection(event_writer)
+
+    mode_json_writer = _called_names(functions["_rms_v1_atomic_write_json"])
+    assert "_write_central_paper_audit_json" in mode_json_writer
+    assert not {"mkdir", "write_text", "write_bytes", "open", "replace"}.intersection(
+        mode_json_writer
+    )
+
+    mode_event_writer = _called_names(functions["_rms_v1_append_event"])
+    assert "_append_central_paper_audit_event" in mode_event_writer
+    assert not {"mkdir", "open"}.intersection(mode_event_writer)

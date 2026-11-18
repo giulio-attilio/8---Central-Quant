@@ -12151,18 +12151,18 @@ def _rms_v1_row(key, trade, bucket):
 
 
 def _rms_v1_atomic_write_json(path, payload):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    tmp.replace(path)
+    _write_central_paper_audit_json(
+        path,
+        payload,
+    )
 
 
 def _rms_v1_append_event(payload):
     try:
-        REGISTRY_MODE_SEGREGATION_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(REGISTRY_MODE_SEGREGATION_V1_EVENTS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        _append_central_paper_audit_event(
+            REGISTRY_MODE_SEGREGATION_V1_EVENTS_FILE,
+            json.dumps(payload, ensure_ascii=False, default=str) + "\n",
+        )
         return True
     except Exception:
         return False
