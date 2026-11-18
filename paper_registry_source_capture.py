@@ -226,7 +226,7 @@ def capture_paper_registry_sources(
     source = _source_snapshot(redis_client)
     try:
         preview = preview_paper_registry_sources(registry, source)
-    except (TypeError, ValueError) as exc:
+    except Exception as exc:
         return {
             "ok": False,
             "status": "SOURCE_SNAPSHOT_INVALID",

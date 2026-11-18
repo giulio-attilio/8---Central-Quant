@@ -437,6 +437,30 @@ def test_unclassified_preview_exception_never_echoes_exception_text(monkeypatch,
     assert private_marker not in serialized
 
 
+def test_unexpected_preview_exception_is_sanitized_and_fails_closed(monkeypatch, tmp_path):
+    registry = _registry(tmp_path / "trade_registry.json")
+    private_marker = "private-unexpected-preview-error"
+    redis = FakeRedis()
+
+    def fail_preview(_registry, _source):
+        raise RuntimeError(private_marker)
+
+    monkeypatch.setattr(
+        paper_registry_source_capture,
+        "preview_paper_registry_sources",
+        fail_preview,
+    )
+
+    report = capture_paper_registry_sources(redis_client=redis, registry_path=registry)
+
+    serialized = json.dumps(report)
+    assert report["status"] == "SOURCE_SNAPSHOT_INVALID"
+    assert report["validation_error_code"] == "UNCLASSIFIED_PREVIEW_ERROR"
+    assert report["all_rows_ineligible_for_import"] is True
+    assert report["writes_performed"] is False
+    assert private_marker not in serialized
+
+
 def test_cli_does_not_read_upstash_without_explicit_flag(monkeypatch, capsys):
     def unexpected_read(**_kwargs):
         raise AssertionError("Upstash must not be contacted without --read-upstash")
