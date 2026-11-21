@@ -143,3 +143,10 @@ operacionais atuais.
   de preview, 20 de captura e 892 da seleção ampliada (1 ignorado, 604,80 s).
   Isso torna `bbd9511` o rollback de código conhecido para esse patch. O branch
   permanece local, sem push ou deploy.
+- Revisão adicional da autenticação no Live `bbd9511`: o gate global retorna
+  503 se o usuário/senha não estiverem configurados; credenciais ausentes ou
+  incorretas não liberam rotas. Apenas GET sem query para `/healthz` é isento
+  do Basic Auth, com resposta mínima de liveness. Runner offline
+  `--personal-http-auth`: 243 testes passaram. Não foram lidos valores de
+  credenciais; a presença atual das variáveis no Render continua sem
+  verificação, então a evidência local não comprova a configuração de runtime.
