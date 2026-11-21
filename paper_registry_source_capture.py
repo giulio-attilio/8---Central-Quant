@@ -19,7 +19,10 @@ from pathlib import Path
 from typing import Any
 
 from paper_state_storage import open_paper_binary, paper_data_mount_verified
-from paper_registry_source_preview import preview_paper_registry_sources
+from paper_registry_source_preview import (
+    preview_paper_registry_sources,
+    source_snapshot_structure_diagnostics,
+)
 
 
 _BOT_KEYS = (
@@ -227,11 +230,16 @@ def capture_paper_registry_sources(
     try:
         preview = preview_paper_registry_sources(registry, source)
     except Exception as exc:
+        try:
+            source_diagnostics = source_snapshot_structure_diagnostics(source)
+        except Exception:
+            source_diagnostics = {"record_count": 0, "by_bot": {}}
         return {
             "ok": False,
             "status": "SOURCE_SNAPSHOT_INVALID",
             "validation_error_code": _safe_preview_error_code(exc),
             "source_status_by_bot": source["source_status_by_bot"],
+            "source_diagnostics": source_diagnostics,
             "all_rows_ineligible_for_import": True,
             "writes_performed": False,
         }

@@ -93,6 +93,64 @@ def test_signal_id_match_is_review_only_and_never_import_eligible():
     assert "private-position" not in json.dumps(report)
 
 
+def test_signal_id_match_with_execution_mode_conflict_stays_review_only():
+    registry = _registry({
+        "bot": "FALCON", "signal_id": "private-signal-1",
+        "execution_mode": "PAPER",
+    })
+    sources = _source_snapshot({
+        "FALCON": {
+            "private-position": {
+                "signal_id": "private-signal-1",
+                "execution_mode": "REAL",
+            },
+        },
+    })
+
+    report = preview_paper_registry_sources(registry, sources)
+
+    row = report["rows"][0]
+    assert row["status"] == "SIGNAL_ID_REVIEW_ONLY"
+    assert row["mode_status"] == "MODE_CONFLICT"
+    assert row["eligible_for_import"] is False
+    assert report["source_reconciliation_counts"]["unique_review_only_match_open"] == 1
+    assert report["all_rows_ineligible_for_import"] is True
+    rendered = json.dumps(report)
+    assert "private-signal-1" not in rendered
+    assert "private-position" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("bot", "display_name"),
+    (
+        ("FALCON", "Falcon Strike ORB PRO"),
+        ("TURTLE", "Turtle Breakout PRO 2.0"),
+    ),
+)
+def test_known_bot_display_name_matches_canonical_source_key_review_only(bot, display_name):
+    registry = _registry({"bot": display_name, "signal_id": "private-signal-1"})
+    sources = _source_snapshot({
+        bot: {
+            "private-position": {
+                "bot": display_name,
+                "signal_id": "private-signal-1",
+            },
+        },
+    })
+
+    report = preview_paper_registry_sources(registry, sources)
+
+    row = report["rows"][0]
+    assert row["status"] == "SIGNAL_ID_REVIEW_ONLY"
+    assert row["eligible_for_import"] is False
+    assert report["source_reconciliation_counts"]["unique_review_only_match_open"] == 1
+    assert report["all_rows_ineligible_for_import"] is True
+    rendered = json.dumps(report)
+    assert display_name not in rendered
+    assert "private-signal-1" not in rendered
+    assert "private-position" not in rendered
+
+
 def test_signal_id_review_match_uses_shared_fields_without_import_promotion():
     registry = _registry({
         "bot": "FALCON", "signal_id": "private-signal-1",

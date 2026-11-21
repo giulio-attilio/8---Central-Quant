@@ -61,6 +61,13 @@ _EXECUTION_MODE_ALIASES = ("execution_mode",)
 _REGISTRY_MODE_ALIASES = ("registry_mode",)
 _REGISTRY_MODE_CLAIMS = frozenset({"PAPER", "REAL", "VERIFY", "SYNC_ONLY", "UNKNOWN"})
 _EXPECTED_SOURCE_BOTS = ("COBRA", "DONKEY", "FALCON", "MEME", "PREDATOR", "TRENDPRO", "TURTLE")
+_BOT_DISPLAY_ALIASES = {
+    "DONKEY": ("Donkey H4",),
+    "FALCON": ("Falcon Strike ORB PRO",),
+    "PREDATOR": ("Smart Predator",),
+    "TRENDPRO": ("Trend PRO Elite",),
+    "TURTLE": ("Turtle Breakout PRO 2.0",),
+}
 _SOURCE_CLOSE_MARKER_ALIASES = ("closed_at", "closed_datetime", "closed_reason", "closed_price")
 # These are counted for operator review only. A signal ID identifies a signal,
 # and the V2 register idempotency key identifies a registration/replay event;
@@ -119,8 +126,21 @@ def _values(row: Mapping[str, Any], aliases: tuple[str, ...], *, flatten: bool =
     return tuple(found)
 
 
+def _canonical_bot_name(value: str) -> str:
+    normalized = str(value).strip().upper()
+    for canonical, display_aliases in _BOT_DISPLAY_ALIASES.items():
+        if normalized == canonical or normalized in {
+            alias.upper() for alias in display_aliases
+        }:
+            return canonical
+    return normalized
+
+
 def _single_alias_value(row: Mapping[str, Any], aliases: tuple[str, ...], *, canonical: bool = False) -> str | None:
     values = _values(row, aliases)
+    if canonical and aliases == _COMPOSITE_ALIASES["bot"]:
+        normalized = {_canonical_bot_name(value) for value in values}
+        return next(iter(normalized)) if len(normalized) == 1 else None
     if len(values) != 1:
         return None
     value = values[0]
@@ -213,7 +233,11 @@ def _identity_alias_conflict(row: Mapping[str, Any]) -> bool:
     for field, aliases in fields.items():
         if field == "fill_id":
             continue
-        if len(_values(row, aliases)) > 1:
+        values = _values(row, aliases)
+        if field == "bot":
+            if len({_canonical_bot_name(value) for value in values}) > 1:
+                return True
+        elif len(values) > 1:
             return True
     return False
 
@@ -322,7 +346,10 @@ def _source_rows(source_snapshot: Mapping[str, Any]) -> list[tuple[str, str, str
             declared_bot = _single_alias_value(position, _COMPOSITE_ALIASES["bot"], canonical=True)
             if declared_bot and declared_bot != bot:
                 raise ValueError("source_bot_key_conflict")
-            if len(_values(position, _COMPOSITE_ALIASES["bot"])) > 1:
+            if len({
+                _canonical_bot_name(value)
+                for value in _values(position, _COMPOSITE_ALIASES["bot"])
+            }) > 1:
                 raise ValueError("source_bot_alias_conflict")
             index += 1
             ref = f"source-{index:04d}-{_json_digest(position)}"
@@ -370,6 +397,77 @@ def _source_diagnostics(
             },
         }
     return {"by_bot": by_bot, "record_count": len(sources)}
+
+
+def source_snapshot_structure_diagnostics(source_snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Return fixed-field counts even when strict source validation fails.
+
+    This diagnostic intentionally does not reconcile records. It exists so a
+    malformed or bot-key-conflicting snapshot can be investigated without
+    echoing arbitrary labels, identifiers, status values, or payloads.
+    """
+    positions_by_bot = source_snapshot.get("positions_by_bot")
+    source_statuses = source_snapshot.get("source_status_by_bot")
+    if not isinstance(positions_by_bot, Mapping) or not isinstance(source_statuses, Mapping):
+        return {"record_count": 0, "by_bot": {}}
+
+    by_bot: dict[str, Any] = {}
+    total_records = 0
+    for bot in _EXPECTED_SOURCE_BOTS:
+        raw_positions = positions_by_bot.get(bot)
+        if isinstance(raw_positions, Mapping):
+            rows = list(raw_positions.values())
+        elif isinstance(raw_positions, list):
+            rows = raw_positions
+        else:
+            rows = []
+
+        counts = Counter({
+            "bot_field_present_records": 0,
+            "bot_field_missing_records": 0,
+            "canonical_bot_match_records": 0,
+            "known_display_name_match_records": 0,
+            "other_bot_label_records": 0,
+            "bot_alias_conflict_records": 0,
+            "invalid_row_records": 0,
+        })
+        identity_presence = Counter()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                counts["invalid_row_records"] += 1
+                continue
+            values = _values(row, _COMPOSITE_ALIASES["bot"])
+            normalized = {_canonical_bot_name(value) for value in values}
+            if values:
+                counts["bot_field_present_records"] += 1
+                if len(normalized) > 1:
+                    counts["bot_alias_conflict_records"] += 1
+                elif normalized == {bot}:
+                    raw_values = {value.upper() for value in values}
+                    if bot in raw_values:
+                        counts["canonical_bot_match_records"] += 1
+                    else:
+                        counts["known_display_name_match_records"] += 1
+                else:
+                    counts["other_bot_label_records"] += 1
+            else:
+                counts["bot_field_missing_records"] += 1
+            for field, aliases in _SOURCE_DIAGNOSTIC_ID_FIELDS.items():
+                if _values(row, aliases, flatten=field == "fill_id"):
+                    identity_presence[field] += 1
+
+        total_records += len(rows)
+        by_bot[bot] = {
+            "source_status": str(source_statuses.get(bot, "<UNSET>")).upper()
+            if str(source_statuses.get(bot, "<UNSET>")).upper() in {
+                "OK", "KEY_MISSING", "READ_FAILED", "INVALID_JSON", "INVALID_SHAPE"
+            }
+            else "INVALID_STATUS",
+            "record_count": len(rows),
+            **dict(counts),
+            "identity_field_presence_counts": dict(sorted(identity_presence.items())),
+        }
+    return {"record_count": total_records, "by_bot": by_bot}
 
 
 def preview_paper_registry_sources(

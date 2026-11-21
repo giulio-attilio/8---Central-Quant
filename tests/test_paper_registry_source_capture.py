@@ -415,6 +415,52 @@ def test_invalid_source_row_exposes_only_fixed_error_code(tmp_path):
     assert "legacy-position-key" not in serialized
 
 
+def test_bot_key_conflict_includes_sanitized_source_structure_counts(tmp_path):
+    registry = _registry(tmp_path / "trade_registry.json")
+    private_label = "private-bot-label-must-not-escape"
+    private_locator = "private-source-locator-must-not-escape"
+    private_signal_id = "private-signal-id-must-not-escape"
+    private_display_locator = "private-display-locator-must-not-escape"
+    values = _source_values()
+    values[2] = json.dumps({
+        private_locator: {"bot": private_label, "signal_id": private_signal_id},
+        "second-private-locator": {"signal_id": "second-private-signal"},
+        private_display_locator: {
+            "bot": "Falcon Strike ORB PRO",
+            "signal_id": "third-private-signal",
+        },
+    })
+    redis = FakeRedis(values=values)
+
+    report = capture_paper_registry_sources(redis_client=redis, registry_path=registry)
+    serialized = json.dumps(report)
+    diagnostics = report["source_diagnostics"]
+    falcon = diagnostics["by_bot"]["FALCON"]
+
+    assert report["ok"] is False
+    assert report["status"] == "SOURCE_SNAPSHOT_INVALID"
+    assert report["validation_error_code"] == "SOURCE_BOT_KEY_CONFLICT"
+    assert diagnostics["record_count"] == 3
+    assert falcon["record_count"] == 3
+    assert falcon["other_bot_label_records"] == 1
+    assert falcon["bot_field_missing_records"] == 1
+    assert falcon["known_display_name_match_records"] == 1
+    assert falcon["identity_field_presence_counts"] == {"signal_id": 3}
+    assert report["all_rows_ineligible_for_import"] is True
+    assert report["writes_performed"] is False
+    for private_value in (
+        private_label,
+        private_locator,
+        private_signal_id,
+        "second-private-locator",
+        "second-private-signal",
+        private_display_locator,
+        "third-private-signal",
+        "Falcon Strike ORB PRO",
+    ):
+        assert private_value not in serialized
+
+
 def test_unclassified_preview_exception_never_echoes_exception_text(monkeypatch, tmp_path):
     registry = _registry(tmp_path / "trade_registry.json")
     private_marker = "private-exception-payload"
