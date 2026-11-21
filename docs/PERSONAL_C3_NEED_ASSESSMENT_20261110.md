@@ -130,3 +130,16 @@ operacionais atuais.
   explícita de liberação. Não apagar o latch manualmente nem criar ledgers
   vazios: primeiro é necessário um procedimento auditável após reconciliação
   comprovada.
+- Uma captura somente leitura anteriormente fornecida pelo operador retornou
+  `SOURCE_SNAPSHOT_INVALID` / `SOURCE_BOT_KEY_CONFLICT` para Falcon. A checagem
+  sanitizada indicou dois rótulos `bot` fora do nome canônico, do `BOT_NAME`
+  efetivo e do nome padrão do código. `BOT_NAME` pode ser sobrescrito no
+  ambiente; não é seguro inferir nem adicionar alias para o valor desconhecido.
+  Enquanto esse conflito não for explicado, o novo matching por `signal_id`
+  não poderá produzir evidência operacional de reconciliação.
+- O patch isolado foi transplantado sem reescrever histórico para o branch
+  `codex/signal-id-preview-20261121`, sobre o Live `bbd9511`; commit local
+  `71ba7a3d789b25aa09605ff383d71b82203ac16a`. Nesse branch passaram 43 testes
+  de preview, 20 de captura e 892 da seleção ampliada (1 ignorado, 604,80 s).
+  Isso torna `bbd9511` o rollback de código conhecido para esse patch. O branch
+  permanece local, sem push ou deploy.
