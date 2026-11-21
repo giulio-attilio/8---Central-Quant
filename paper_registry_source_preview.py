@@ -41,9 +41,12 @@ _IDENTITY_ALIASES = {
     # TRENDPRO snapshots call this legacy logical Registry identifier
     # ``registry_trade_id``. It is review-only, never strong lifecycle proof.
     "trade_id": ("trade_id", "trade_registry_id", "registry_trade_id", "logical_trade_id"),
+    # A signal identifies an originating market event, not an executed
+    # position/order lifecycle. It may support a sanitized review match only.
+    "signal_id": ("signal_id",),
     "source_position_id": ("source_position_id", "position_id", "positionId", "id"),
 }
-_REVIEW_ID_FIELDS = ("trade_id", "source_position_id")
+_REVIEW_ID_FIELDS = ("trade_id", "signal_id", "source_position_id")
 _STRONG_FIELDS = tuple(name for name in _IDENTITY_ALIASES if name not in _REVIEW_ID_FIELDS)
 _COMPOSITE_FIELDS = ("bot", "symbol", "side", "setup", "entry_time", "entry_price")
 _COMPOSITE_ALIASES = {
@@ -187,6 +190,22 @@ def _source_review_ids(row: Mapping[str, Any], bot: str) -> tuple[tuple[str, str
         return stored
     derived = _derive_donkey_logical_trade_id(row, bot)
     return (("trade_id", derived),) if derived else ()
+
+
+def _ambiguous_review_status(fields: set[str]) -> str:
+    if fields == {"source_position_id"}:
+        return "AMBIGUOUS_POSITION_ID"
+    if fields == {"signal_id"}:
+        return "AMBIGUOUS_SIGNAL_ID"
+    return "AMBIGUOUS_LOGICAL_ID"
+
+
+def _missing_review_status(fields: set[str]) -> str:
+    if fields == {"source_position_id"}:
+        return "POSITION_ID_NOT_FOUND"
+    if fields == {"signal_id"}:
+        return "SIGNAL_ID_NOT_FOUND"
+    return "LOGICAL_ID_NOT_FOUND"
 
 
 def _identity_alias_conflict(row: Mapping[str, Any]) -> bool:
@@ -374,6 +393,7 @@ def preview_paper_registry_sources(
     registry_by_strong: dict[tuple[str, str, str], list[int]] = defaultdict(list)
     source_by_review_id: dict[tuple[str, str, str], list[int]] = defaultdict(list)
     registry_by_review_id: dict[tuple[str, str, str], list[int]] = defaultdict(list)
+    source_review_fields: set[tuple[str, str]] = set()
     source_by_composite: dict[tuple[str, ...], list[int]] = defaultdict(list)
     registry_by_composite: dict[tuple[str, ...], list[int]] = defaultdict(list)
 
@@ -382,6 +402,7 @@ def preview_paper_registry_sources(
             source_by_strong[(bot, field, value)].append(index)
         for field, value in _source_review_ids(row, bot):
             source_by_review_id[(bot, field, value)].append(index)
+            source_review_fields.add((bot, field))
         key = _composite_key(row, bot)
         if key:
             source_by_composite[key].append(index)
@@ -462,9 +483,14 @@ def preview_paper_registry_sources(
                 status = "STRONG_ID_NOT_FOUND"
         else:
             review_ids = registry_review_ids[index]
+            shared_review_ids = [
+                (field, value)
+                for field, value in review_ids
+                if (bot, field) in source_review_fields
+            ]
             review_candidates = [
                 set(source_by_review_id.get((bot, field, value), ()))
-                for field, value in review_ids
+                for field, value in shared_review_ids
             ]
             any_review_id_found = any(review_candidates)
             common_review_candidates = (
@@ -472,12 +498,12 @@ def preview_paper_registry_sources(
             )
             for matches in review_candidates:
                 candidate_source_indexes.update(matches)
-            review_fields = {field for field, _ in review_ids}
-            if review_ids and len(common_review_candidates) == 1:
+            review_fields = {field for field, _ in shared_review_ids}
+            if shared_review_ids and len(common_review_candidates) == 1:
                 candidate = next(iter(common_review_candidates))
                 reverse_indexes = {
                     other
-                    for field, value in review_ids
+                    for field, value in shared_review_ids
                     for other in registry_by_review_id.get((bot, field, value), ())
                 }
                 if _identity_alias_conflict(sources[candidate][3]):
@@ -485,31 +511,21 @@ def preview_paper_registry_sources(
                 elif len(reverse_indexes) == 1:
                     if review_fields == {"trade_id"}:
                         status = "LOGICAL_ID_REVIEW_ONLY"
+                    elif review_fields == {"signal_id"}:
+                        status = "SIGNAL_ID_REVIEW_ONLY"
                     elif review_fields == {"source_position_id"}:
                         status = "POSITION_ID_REVIEW_ONLY"
                     else:
                         status = "REVIEW_IDENTITY_REVIEW_ONLY"
                     source_index = candidate
                 else:
-                    status = (
-                        "AMBIGUOUS_POSITION_ID"
-                        if review_fields == {"source_position_id"}
-                        else "AMBIGUOUS_LOGICAL_ID"
-                    )
-            elif review_ids and len(common_review_candidates) > 1:
-                status = (
-                    "AMBIGUOUS_POSITION_ID"
-                    if review_fields == {"source_position_id"}
-                    else "AMBIGUOUS_LOGICAL_ID"
-                )
-            elif review_ids and any_review_id_found:
+                    status = _ambiguous_review_status(review_fields)
+            elif shared_review_ids and len(common_review_candidates) > 1:
+                status = _ambiguous_review_status(review_fields)
+            elif shared_review_ids and any_review_id_found:
                 status = "PARTIAL_REVIEW_ID_CONFLICT"
             elif review_ids:
-                status = (
-                    "POSITION_ID_NOT_FOUND"
-                    if review_fields == {"source_position_id"}
-                    else "LOGICAL_ID_NOT_FOUND"
-                )
+                status = _missing_review_status(review_fields or {field for field, _ in review_ids})
             else:
                 composite = _composite_key(row, bot)
                 source_candidates = set(source_by_composite.get(composite, ())) if composite else set()
@@ -558,6 +574,7 @@ def preview_paper_registry_sources(
     source_reconciliation_counts = Counter()
     review_only_statuses = {
         "LOGICAL_ID_REVIEW_ONLY",
+        "SIGNAL_ID_REVIEW_ONLY",
         "POSITION_ID_REVIEW_ONLY",
         "REVIEW_IDENTITY_REVIEW_ONLY",
         "COMPOSITE_REVIEW_ONLY",

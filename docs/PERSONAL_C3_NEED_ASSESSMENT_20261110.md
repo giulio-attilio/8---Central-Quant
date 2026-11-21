@@ -80,3 +80,53 @@ raiz de scanners anteriormente observados como parados. Não desligar o gate sem
 medir carga, latência, locks e impacto de escrita. Custo de futuras publicações
 não está confirmado como zero; não publicar sem verificar custo e condições
 operacionais atuais.
+
+## Atualização local — reconciliação de signal_id (2026-11-21)
+
+- No worktree candidato `cq-falcon-paper-missing-key-hotfix-20261121`, branch
+  `codex/falcon-paper-missing-key-hotfix-20261121`, HEAD base `784a570`, o
+  preview de reconciliação agora compara também `signal_id`, classificado
+  explicitamente como `SIGNAL_ID_REVIEW_ONLY`. Sinal identifica o evento que
+  originou a análise; não prova ordem, fill nem ciclo de vida de posição.
+- Para identificadores de revisão, o matcher cruza os campos presentes nos
+  dois snapshots; todos os campos em comum precisam concordar. Campos que só
+  aparecem de um lado não são tratados como prova nem como conflito. A
+  correspondência por signal continua estritamente review-only.
+- Correspondência por `signal_id` nunca torna linha elegível para importação.
+  IDs duplicados resultam em `AMBIGUOUS_SIGNAL_ID`; o relatório continua
+  sanitizado e `all_rows_ineligible_for_import=true`.
+- Evidência fornecida pelo operador antes desta alteração: duas linhas de
+  origem tinham `signal_id`; os resultados sanitizados anteriores mostraram
+  dois candidatos lógicos ambíguos. Não houve nova leitura de Upstash ou
+  Registry nesta atualização, portanto não há resultado de match por
+  `signal_id` para produção.
+- Validação após a alteração: runner offline `--paper-registry-source-preview`
+  aprovou 43 testes; `--paper-registry-source-capture` aprovou 20; `git diff
+  --check` passou. A primeira tentativa da seleção ampliada
+  `--personal-lifecycle-completeness` falhou na coleta porque o Python global
+  não tinha `ccxt`. Foi reutilizado o ambiente offline já existente
+  `cq-offline-ccxt-py314-20261106` (`ccxt 4.5.88`, `pytest 9.1.1`): a seleção
+  terminou com 892 aprovados e 1 ignorado em 568,20 s. Nenhuma dependência foi
+  baixada/instalada e o runner aplicou os bloqueios de rede.
+- O candidato ainda não foi enviado nem publicado; a instância Render não foi
+  alterada por esta atualização de código. Consulta Render MCP somente leitura
+  em 2026-11-21 confirmou `bbd9511ffb425c3df7415283d69ed35ec84a2657` como Live,
+  uma instância, plano Standard, disco persistente de 4 GB montado em `/data`,
+  auto-deploy desligado e `healthCheckPath` vazio. O candidato local continua
+  fora de produção. Métricas consultadas mostraram CPU aproximadamente
+  29–42%, memória 0,83–0,91 GiB e amostras p95 HTTP 0,21–0,46 s no intervalo
+  retornado; isso não valida a lógica PAPER.
+- Logs recentes consultados incluíram erros de timeout de 10 s do Risk Manager
+  para o serviço MEME (19–20/11/2026) e respostas HTTP 502 de probes públicos.
+  Buscas sanitizadas por `FALCON_PAPER_PERSISTENCE_RECONCILIATION_REQUIRED`,
+  `PAPER_STATE_FILES_MISSING` e `SOURCE_SNAPSHOT_INVALID` desde 18/11 não
+  retornaram linhas; ausência desses textos nos logs não valida o estado do
+  ledger nem a saúde do executor.
+  Não houve leitura de secrets nem chamada à corretora. O serviço não foi
+  alterado; controles runtime PAPER/REAL, estado do ledger e posições/ordens
+  BingX não foram verificados nesta consulta.
+- O latch de reconciliação continua fail-closed. A inspeção local encontrou
+  escrita persistente e leitura fail-closed entre reinícios, mas nenhuma rotina
+  explícita de liberação. Não apagar o latch manualmente nem criar ledgers
+  vazios: primeiro é necessário um procedimento auditável após reconciliação
+  comprovada.

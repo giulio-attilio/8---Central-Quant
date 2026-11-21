@@ -67,6 +67,99 @@ def test_duplicate_source_strong_identity_is_ambiguous():
     assert report["source_reconciliation_counts"]["ambiguous_or_conflicting_candidate"] == 2
 
 
+def test_signal_id_match_is_review_only_and_never_import_eligible():
+    registry = _registry({
+        "bot": "FALCON", "signal_id": "private-signal-1",
+        "execution_mode": "PAPER",
+    })
+    sources = _source_snapshot({
+        "FALCON": {
+            "private-position": {
+                "signal_id": "private-signal-1",
+                "execution_mode": "PAPER",
+            },
+        },
+    })
+
+    report = preview_paper_registry_sources(registry, sources)
+
+    row = report["rows"][0]
+    assert row["status"] == "SIGNAL_ID_REVIEW_ONLY"
+    assert row["mode_status"] == "PAPER_CONFIRMED_BY_BOTH_SNAPSHOTS"
+    assert row["eligible_for_import"] is False
+    assert report["source_reconciliation_counts"]["unique_review_only_match_open"] == 1
+    assert report["all_rows_ineligible_for_import"] is True
+    assert "private-signal-1" not in json.dumps(report)
+    assert "private-position" not in json.dumps(report)
+
+
+def test_signal_id_review_match_uses_shared_fields_without_import_promotion():
+    registry = _registry({
+        "bot": "FALCON", "signal_id": "private-signal-1",
+        "trade_id": "registry-only-logical-id",
+    })
+    sources = _source_snapshot({
+        "FALCON": {"private-position": {"signal_id": "private-signal-1"}},
+    })
+
+    report = preview_paper_registry_sources(registry, sources)
+
+    assert report["rows"][0]["status"] == "SIGNAL_ID_REVIEW_ONLY"
+    assert report["rows"][0]["eligible_for_import"] is False
+    assert report["source_reconciliation_counts"]["unique_review_only_match_open"] == 1
+    assert report["all_rows_ineligible_for_import"] is True
+    assert "private-signal-1" not in json.dumps(report)
+    assert "registry-only-logical-id" not in json.dumps(report)
+
+
+def test_conflicting_shared_review_ids_block_signal_id_match():
+    registry = _registry({
+        "bot": "FALCON", "signal_id": "private-signal-1",
+        "trade_id": "registry-trade-1",
+    })
+    sources = _source_snapshot({
+        "FALCON": {
+            "private-position": {
+                "signal_id": "private-signal-1",
+                "trade_registry_id": "different-trade-id",
+            },
+        },
+    })
+
+    report = preview_paper_registry_sources(registry, sources)
+
+    assert report["rows"][0]["status"] == "PARTIAL_REVIEW_ID_CONFLICT"
+    assert report["rows"][0]["eligible_for_import"] is False
+    assert report["all_rows_ineligible_for_import"] is True
+    assert "private-signal-1" not in json.dumps(report)
+    assert "different-trade-id" not in json.dumps(report)
+
+
+def test_duplicate_signal_id_match_is_ambiguous_and_not_import_eligible():
+    registry = {
+        "open_trades": {
+            "legacy-a": {"bot": "FALCON", "signal_id": "private-signal-1"},
+            "legacy-b": {"bot": "FALCON", "signal_id": "private-signal-1"},
+        },
+        "closed_trades": [],
+    }
+    sources = _source_snapshot({
+        "FALCON": {
+            "private-position": {"signal_id": "private-signal-1"},
+        },
+    })
+
+    report = preview_paper_registry_sources(registry, sources)
+
+    assert [row["status"] for row in report["rows"]] == [
+        "AMBIGUOUS_SIGNAL_ID", "AMBIGUOUS_SIGNAL_ID",
+    ]
+    assert all(row["eligible_for_import"] is False for row in report["rows"])
+    assert report["source_reconciliation_counts"]["ambiguous_or_conflicting_candidate"] == 1
+    assert report["all_rows_ineligible_for_import"] is True
+    assert "private-signal-1" not in json.dumps(report)
+
+
 def test_strong_identity_in_another_bot_is_a_conflict():
     registry = _registry({"bot": "TURTLE", "lifecycle_id": "lc-1"})
     sources = _source_snapshot({"FALCON": {"p1": {"lifecycle_id": "lc-1"}}})
