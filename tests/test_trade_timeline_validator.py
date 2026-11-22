@@ -379,19 +379,30 @@ def test_production_regression_invalid_history_and_timeline_do_not_become_error(
 def test_permission_error_remains_source_error(tmp_path, monkeypatch):
     target = tmp_path / "history_events.jsonl"
     target.write_text(json.dumps(event("SIGNAL_RECEIVED", 1)), encoding="utf-8")
-    original_open = validator_module.Path.open
+    original_open = validator_module.open_paper_binary
 
     def denied(path, *args, **kwargs):
         if path == target:
             raise PermissionError("denied for test")
         return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(validator_module.Path, "open", denied)
+    monkeypatch.setattr(validator_module, "open_paper_binary", denied)
     report = _validate_from_data_dir(tmp_path, monkeypatch)
 
     assert report["components"]["history_manager"]["status"] == "ERROR"
     assert report["components"]["history_manager"]["error_type"] == "PermissionError"
     assert any(item["component"] == "history_manager" and item["error_type"] == "PermissionError" for item in report["errors"])
+
+
+def test_render_rejects_ephemeral_timeline_source(tmp_path, monkeypatch):
+    if __import__("os").name == "nt":
+        pytest.skip("Render mount enforcement is POSIX-specific")
+    source = tmp_path / "trade_lifecycle_shadow_runtime_events.jsonl"
+    source.write_text(json.dumps(event("POSITION_OPEN", 1)) + "\n", encoding="utf-8")
+    monkeypatch.setenv("RENDER", "true")
+
+    with pytest.raises(OSError, match="PAPER_DATA_MOUNT_NOT_VERIFIED"):
+        list(validator_module._read_path(source))
 
 
 def test_jsonl_reader_limits_bytes_and_valid_lines_with_partial_coverage(tmp_path, monkeypatch):

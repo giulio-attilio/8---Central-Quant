@@ -17,13 +17,15 @@ import json
 import os
 import time
 import hashlib
+from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from paper_state_storage import append_paper_text, ensure_paper_data_dir, paper_data_mount_verified, paper_file_exists, read_paper_text, resolve_paper_data_dir, write_json_atomically
 
 VERSION = "2026-07-05-EXECUTIVE-POLICY-TIMELINE-V1"
 MODULE = "executive_policy_timeline"
 
-DATA_DIR = os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data")
+DATA_DIR = str(resolve_paper_data_dir(__file__))
 TIMELINE_FILE = os.path.join(DATA_DIR, "executive_policy_timeline.jsonl")
 TIMELINE_STATE_FILE = os.path.join(DATA_DIR, "executive_policy_timeline_state.json")
 TIMELINE_STATS_FILE = os.path.join(DATA_DIR, "executive_policy_timeline_stats.json")
@@ -43,46 +45,38 @@ def _now_br() -> str:
 
 
 def _ensure_data_dir() -> None:
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-    except Exception:
-        pass
+    if not ensure_paper_data_dir(resolve_paper_data_dir(__file__)):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED_OR_DIRECTORY_UNAVAILABLE")
 
 
 def _safe_read_json(path: str, default: Any = None) -> Any:
+    if not path or not paper_data_mount_verified(Path(path)):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
     try:
-        if not path or not os.path.exists(path):
+        if not path or not paper_file_exists(Path(path)):
             return default
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(read_paper_text(Path(path), encoding="utf-8"))
     except Exception:
         return default
 
 
 def _safe_write_json(path: str, data: Any) -> bool:
     try:
-        _ensure_data_dir()
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-        return True
+        return write_json_atomically(Path(path), data)
     except Exception:
         return False
 
 
 def _append_jsonl(path: str, payload: Dict[str, Any]) -> bool:
     try:
-        _ensure_data_dir()
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        append_paper_text(Path(path), json.dumps(payload, ensure_ascii=False) + "\n")
         return True
     except Exception:
         return False
 
 
 def _read_jsonl_tail(path: str, limit: int = 20) -> List[Dict[str, Any]]:
-    if not os.path.exists(path):
+    if not paper_file_exists(Path(path)):
         return []
     try:
         limit = max(1, min(500, int(limit)))
@@ -90,8 +84,7 @@ def _read_jsonl_tail(path: str, limit: int = 20) -> List[Dict[str, Any]]:
         limit = 20
     items: List[Dict[str, Any]] = []
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-limit:]
+        lines = read_paper_text(Path(path), encoding="utf-8").splitlines()[-limit:]
         for line in lines:
             try:
                 item = json.loads(line)

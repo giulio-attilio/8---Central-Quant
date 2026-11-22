@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 from flask import Flask, request as flask_request
+from paper_state_storage import paper_file_exists as _paper_file_exists
+from paper_state_storage import read_paper_text as _read_guarded_paper_text
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -182,6 +184,8 @@ def _main_namespace(*, local_records=None, live_result=None, registry=None):
         "Path": Path,
         "json": json,
         "re": re,
+        "_paper_file_exists": _paper_file_exists,
+        "_read_guarded_paper_text": _read_guarded_paper_text,
         "datetime": datetime,
         "timezone": timezone,
         "timedelta": timedelta,

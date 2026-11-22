@@ -21,6 +21,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
 
+from paper_state_storage import (
+    open_paper_binary,
+    paper_file_stat,
+    resolve_paper_data_dir,
+)
+
 
 VERSION = "1.0.0-SHADOW"
 SCHEMA_VERSION = "1.0"
@@ -200,12 +206,16 @@ class TradeLifecycleShadowObservability:
     ) -> None:
         configured = os.getenv(ENV_ENABLED, "false").strip().lower() in _TRUE
         self.enabled = configured if enabled is None else bool(enabled)
-        root = Path(data_dir) if data_dir is not None else Path(
-            os.getenv("TRADE_LIFECYCLE_SHADOW_DATA_DIR")
-            or os.getenv("CENTRAL_DATA_DIR")
-            or Path(__file__).resolve().parent / "data"
+        configured_root = (
+            Path(data_dir)
+            if data_dir is not None
+            else Path(os.getenv("TRADE_LIFECYCLE_SHADOW_DATA_DIR"))
+            if os.getenv("TRADE_LIFECYCLE_SHADOW_DATA_DIR")
+            else resolve_paper_data_dir(__file__)
         )
-        self.data_dir = root.resolve(strict=False)
+        # Keep the lexical path: resolving here would erase an intermediate
+        # symlink before paper_state_storage can reject it under Render /data.
+        self.data_dir = Path(os.path.abspath(os.fspath(configured_root)))
         self.events_file = self.data_dir / "trade_lifecycle_shadow_runtime_events.jsonl"
         self.divergences_file = self.data_dir / "trade_lifecycle_shadow_runtime_divergences.jsonl"
         self.state_file = self.data_dir / "trade_lifecycle_shadow_runtime_state.json"
@@ -260,11 +270,10 @@ class TradeLifecycleShadowObservability:
 
     @staticmethod
     def _file_meta(path: Path) -> Dict[str, Any]:
-        if not path.exists():
+        try:
+            stat = paper_file_stat(path)
+        except FileNotFoundError:
             return {"exists": False, "size": 0, "mtime_ns": None, "identity": None}
-        if not path.is_file():
-            raise OSError("evidence source is not a regular file")
-        stat = path.stat()
         identity_material = f"{getattr(stat, 'st_dev', 0)}:{getattr(stat, 'st_ino', 0)}"
         return {
             "exists": True,
@@ -288,11 +297,11 @@ class TradeLifecycleShadowObservability:
         self._record(cache_misses=1)
         try:
             before = self._file_meta(self.state_file)
-            with self.state_file.open("rb") as handle:
+            with open_paper_binary(self.state_file, "rb") as handle:
                 raw = handle.read(min(MAX_LINE_BYTES, before["size"] + 1))
             after = self._file_meta(self.state_file)
             if before != after:
-                with self.state_file.open("rb") as handle:
+                with open_paper_binary(self.state_file, "rb") as handle:
                     raw = handle.read(min(MAX_LINE_BYTES, after["size"] + 1))
                 after = self._file_meta(self.state_file)
             if len(raw) > MAX_LINE_BYTES:
@@ -425,7 +434,7 @@ class TradeLifecycleShadowObservability:
             return [], None, False, stats, None
         start = max(0, end - self.max_read_bytes)
         try:
-            with path.open("rb") as handle:
+            with open_paper_binary(path, "rb") as handle:
                 handle.seek(start)
                 data = handle.read(end - start)
             stats["bytes_read"] = len(data)

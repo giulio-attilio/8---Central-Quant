@@ -358,6 +358,48 @@ def read_paper_text(
         return raw.decode(encoding)
 
 
+def read_paper_tail_lines(
+    path: Path,
+    *,
+    limit: int,
+    max_bytes: int = 6 * 1024 * 1024,
+    encoding: str = "utf-8",
+) -> list[str]:
+    """Read a bounded tail through the guarded, descriptor-anchored opener."""
+    requested = int(limit)
+    byte_limit = int(max_bytes)
+    if requested < 0:
+        raise ValueError("PAPER_TAIL_LINE_LIMIT_INVALID")
+    if byte_limit < 1:
+        raise ValueError("PAPER_TAIL_BYTE_LIMIT_INVALID")
+    if requested == 0:
+        return []
+
+    with open_paper_binary(path, "rb") as handle:
+        snapshot_size = os.fstat(handle.fileno()).st_size
+        start = max(0, snapshot_size - byte_limit)
+        handle.seek(start, os.SEEK_SET)
+        payload = handle.read(snapshot_size - start)
+        if len(payload) != snapshot_size - start:
+            raise OSError("PAPER_TAIL_SHORT_READ")
+        if os.fstat(handle.fileno()).st_size < snapshot_size:
+            raise OSError("PAPER_TAIL_SOURCE_TRUNCATED")
+
+    if start:
+        first_boundary = payload.find(b"\n")
+        if first_boundary < 0:
+            return []
+        payload = payload[first_boundary + 1 :]
+
+    raw_lines = payload.split(b"\n")
+    if raw_lines and raw_lines[-1] == b"":
+        raw_lines.pop()
+    elif raw_lines:
+        # Do not parse a JSONL record that was incomplete at the EOF snapshot.
+        raw_lines.pop()
+    return [line.decode(encoding) for line in raw_lines[-requested:]]
+
+
 def append_paper_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
     with open_paper_text(path, "a", encoding=encoding) as handle:
         handle.write(content)
@@ -402,6 +444,89 @@ def paper_file_exists(
         return True
     except FileNotFoundError:
         return False
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
+def paper_file_stat(
+    path: Path,
+    *,
+    data_root: Path = Path("/data"),
+    require_mount: bool = True,
+) -> os.stat_result:
+    """Return metadata from the same guarded descriptor used to open the file."""
+    with open_paper_binary(
+        path,
+        "rb",
+        data_root=data_root,
+        require_mount=require_mount,
+    ) as handle:
+        info = os.fstat(handle.fileno())
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError("PAPER_FILE_NOT_REGULAR")
+    return info
+
+
+def list_paper_files(
+    path: Path,
+    *,
+    suffix: str | None = None,
+    data_root: Path = Path("/data"),
+    require_mount: bool = True,
+) -> list[str]:
+    """List regular files under a guarded PAPER directory without following links."""
+    target = Path(path)
+    if require_mount and not paper_data_mount_verified(target, data_root=data_root):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
+    absolute = Path(os.path.abspath(os.fspath(target)))
+    root = Path(data_root)
+    try:
+        absolute.relative_to(root)
+    except ValueError:
+        if os.environ.get("RENDER", "").strip().lower() == "true":
+            raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
+        if not target.is_dir():
+            return []
+        names = []
+        for child in target.iterdir():
+            if child.is_symlink():
+                raise OSError("PAPER_SYMLINK_REJECTED")
+            if child.is_file() and (suffix is None or child.name.endswith(suffix)):
+                names.append(child.name)
+        return sorted(names)
+
+    if os.name == "nt":
+        if not absolute.is_dir():
+            return []
+        names = []
+        for child in absolute.iterdir():
+            if child.is_symlink():
+                raise OSError("PAPER_SYMLINK_REJECTED")
+            if child.is_file() and (suffix is None or child.name.endswith(suffix)):
+                names.append(child.name)
+        return sorted(names)
+
+    parent_fd = root_fd = -1
+    try:
+        # Opening a sentinel's parent yields an anchored descriptor for target;
+        # the sentinel itself is never created or opened.
+        parent_fd, _name, root_fd, _device, _mount_id = _open_parent_under_root(
+            absolute / ".paper-list-directory-anchor",
+            root,
+            create_parent=False,
+            require_mount=require_mount,
+        )
+        names = []
+        for name in os.listdir(parent_fd):
+            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                raise OSError("PAPER_SYMLINK_REJECTED")
+            if stat.S_ISREG(info.st_mode) and (suffix is None or name.endswith(suffix)):
+                names.append(name)
+        return sorted(names)
     finally:
         if parent_fd >= 0:
             os.close(parent_fd)
@@ -608,9 +733,9 @@ def read_paper_positions_state(path: Path):
     target = Path(path)
     if not paper_data_mount_verified(target):
         return None, "PAPER_DATA_MOUNT_NOT_VERIFIED"
-    if not target.is_file():
-        return None, "PAPER_STATE_FILES_MISSING"
     try:
+        if not paper_file_exists(target):
+            return None, "PAPER_STATE_FILES_MISSING"
         positions = json.loads(read_paper_text(target, encoding="utf-8"))
     except Exception:
         return None, "PAPER_STATE_FILES_INVALID"

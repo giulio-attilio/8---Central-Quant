@@ -40,14 +40,16 @@ import os
 import time
 import traceback
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from paper_state_storage import append_paper_text, ensure_paper_data_dir, paper_data_mount_verified, paper_file_exists, read_paper_text, resolve_paper_data_dir, write_json_atomically
 
 
 VERSION = "2026-07-04-EXECUTIVE-POLICY-AUTO-RELEASE-V1"
 MODULE = "executive_policy_auto_release"
 
-DATA_DIR = os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data")
+DATA_DIR = str(resolve_paper_data_dir(__file__))
 POLICY_STATE_FILE = os.path.join(DATA_DIR, "executive_policy_state.json")
 POLICY_LOG_FILE = os.path.join(DATA_DIR, "executive_policy_log.jsonl")
 AUTO_RELEASE_LOG_FILE = os.path.join(DATA_DIR, "executive_policy_auto_release_log.jsonl")
@@ -129,15 +131,17 @@ def _now_br() -> str:
 
 
 def _ensure_data_dir() -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
+    if not ensure_paper_data_dir(resolve_paper_data_dir(__file__)):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED_OR_DIRECTORY_UNAVAILABLE")
 
 
 def _safe_read_json(path: str, default: Any) -> Any:
+    if not path or not paper_data_mount_verified(Path(path)):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
     try:
-        if not path or not os.path.exists(path):
+        if not path or not paper_file_exists(Path(path)):
             return default
-        with open(path, "r", encoding="utf-8") as f:
-            raw = f.read().strip()
+        raw = read_paper_text(Path(path), encoding="utf-8").strip()
         if not raw:
             return default
         return json.loads(raw)
@@ -146,23 +150,25 @@ def _safe_read_json(path: str, default: Any) -> Any:
 
 
 def _safe_write_json(path: str, payload: Any) -> None:
-    _ensure_data_dir()
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
-    os.replace(tmp, path)
+    serializable = json.loads(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    if not write_json_atomically(Path(path), serializable):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED_OR_WRITE_FAILED")
 
 
 def _append_jsonl(path: str, payload: Dict[str, Any]) -> None:
-    _ensure_data_dir()
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    append_paper_text(
+        Path(path),
+        json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+    )
 
 
 def _find_policy_state_file() -> str:
     for path in POLICY_STATE_CANDIDATES:
-        if os.path.exists(path):
-            return path
+        try:
+            if paper_file_exists(Path(path)):
+                return path
+        except OSError:
+            continue
     return POLICY_STATE_FILE
 
 

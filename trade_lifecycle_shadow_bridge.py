@@ -18,6 +18,13 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 import trade_lifecycle_manager as _manager
+from paper_state_storage import (
+    append_paper_text,
+    ensure_paper_data_dir,
+    paper_file_exists,
+    read_paper_text,
+    resolve_paper_data_dir,
+)
 
 
 VERSION = "3.1.0-SHADOW-BRIDGE"
@@ -70,8 +77,7 @@ def _dead_letters_enabled() -> bool:
 
 def _data_dir() -> Path:
     configured = os.environ.get("TRADE_LIFECYCLE_SHADOW_DATA_DIR")
-    fallback = os.environ.get("CENTRAL_DATA_DIR")
-    return Path(configured or fallback or (Path(__file__).resolve().parent / "data"))
+    return Path(configured) if configured else resolve_paper_data_dir(__file__)
 
 
 def _storage_paths() -> Tuple[Path, Path]:
@@ -139,9 +145,13 @@ def _set_error(message: str) -> None:
 
 def _append(path: Path, record: Mapping[str, Any]) -> Optional[str]:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(_safe(record), ensure_ascii=False) + "\n")
+        if not ensure_paper_data_dir(Path(path).parent):
+            raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
+        append_paper_text(
+            path,
+            json.dumps(_safe(record), ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
         return None
     except (OSError, TypeError, ValueError) as exc:
         message = f"persistence_error: {exc}"
@@ -580,12 +590,15 @@ def emit_shadow_lifecycle_created(
 def _read_jsonl(path: Path, limit: int) -> Dict[str, Any]:
     if not isinstance(limit, int) or limit < 0:
         raise TypeError("limit must be a non-negative int")
-    if limit == 0 or not path.exists():
+    if limit == 0:
         return {"ok": True, "shadow_mode": True, "count": 0, "invalid_lines": 0, "items": []}
     items = []
     invalid = 0
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
+        if not paper_file_exists(path):
+            return {"ok": True, "shadow_mode": True, "count": 0, "invalid_lines": 0, "items": []}
+        content = read_paper_text(path, encoding="utf-8", max_bytes=16 * 1024 * 1024)
+        for line in content.splitlines():
             try:
                 item = json.loads(line)
                 if isinstance(item, dict):
@@ -645,9 +658,21 @@ def reset_shadow_bridge_storage(confirm: bool = False) -> Dict[str, Any]:
         raise TypeError("confirm must be bool")
     if not confirm:
         return {"ok": False, "status": "CONFIRM_REQUIRED", "reset": False, "shadow_mode": True, "operational_impact": False}
+    paths = _storage_paths()
+    if os.environ.get("RENDER", "").strip().lower() == "true" or any(
+        _path_is_persistent(path) for path in paths
+    ):
+        return {
+            "ok": False,
+            "status": "BLOCKED_PERSISTENT_STORAGE_RESET",
+            "reset": False,
+            "shadow_mode": True,
+            "operational_impact": False,
+            "errors": ["PAPER_STORAGE_DELETE_NOT_SUPPORTED"],
+        }
     errors = []
     with _lock:
-        for path in _storage_paths():
+        for path in paths:
             try:
                 if path.exists():
                     path.unlink()
@@ -667,6 +692,22 @@ def reset_shadow_bridge_storage(confirm: bool = False) -> Dict[str, Any]:
         "operational_impact": False,
         "errors": errors,
     }
+
+
+def _path_is_persistent(path: Path) -> bool:
+    """Treat lexical or resolved aliases of /data as persistent and non-deletable."""
+    root = Path("/data")
+    target = Path(os.path.abspath(os.fspath(path)))
+    try:
+        target.relative_to(root)
+        return True
+    except ValueError:
+        pass
+    try:
+        target.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 __all__ = [

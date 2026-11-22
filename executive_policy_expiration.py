@@ -19,13 +19,15 @@ import inspect
 import json
 import os
 import time
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+from paper_state_storage import append_paper_text, ensure_paper_data_dir, paper_data_mount_verified, paper_file_exists, read_paper_text, resolve_paper_data_dir, write_json_atomically
 
 VERSION = "2026-07-05-EXECUTIVE-POLICY-EXPIRATION-V1"
 MODULE = "executive_policy_expiration"
 
-DATA_DIR = os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data")
+DATA_DIR = str(resolve_paper_data_dir(__file__))
 POLICY_STATE_FILE = os.path.join(DATA_DIR, "executive_policy_state.json")
 POLICY_LOG_FILE = os.path.join(DATA_DIR, "executive_policy_log.jsonl")
 EXPIRATION_LOG_FILE = os.path.join(DATA_DIR, "executive_policy_expiration_log.jsonl")
@@ -72,18 +74,17 @@ def _now_br() -> str:
 
 
 def _ensure_data_dir() -> None:
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-    except Exception:
-        pass
+    if not ensure_paper_data_dir(resolve_paper_data_dir(__file__)):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED_OR_DIRECTORY_UNAVAILABLE")
 
 
 def _safe_read_json(path: str, default: Any = None) -> Any:
+    if not path or not paper_data_mount_verified(Path(path)):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
     try:
-        if not path or not os.path.exists(path):
+        if not path or not paper_file_exists(Path(path)):
             return default
-        with open(path, "r", encoding="utf-8") as f:
-            raw = f.read().strip()
+        raw = read_paper_text(Path(path), encoding="utf-8").strip()
         if not raw:
             return default
         return json.loads(raw)
@@ -93,21 +94,15 @@ def _safe_read_json(path: str, default: Any = None) -> Any:
 
 def _safe_write_json(path: str, payload: Any) -> bool:
     try:
-        _ensure_data_dir()
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
-        os.replace(tmp, path)
-        return True
+        serializable = json.loads(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return write_json_atomically(Path(path), serializable)
     except Exception:
         return False
 
 
 def _append_jsonl(path: str, payload: Dict[str, Any]) -> bool:
     try:
-        _ensure_data_dir()
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        append_paper_text(Path(path), json.dumps(payload, ensure_ascii=False) + "\n")
         return True
     except Exception:
         return False
@@ -606,12 +601,11 @@ def read_executive_policy_expiration_log(limit: int = 20) -> Dict[str, Any]:
         limit = max(1, min(200, int(limit)))
     except Exception:
         limit = 20
-    if not os.path.exists(EXPIRATION_LOG_FILE):
+    if not paper_file_exists(Path(EXPIRATION_LOG_FILE)):
         return {"ok": True, "items": [], "count": 0, "log_file": EXPIRATION_LOG_FILE}
     items: List[Dict[str, Any]] = []
     try:
-        with open(EXPIRATION_LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-limit:]
+        lines = read_paper_text(Path(EXPIRATION_LOG_FILE), encoding="utf-8").splitlines()[-limit:]
         for line in lines:
             try:
                 items.append(json.loads(line))

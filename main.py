@@ -104,8 +104,15 @@ os.environ["CENTRAL_DATA_DIR"] = str(CENTRAL_DATA_DIR)
 
 from paper_state_storage import (
     append_paper_text as _append_guarded_paper_text,
+    ensure_paper_data_dir as _ensure_guarded_paper_data_dir,
+    fsync_paper_directory as _fsync_guarded_paper_directory,
+    list_paper_files as _list_guarded_paper_files,
+    open_paper_binary as _open_guarded_paper_binary,
+    open_paper_text as _open_guarded_paper_text,
     paper_file_exists as _paper_file_exists,
+    paper_file_stat as _paper_file_stat,
     paper_data_mount_verified as _paper_data_mount_verified,
+    read_paper_tail_lines as _read_guarded_paper_tail_lines,
     read_paper_text as _read_guarded_paper_text,
     write_json_atomically as _write_guarded_paper_json,
 )
@@ -128,6 +135,17 @@ def _append_central_paper_audit_event(path, event_text):
     path = Path(path)
     _verify_central_paper_audit_path(path)
     _append_guarded_paper_text(path, event_text, encoding="utf-8")
+
+
+def _is_central_data_path(path):
+    """Select guarded I/O for paths lexically rooted in Central's data dir."""
+    try:
+        root = Path(os.path.abspath(os.fspath(CENTRAL_DATA_DIR)))
+        target = Path(os.path.abspath(os.fspath(path)))
+        target.relative_to(root)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
 
 # Deve permanecer antes dos imports operacionais, do Startup Disk Forensics,
 # do mkdir do data dir e de qualquer writer configurado pela Central. O módulo
@@ -1944,8 +1962,12 @@ def real_execution_config_for_bot(bot):
 def all_real_execution_configs():
     return {key: real_execution_config_for_bot(key) for key in BOT_CONFIGS.keys()} if "BOT_CONFIGS" in globals() else {}
 
-DAILY_HISTORY_DIR = BASE_DIR / "daily_history"
-DAILY_HISTORY_DIR.mkdir(exist_ok=True)
+if os.environ.get("RENDER", "").strip().lower() == "true":
+    DAILY_HISTORY_DIR = CENTRAL_DATA_DIR / "daily_history"
+    DAILY_HISTORY_DIR_READY = _ensure_guarded_paper_data_dir(DAILY_HISTORY_DIR)
+else:
+    DAILY_HISTORY_DIR = BASE_DIR / "daily_history"
+    DAILY_HISTORY_DIR.mkdir(exist_ok=True)
 
 # Persistência leve do OMS/Decision Engine da Central.
 # Não exige banco externo: grava JSONL/JSON local no Render.
@@ -1985,7 +2007,9 @@ else:
         "read_only": True,
         "error": STARTUP_DISK_FORENSICS_IMPORT_ERROR or "MODULE_UNAVAILABLE",
     }
-CENTRAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+CENTRAL_DATA_DIR_READY = _ensure_guarded_paper_data_dir(CENTRAL_DATA_DIR)
+if not CENTRAL_DATA_DIR_READY:
+    print("AVISO: diretório central de dados não verificado; persistência fail-closed")
 CENTRAL_DECISION_LOG_FILE = CENTRAL_DATA_DIR / "decision_log.jsonl"
 CENTRAL_TIMELINE_LOG_FILE = CENTRAL_DATA_DIR / "timeline.jsonl"
 CENTRAL_SHADOW_POSITIONS_FILE = CENTRAL_DATA_DIR / "shadow_positions.json"
@@ -2106,13 +2130,19 @@ def _runtime_stability_v1_json_default(value):
 
 def _runtime_stability_v1_append_event(event):
     try:
-        CENTRAL_RUNTIME_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
         payload = dict(event or {})
         payload.setdefault("version", CENTRAL_RUNTIME_STABILITY_V1_VERSION)
         payload.setdefault("generated_at", data_hora_sp_str())
         payload.setdefault("epoch", time.time())
-        with CENTRAL_RUNTIME_EVENTS_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, default=_runtime_stability_v1_json_default) + "\n")
+        _append_central_paper_audit_event(
+            CENTRAL_RUNTIME_EVENTS_FILE,
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                default=_runtime_stability_v1_json_default,
+            )
+            + "\n",
+        )
         return True
     except Exception as exc:
         print(f"ERRO RUNTIME STABILITY append: {exc}")
@@ -2121,11 +2151,15 @@ def _runtime_stability_v1_append_event(event):
 
 def _runtime_stability_v1_write_state(state):
     try:
-        CENTRAL_RUNTIME_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CENTRAL_RUNTIME_STATE_FILE.write_text(
-            json.dumps(state or {}, ensure_ascii=False, indent=2, default=_runtime_stability_v1_json_default),
-            encoding="utf-8",
+        serializable_state = json.loads(
+            json.dumps(
+                state or {},
+                ensure_ascii=False,
+                indent=2,
+                default=_runtime_stability_v1_json_default,
+            )
         )
+        _write_central_paper_audit_json(CENTRAL_RUNTIME_STATE_FILE, serializable_state)
         return True
     except Exception as exc:
         print(f"ERRO RUNTIME STABILITY state: {exc}")
@@ -2134,11 +2168,13 @@ def _runtime_stability_v1_write_state(state):
 
 def _runtime_stability_v1_read_events(limit=2000):
     try:
-        if not CENTRAL_RUNTIME_EVENTS_FILE.exists():
+        if not _paper_file_exists(CENTRAL_RUNTIME_EVENTS_FILE):
             return []
-        lines = CENTRAL_RUNTIME_EVENTS_FILE.read_text(encoding="utf-8").splitlines()
-        if limit:
-            lines = lines[-int(limit):]
+        lines = _read_guarded_paper_tail_lines(
+            CENTRAL_RUNTIME_EVENTS_FILE,
+            limit=max(0, int(limit or 2000)),
+            max_bytes=6 * 1024 * 1024,
+        )
         rows = []
         for line in lines:
             try:
@@ -2662,11 +2698,19 @@ def acquire_runtime_file_lock(lock_name: str):
             print(f"ERRO LOCK {safe_name}: flock indisponível; liderança negada")
             return False
         lock_path = CENTRAL_DATA_DIR / f"{safe_name}.lock"
-        lock_path.parent.mkdir(exist_ok=True)
+        if _is_central_data_path(lock_path):
+            # The central runtime lock is on persistent state: open it through
+            # the descriptor-anchored guard so /data symlinks cannot redirect
+            # the lock or its metadata write.
+            fh = _open_guarded_paper_binary(lock_path, "a+b")
+        else:
+            if os.environ.get("RENDER", "").strip().lower() == "true":
+                raise OSError("CENTRAL_LOCK_PATH_OUTSIDE_VERIFIED_ROOT")
+            lock_path.parent.mkdir(exist_ok=True)
+            fh = open(lock_path, "a+b")
         # Do not truncate another process's metadata before flock decides
         # whether this process acquired the lock. The winner truncates only
         # after the exclusive lock is held.
-        fh = open(lock_path, "a+", encoding="utf-8")
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         fh.seek(0)
         fh.truncate()
@@ -2676,7 +2720,7 @@ def acquire_runtime_file_lock(lock_name: str):
             "ts": data_hora_sp_str(),
             "base_dir": str(BASE_DIR),
             "data_dir": str(CENTRAL_DATA_DIR),
-        }, ensure_ascii=False))
+        }, ensure_ascii=False).encode("utf-8"))
         fh.flush()
         CENTRAL_PROCESS_LOCK_HANDLES[safe_name] = fh
         print(f"LOCK OK - {safe_name}: pid={os.getpid()}")
@@ -6251,11 +6295,10 @@ def _dsf_v1_now():
 
 def _dsf_v1_atomic_write_json(path, payload):
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
-        tmp.replace(path)
+        serializable_payload = json.loads(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        )
+        _write_central_paper_audit_json(path, serializable_payload)
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -6263,10 +6306,10 @@ def _dsf_v1_atomic_write_json(path, payload):
 
 def _dsf_v1_read_json(path, default=None):
     try:
-        if not path.exists():
+        path = Path(path)
+        if not _paper_file_exists(path):
             return default if default is not None else {}
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = json.loads(_read_guarded_paper_text(path, encoding="utf-8"))
         return data if isinstance(data, dict) else (default if default is not None else {})
     except Exception:
         return default if default is not None else {}
@@ -6274,9 +6317,10 @@ def _dsf_v1_read_json(path, default=None):
 
 def _dsf_v1_append_event(payload):
     try:
-        DISASTER_STOP_FALLBACK_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(DISASTER_STOP_FALLBACK_V1_EVENTS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        _append_central_paper_audit_event(
+            DISASTER_STOP_FALLBACK_V1_EVENTS_FILE,
+            json.dumps(payload, ensure_ascii=False, default=str) + "\n",
+        )
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -9011,6 +9055,7 @@ def _rp_v1_norm_bot(value):
 
 def _rp_v1_data_dir_status():
     data_dir = Path(str(CENTRAL_DATA_DIR))
+    mount_verified = _paper_data_mount_verified(data_dir)
     env_configured = bool(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR"))
     warning = None
     path_s = str(data_dir)
@@ -9018,7 +9063,14 @@ def _rp_v1_data_dir_status():
         warning = "CENTRAL_DATA_DIR/DATA_DIR não parece apontar para disco persistente externo; em Render, arquivos dentro do projeto podem sumir em deploy/restart."
     return {
         "central_data_dir": path_s,
-        "central_data_dir_exists": data_dir.exists(),
+        "central_data_dir_exists": bool(
+            mount_verified
+            or (
+                os.environ.get("RENDER", "").strip().lower() != "true"
+                and data_dir.is_dir()
+            )
+        ),
+        "central_data_dir_mount_verified": mount_verified,
         "env_configured": env_configured,
         "env_central_data_dir_set": bool(os.environ.get("CENTRAL_DATA_DIR")),
         "env_data_dir_set": bool(os.environ.get("DATA_DIR")),
@@ -9030,17 +9082,18 @@ def _rp_v1_data_dir_status():
 
 def _rp_v1_atomic_write_json(path, payload):
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    serializable_payload = json.loads(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    )
+    _write_central_paper_audit_json(path, serializable_payload)
 
 
 def _rp_v1_append_event(event):
     try:
-        REGISTRY_PERSISTENCE_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(REGISTRY_PERSISTENCE_V1_EVENTS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        _append_central_paper_audit_event(
+            REGISTRY_PERSISTENCE_V1_EVENTS_FILE,
+            json.dumps(event, ensure_ascii=False, default=str) + "\n",
+        )
         return True
     except Exception:
         return False
@@ -9048,10 +9101,12 @@ def _rp_v1_append_event(event):
 
 def _rp_v1_read_latest_snapshot():
     try:
-        if not REGISTRY_PERSISTENCE_V1_LATEST_FILE.exists():
+        if not _paper_file_exists(REGISTRY_PERSISTENCE_V1_LATEST_FILE):
             return {"ok": False, "status": "NO_LATEST_SNAPSHOT", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE)}
         payload = json.loads(
-            REGISTRY_PERSISTENCE_V1_LATEST_FILE.read_text(encoding="utf-8")
+            _read_guarded_paper_text(
+                REGISTRY_PERSISTENCE_V1_LATEST_FILE, encoding="utf-8"
+            )
         )
         if not isinstance(payload, dict):
             return {
@@ -12959,18 +13014,14 @@ def execution_console_route():
     import urllib.parse
 
     def _console_store_path():
-        try:
-            return CENTRAL_DATA_DIR / "execution_console_prg_results.json"
-        except Exception:
-            return BASE_DIR / "execution_console_prg_results.json"
+        return Path(CENTRAL_DATA_DIR) / "execution_console_prg_results.json"
 
     def _console_read_store():
         path = _console_store_path()
         try:
-            if not path.exists():
+            if not _paper_file_exists(path):
                 return {}
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = json.loads(_read_guarded_paper_text(path, encoding="utf-8"))
             return data if isinstance(data, dict) else {}
         except Exception:
             return {}
@@ -12978,9 +13029,10 @@ def execution_console_route():
     def _console_write_store(data):
         path = _console_store_path()
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data if isinstance(data, dict) else {}, f, ensure_ascii=False, indent=2, default=str)
+            serializable_data = json.loads(
+                json.dumps(data if isinstance(data, dict) else {}, ensure_ascii=False, indent=2, default=str)
+            )
+            _write_central_paper_audit_json(path, serializable_data)
             return True
         except Exception:
             return False
@@ -14577,9 +14629,22 @@ def history_hooks_status_route():
 
 
 
+def _central_runtime_lock_files():
+    try:
+        names = _list_guarded_paper_files(
+            CENTRAL_DATA_DIR,
+            suffix=".lock",
+            require_mount=True,
+        )
+        return [str(CENTRAL_DATA_DIR / name) for name in names], None
+    except Exception as exc:
+        return [], type(exc).__name__
+
+
 @app.route("/data/status")
 def data_status_route():
     """Diagnóstico dos caminhos usados por Main, Event Bus e History."""
+    lock_file_paths, lock_file_error = _central_runtime_lock_files()
     payload = {
         "ok": True,
         "pid": os.getpid(),
@@ -14594,7 +14659,8 @@ def data_status_route():
         },
         "locks": {
             "held_by_this_process": list(CENTRAL_PROCESS_LOCK_HANDLES.keys()),
-            "lock_files": [str(p) for p in CENTRAL_DATA_DIR.glob("*.lock")],
+            "lock_files": lock_file_paths,
+            "lock_files_error": lock_file_error,
         },
         "event_bus": None,
         "history_manager": None,
@@ -17714,10 +17780,15 @@ def _json_default(value):
 
 
 def _append_jsonl(path, item):
+    path = Path(path)
     probe = None
     try:
-        path.parent.mkdir(exist_ok=True)
         line = json.dumps(item, ensure_ascii=False, default=_json_default) + "\n"
+        guarded_central_path = _is_central_data_path(path)
+        if not guarded_central_path and os.environ.get("RENDER", "").strip().lower() == "true":
+            raise OSError("CENTRAL_DATA_PATH_OUTSIDE_VERIFIED_ROOT")
+        if not guarded_central_path:
+            path.parent.mkdir(exist_ok=True)
         try:
             from decision_log_forensics import decision_log_write_probe
 
@@ -17730,8 +17801,11 @@ def _append_jsonl(path, item):
             probe.begin()
         except Exception:
             probe = None
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line)
+        if guarded_central_path:
+            _append_central_paper_audit_event(path, line)
+        else:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
         if probe is not None:
             probe.finish(True)
         return True
@@ -17747,6 +17821,21 @@ def _append_jsonl(path, item):
 
 def _read_jsonl_tail(path, limit=50):
     try:
+        path = Path(path)
+        if _is_central_data_path(path):
+            if not _paper_file_exists(path):
+                return []
+            records = []
+            for line in _read_guarded_paper_tail_lines(
+                path, limit=max(0, int(limit)), max_bytes=6 * 1024 * 1024
+            ):
+                try:
+                    records.append(json.loads(line))
+                except Exception:
+                    records.append(line)
+            return records
+        if os.environ.get("RENDER", "").strip().lower() == "true":
+            return []
         from history_memory_guard import AUTOMATIC_MAX_BYTES, iter_jsonl_tail
 
         return iter_jsonl_tail(
@@ -17763,6 +17852,13 @@ def _read_jsonl_tail(path, limit=50):
 
 def _read_json_file(path, default):
     try:
+        path = Path(path)
+        if _is_central_data_path(path):
+            if not _paper_file_exists(path):
+                return default
+            return json.loads(_read_guarded_paper_text(path, encoding="utf-8"))
+        if os.environ.get("RENDER", "").strip().lower() == "true":
+            return default
         if not path.exists():
             return default
         with open(path, "r", encoding="utf-8") as f:
@@ -17773,6 +17869,12 @@ def _read_json_file(path, default):
 
 def _write_json_file(path, payload):
     try:
+        path = Path(path)
+        if _is_central_data_path(path):
+            _write_central_paper_audit_json(path, payload)
+            return True
+        if os.environ.get("RENDER", "").strip().lower() == "true":
+            return False
         path.parent.mkdir(exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2, default=_json_default)
@@ -19450,7 +19552,7 @@ def _trg_v1_load_history_events(limit=None):
             if path in seen_paths:
                 continue
             seen_paths.append(path)
-            if path.exists():
+            if _paper_file_exists(path):
                 events.extend(_read_jsonl_tail(path, limit=limit) if "_read_jsonl_tail" in globals() else [])
         except Exception:
             continue
@@ -21171,24 +21273,48 @@ def daily_snapshot_payload():
 
 
 def save_daily_snapshot(label=None):
+    if (
+        os.environ.get("RENDER", "").strip().lower() == "true"
+        and not _is_central_data_path(DAILY_HISTORY_DIR)
+    ):
+        raise OSError("DAILY_HISTORY_PERSISTENT_PATH_REQUIRED")
     payload = daily_snapshot_payload()
     date_key = payload.get("date")
     suffix = f"_{label}" if label else ""
     path = DAILY_HISTORY_DIR / f"{date_key}{suffix}.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+    if _is_central_data_path(path):
+        _write_central_paper_audit_json(path, payload)
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
     return str(path), payload
 
 
 def build_history_report(days=7):
-    files = sorted(DAILY_HISTORY_DIR.glob("*.json"), reverse=True)[:days]
+    if (
+        os.environ.get("RENDER", "").strip().lower() == "true"
+        and not _is_central_data_path(DAILY_HISTORY_DIR)
+    ):
+        return "Histórico indisponível: armazenamento persistente não verificado."
+    if _is_central_data_path(DAILY_HISTORY_DIR):
+        names = _list_guarded_paper_files(
+            DAILY_HISTORY_DIR, suffix=".json", require_mount=True
+        )
+        files = [DAILY_HISTORY_DIR / name for name in sorted(names, reverse=True)[:days]]
+    else:
+        files = sorted(DAILY_HISTORY_DIR.glob("*.json"), reverse=True)[:days]
     lines = ["📚 HISTÓRICO CENTRAL QUANT", f"Arquivos: {len(files)}", ""]
     if not files:
         lines.append("Nenhum histórico salvo ainda. Use /snapshot ou aguarde o relatório automático.")
         return "\n".join(lines)
     for path in files:
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            if _is_central_data_path(path):
+                data = json.loads(
+                    _read_guarded_paper_text(path, encoding="utf-8")
+                )
+            else:
+                data = json.loads(path.read_text(encoding="utf-8"))
             exp = data.get("exposure", {}) or {}
             mem = data.get("memory", {}) or {}
             score = data.get("health_score", {}) or {}
@@ -22700,11 +22826,13 @@ def _read_executive_alert_log_rows(limit=50000):
     path = _executive_alert_log_file_path()
     rows = []
     try:
-        if not path.exists():
+        if not _paper_file_exists(path):
             return []
-        lines = path.read_text(encoding="utf-8").splitlines()
-        if limit:
-            lines = lines[-int(limit):]
+        lines = _read_guarded_paper_tail_lines(
+            path,
+            limit=max(0, int(limit)) if limit else 50000,
+            max_bytes=6 * 1024 * 1024,
+        )
         for line in lines:
             try:
                 item = json.loads(line)
@@ -23735,6 +23863,21 @@ def _read_physical_tail_lines_v1(
 def _read_jsonl_tail_v3(path, limit=200):
     try:
         p = Path(path)
+        if _is_central_data_path(p):
+            if not _paper_file_exists(p):
+                return []
+            lines = _read_guarded_paper_tail_lines(
+                p, limit=max(0, int(limit)), max_bytes=6 * 1024 * 1024
+            )
+            out = []
+            for line in lines:
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    pass
+            return out
+        if os.environ.get("RENDER", "").strip().lower() == "true":
+            return []
         if not p.exists():
             return []
         lines = _read_physical_tail_lines_v1(p, int(limit))["lines"]
@@ -24173,9 +24316,22 @@ def system_debug_route():
 
     def count_jsonl(path):
         try:
-            if not path or not os.path.exists(path):
+            if not path:
                 return 0
-            with open(path, "r", encoding="utf-8") as f:
+            path_obj = Path(path)
+            if _is_central_data_path(path_obj):
+                if not _paper_file_exists(path_obj):
+                    return 0
+                handle_context = _open_guarded_paper_text(
+                    path_obj, "r", encoding="utf-8"
+                )
+            elif os.environ.get("RENDER", "").strip().lower() == "true":
+                return None
+            else:
+                if not path_obj.is_file():
+                    return 0
+                handle_context = open(path_obj, "r", encoding="utf-8")
+            with handle_context as f:
                 return sum(1 for line in f if line.strip())
         except Exception:
             return None
@@ -29678,9 +29834,12 @@ def _awe_default_state():
 
 def _awe_load_state():
     try:
-        if ADAPTIVE_WEIGHT_ENGINE_V1_FILE.exists():
-            with open(ADAPTIVE_WEIGHT_ENGINE_V1_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+        if _paper_file_exists(ADAPTIVE_WEIGHT_ENGINE_V1_FILE):
+            data = json.loads(
+                _read_guarded_paper_text(
+                    ADAPTIVE_WEIGHT_ENGINE_V1_FILE, encoding="utf-8"
+                )
+            )
             if isinstance(data, dict):
                 default = _awe_default_state()
                 data.setdefault("modules", {})
@@ -29696,9 +29855,7 @@ def _awe_save_state(state):
     try:
         state = dict(state or {})
         state["updated_at"] = data_hora_sp_str()
-        ADAPTIVE_WEIGHT_ENGINE_V1_FILE.parent.mkdir(exist_ok=True)
-        with open(ADAPTIVE_WEIGHT_ENGINE_V1_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        _write_central_paper_audit_json(ADAPTIVE_WEIGHT_ENGINE_V1_FILE, state)
         return True
     except Exception:
         return False
@@ -29713,9 +29870,11 @@ def _awe_extract_outcome_records(limit=600):
     paths = [CENTRAL_DECISION_LOG_FILE, CENTRAL_TIMELINE_LOG_FILE, CENTRAL_DATA_DIR / "learning_engine_v1.jsonl"]
     for path in paths:
         try:
-            if not path or not Path(path).exists():
+            if not path or not _paper_file_exists(Path(path)):
                 continue
-            lines = _read_physical_tail_lines_v1(path, int(limit))["lines"]
+            lines = _read_guarded_paper_tail_lines(
+                Path(path), limit=int(limit), max_bytes=6 * 1024 * 1024
+            )
             for line in lines:
                 try:
                     item = json.loads(line)
@@ -30115,9 +30274,9 @@ def _le_now_id(prefix="LEARN"):
 
 def _le_append_jsonl(item):
     try:
-        LEARNING_ENGINE_V1_FILE.parent.mkdir(exist_ok=True)
-        with open(LEARNING_ENGINE_V1_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        _append_central_paper_audit_event(
+            LEARNING_ENGINE_V1_FILE, json.dumps(item, ensure_ascii=False) + "\n"
+        )
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -30127,10 +30286,13 @@ def _le_read_records(limit=None):
     limit = int(limit or LEARNING_ENGINE_V1_DEFAULT_READ_LIMIT)
     records = []
     try:
-        if not LEARNING_ENGINE_V1_FILE.exists():
+        if not _paper_file_exists(LEARNING_ENGINE_V1_FILE):
             return []
-        with open(LEARNING_ENGINE_V1_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-limit:]
+        lines = _read_guarded_paper_tail_lines(
+            LEARNING_ENGINE_V1_FILE,
+            limit=max(0, limit),
+            max_bytes=6 * 1024 * 1024,
+        )
         for line in lines:
             try:
                 item = json.loads(line)
@@ -30548,22 +30710,23 @@ def _oe_safe_float(value, default=None):
 
 def _oe_append_jsonl(path, item):
     try:
-        path.parent.mkdir(exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        _append_central_paper_audit_event(
+            Path(path), json.dumps(item, ensure_ascii=False) + "\n"
+        )
         return True, None
     except Exception as exc:
         return False, str(exc)
 
 
 def _oe_read_records(path=None, limit=1000):
-    path = path or OUTCOME_EVALUATOR_V1_FILE
+    path = Path(path or OUTCOME_EVALUATOR_V1_FILE)
     records = []
     try:
-        if not path.exists():
+        if not _paper_file_exists(path):
             return []
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-int(limit or 1000):]
+        lines = _read_guarded_paper_tail_lines(
+            path, limit=max(0, int(limit or 1000)), max_bytes=6 * 1024 * 1024
+        )
         for line in lines:
             try:
                 item = json.loads(line)
@@ -33977,13 +34140,14 @@ TRENDPRO_DAILY_SUMMARY_LOOP_SECONDS = int(os.environ.get("TRENDPRO_DAILY_SUMMARY
 
 def _trendpro_daily_summary_v1_append_event(event: dict) -> bool:
     try:
-        TRENDPRO_DAILY_SUMMARY_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
         row = dict(event or {})
         row.setdefault("generated_at", data_hora_sp_str())
         row.setdefault("module", "trendpro_daily_summary_v1")
         row.setdefault("version", TRENDPRO_DAILY_SUMMARY_V1_VERSION)
-        with TRENDPRO_DAILY_SUMMARY_EVENTS_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        _append_central_paper_audit_event(
+            TRENDPRO_DAILY_SUMMARY_EVENTS_FILE,
+            json.dumps(row, ensure_ascii=False, default=str) + "\n",
+        )
         return True
     except Exception as exc:
         print("ERRO TRENDPRO DAILY SUMMARY append_event:", exc)
@@ -33992,8 +34156,14 @@ def _trendpro_daily_summary_v1_append_event(event: dict) -> bool:
 
 def trendpro_daily_summary_v1_load_state() -> dict:
     try:
-        if TRENDPRO_DAILY_SUMMARY_STATE_FILE.exists():
-            data = json.loads(TRENDPRO_DAILY_SUMMARY_STATE_FILE.read_text(encoding="utf-8") or "{}")
+        if _paper_file_exists(TRENDPRO_DAILY_SUMMARY_STATE_FILE):
+            data = json.loads(
+                _read_guarded_paper_text(
+                    TRENDPRO_DAILY_SUMMARY_STATE_FILE,
+                    encoding="utf-8",
+                    max_bytes=6 * 1024 * 1024,
+                ) or "{}"
+            )
             return data if isinstance(data, dict) else {}
     except Exception as exc:
         print("ERRO TRENDPRO DAILY SUMMARY load_state:", exc)
@@ -34002,10 +34172,11 @@ def trendpro_daily_summary_v1_load_state() -> dict:
 
 def trendpro_daily_summary_v1_save_state(state: dict) -> bool:
     try:
-        TRENDPRO_DAILY_SUMMARY_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        TRENDPRO_DAILY_SUMMARY_STATE_FILE.write_text(
-            json.dumps(state or {}, ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
+        serializable_state = json.loads(
+            json.dumps(state or {}, ensure_ascii=False, indent=2, default=str)
+        )
+        _write_central_paper_audit_json(
+            TRENDPRO_DAILY_SUMMARY_STATE_FILE, serializable_state
         )
         return True
     except Exception as exc:
@@ -34742,21 +34913,13 @@ ADAPTIVE_WEIGHT_ENGINE_V2_MODULE_LIMITS = dict(ADAPTIVE_WEIGHT_ENGINE_V1_MODULE_
 
 
 def _awe_v2_read_evaluations(limit=5000):
-    records = []
-    try:
-        if OUTCOME_EVALUATOR_V1_FILE.exists():
-            with open(OUTCOME_EVALUATOR_V1_FILE, "r", encoding="utf-8") as f:
-                lines = f.readlines()[-int(limit or 5000):]
-            for line in lines:
-                try:
-                    item = json.loads(line)
-                except Exception:
-                    continue
-                if isinstance(item, dict) and item.get("record_type") == "OUTCOME_EVALUATION":
-                    records.append(item)
-    except Exception:
-        pass
-    return records
+    return [
+        item
+        for item in _oe_read_records(
+            OUTCOME_EVALUATOR_V1_FILE, limit=limit or 5000
+        )
+        if item.get("record_type") == "OUTCOME_EVALUATION"
+    ]
 
 
 def _awe_v2_vote_structural_points(ev):
@@ -34855,9 +35018,12 @@ def _awe_v2_default_state():
 
 def _awe_v2_load_state():
     try:
-        if ADAPTIVE_WEIGHT_ENGINE_V2_FILE.exists():
-            with open(ADAPTIVE_WEIGHT_ENGINE_V2_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+        if _paper_file_exists(ADAPTIVE_WEIGHT_ENGINE_V2_FILE):
+            data = json.loads(
+                _read_guarded_paper_text(
+                    ADAPTIVE_WEIGHT_ENGINE_V2_FILE, encoding="utf-8"
+                )
+            )
             if isinstance(data, dict):
                 data.setdefault("weights", dict(DECISION_SCORE_ENGINE_V1_WEIGHTS))
                 data.setdefault("history", [])
@@ -34871,9 +35037,7 @@ def _awe_v2_save_state(state):
     try:
         state = dict(state or {})
         state["updated_at"] = data_hora_sp_str()
-        ADAPTIVE_WEIGHT_ENGINE_V2_FILE.parent.mkdir(exist_ok=True)
-        with open(ADAPTIVE_WEIGHT_ENGINE_V2_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        _write_central_paper_audit_json(ADAPTIVE_WEIGHT_ENGINE_V2_FILE, state)
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -36674,9 +36838,10 @@ def _see_safe_int(value, default=0):
 
 def _see_append_jsonl(item):
     try:
-        STRATEGY_EVOLUTION_ENGINE_V1_FILE.parent.mkdir(exist_ok=True)
-        with open(STRATEGY_EVOLUTION_ENGINE_V1_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        _append_central_paper_audit_event(
+            STRATEGY_EVOLUTION_ENGINE_V1_FILE,
+            json.dumps(item, ensure_ascii=False) + "\n",
+        )
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -37204,9 +37369,10 @@ def _tlm_trade_tp50(trade):
 
 def _tlm_append_jsonl(item):
     try:
-        TRADE_LIFECYCLE_MANAGER_V1_FILE.parent.mkdir(exist_ok=True)
-        with open(TRADE_LIFECYCLE_MANAGER_V1_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        _append_central_paper_audit_event(
+            TRADE_LIFECYCLE_MANAGER_V1_FILE,
+            json.dumps(item, ensure_ascii=False) + "\n",
+        )
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -37215,10 +37381,13 @@ def _tlm_append_jsonl(item):
 def _tlm_read_records(limit=1000):
     records = []
     try:
-        if not TRADE_LIFECYCLE_MANAGER_V1_FILE.exists():
+        if not _paper_file_exists(TRADE_LIFECYCLE_MANAGER_V1_FILE):
             return []
-        with open(TRADE_LIFECYCLE_MANAGER_V1_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-int(limit or 1000):]
+        lines = _read_guarded_paper_tail_lines(
+            TRADE_LIFECYCLE_MANAGER_V1_FILE,
+            limit=max(0, int(limit or 1000)),
+            max_bytes=6 * 1024 * 1024,
+        )
         for line in lines:
             try:
                 item = json.loads(line)
@@ -39734,12 +39903,17 @@ def _retg_v1_append_event(event):
         event.setdefault("generated_at", _retg_v1_now())
         event.setdefault("version", REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_VERSION)
         if REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_EVENTS_FILE is not None:
-            REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_EVENTS_FILE, "a", encoding="utf-8") as f:
-                f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+            _append_central_paper_audit_event(
+                REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_EVENTS_FILE,
+                json.dumps(event, ensure_ascii=False, default=str) + "\n",
+            )
         if REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_LATEST_FILE is not None:
-            with open(REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_LATEST_FILE, "w", encoding="utf-8") as f:
-                json.dump(event, f, ensure_ascii=False, indent=2, default=str)
+            serializable_event = json.loads(
+                json.dumps(event, ensure_ascii=False, indent=2, default=str)
+            )
+            _write_central_paper_audit_json(
+                REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_LATEST_FILE, serializable_event
+            )
         return True
     except Exception:
         return False
@@ -40174,9 +40348,17 @@ def _arb_v1_float(value, default=None):
 
 def _arb_v1_load_state():
     try:
-        if AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE is not None and AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE.exists():
-            with open(AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+        if (
+            AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE is not None
+            and _paper_file_exists(AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE)
+        ):
+            data = json.loads(
+                _read_guarded_paper_text(
+                    AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE,
+                    encoding="utf-8",
+                    max_bytes=6 * 1024 * 1024,
+                )
+            )
             if isinstance(data, dict):
                 data.setdefault("signals", {})
                 return data
@@ -40200,9 +40382,12 @@ def _arb_v1_save_state(state):
             state["signals"] = dict(ordered[:max_items])
         state["version"] = AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION
         state["updated_at"] = _arb_v1_now()
-        AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2, default=str)
+        serializable_state = json.loads(
+            json.dumps(state, ensure_ascii=False, indent=2, default=str)
+        )
+        _write_central_paper_audit_json(
+            AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE, serializable_state
+        )
         return True
     except Exception:
         return False
@@ -40217,12 +40402,17 @@ def _arb_v1_append_event(event):
         event.setdefault("token_value_exposed", False)
         event = _arb_v1_sanitize_public(event)
         if AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE is not None:
-            AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE, "a", encoding="utf-8") as f:
-                f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+            _append_central_paper_audit_event(
+                AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE,
+                json.dumps(event, ensure_ascii=False, default=str) + "\n",
+            )
         if AUTO_REAL_EXECUTION_BRIDGE_V1_LATEST_FILE is not None:
-            with open(AUTO_REAL_EXECUTION_BRIDGE_V1_LATEST_FILE, "w", encoding="utf-8") as f:
-                json.dump(event, f, ensure_ascii=False, indent=2, default=str)
+            serializable_event = json.loads(
+                json.dumps(event, ensure_ascii=False, indent=2, default=str)
+            )
+            _write_central_paper_audit_json(
+                AUTO_REAL_EXECUTION_BRIDGE_V1_LATEST_FILE, serializable_event
+            )
         return True
     except Exception:
         return False
@@ -40337,7 +40527,26 @@ def _arb_v1_read_events_page(
     target_records = None if requested_limit < 0 else requested_limit
 
     try:
-        initial_path = source.lstat()
+        use_guarded_open = bool(
+            _is_central_data_path(source)
+            and callable(_open_guarded_paper_binary)
+            and callable(_paper_file_stat)
+        )
+    except NameError:
+        use_guarded_open = False
+    if os.environ.get("RENDER", "").strip().lower() == "true" and not use_guarded_open:
+        raise OSError("ARB_V1_PERSISTENT_PATH_GUARD_REQUIRED")
+
+    guarded_handle = None
+    try:
+        if use_guarded_open:
+            data_root = Path(CENTRAL_DATA_DIR)
+            initial_path = _paper_file_stat(source, data_root=data_root)
+            guarded_handle = _open_guarded_paper_binary(
+                source, "rb", data_root=data_root
+            )
+        else:
+            initial_path = source.lstat()
     except FileNotFoundError:
         return metadata
     if stat.S_ISLNK(initial_path.st_mode):
@@ -40345,10 +40554,14 @@ def _arb_v1_read_events_page(
     if not stat.S_ISREG(initial_path.st_mode):
         raise ValueError("ARB_V1_TAIL_NOT_REGULAR_FILE")
 
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(os.fspath(source), flags)
+    descriptor = None
     try:
-        initial_open = os.fstat(descriptor)
+        if guarded_handle is not None:
+            initial_open = os.fstat(guarded_handle.fileno())
+        else:
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(os.fspath(source), flags)
+            initial_open = os.fstat(descriptor)
         if not stat.S_ISREG(initial_open.st_mode):
             raise ValueError("ARB_V1_TAIL_NOT_REGULAR_FILE")
         for name in ("st_dev", "st_ino"):
@@ -40365,8 +40578,12 @@ def _arb_v1_read_events_page(
 
         snapshot_size = int(initial_open.st_size)
         metadata["source_size_bytes"] = snapshot_size
-        handle = os.fdopen(descriptor, "rb", closefd=True)
-        descriptor = None
+        if guarded_handle is not None:
+            handle = guarded_handle
+            guarded_handle = None
+        else:
+            handle = os.fdopen(descriptor, "rb", closefd=True)
+            descriptor = None
         cursor = snapshot_size
         pending_prefix = b""
         reversed_rows = []
@@ -40468,6 +40685,8 @@ def _arb_v1_read_events_page(
     finally:
         if descriptor is not None:
             os.close(descriptor)
+        if guarded_handle is not None:
+            guarded_handle.close()
 
 
 def _arb_v1_read_events(limit=20):
@@ -41374,10 +41593,13 @@ def _rpw_v1_sanitize_public(obj):
 
 def _rpw_v1_load_json(path, default=None):
     try:
-        if path is not None and Path(path).exists():
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data if data is not None else (default if default is not None else {})
+        if path is not None and _paper_file_exists(Path(path)):
+            data = json.loads(
+                _read_guarded_paper_text(
+                    Path(path), encoding="utf-8", max_bytes=6 * 1024 * 1024
+                )
+            )
+            return data if data is not None else (default if default is not None else {})
     except Exception:
         pass
     return default if default is not None else {}
@@ -41387,9 +41609,10 @@ def _rpw_v1_write_json(path, payload):
     try:
         if path is None:
             return False
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        serializable_payload = json.loads(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        )
+        _write_central_paper_audit_json(Path(path), serializable_payload)
         return True
     except Exception:
         return False
@@ -41402,9 +41625,10 @@ def _rpw_v1_append_event(event):
         event.setdefault("version", REAL_POSITION_WATCHDOG_V1_VERSION)
         event = _rpw_v1_sanitize_public(event)
         if REAL_POSITION_WATCHDOG_V1_EVENTS_FILE is not None:
-            REAL_POSITION_WATCHDOG_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(REAL_POSITION_WATCHDOG_V1_EVENTS_FILE, "a", encoding="utf-8") as f:
-                f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+            _append_central_paper_audit_event(
+                REAL_POSITION_WATCHDOG_V1_EVENTS_FILE,
+                json.dumps(event, ensure_ascii=False, default=str) + "\n",
+            )
         _rpw_v1_write_json(REAL_POSITION_WATCHDOG_V1_LATEST_FILE, event)
         return True
     except Exception:
@@ -41415,9 +41639,15 @@ def _rpw_v1_read_events(limit=20):
     events = []
     try:
         limit = max(1, min(200, int(limit or 20)))
-        if REAL_POSITION_WATCHDOG_V1_EVENTS_FILE is not None and REAL_POSITION_WATCHDOG_V1_EVENTS_FILE.exists():
-            with open(REAL_POSITION_WATCHDOG_V1_EVENTS_FILE, "r", encoding="utf-8") as f:
-                lines = f.readlines()[-limit:]
+        if (
+            REAL_POSITION_WATCHDOG_V1_EVENTS_FILE is not None
+            and _paper_file_exists(REAL_POSITION_WATCHDOG_V1_EVENTS_FILE)
+        ):
+            lines = _read_guarded_paper_tail_lines(
+                REAL_POSITION_WATCHDOG_V1_EVENTS_FILE,
+                limit=limit,
+                max_bytes=6 * 1024 * 1024,
+            )
             for line in lines:
                 try:
                     events.append(json.loads(line))
@@ -42069,10 +42299,11 @@ def _pcd_v1_int(value, default=0):
 def _pcd_v1_load_json(path, default=None):
     try:
         p = Path(path)
-        if not p.exists():
+        if not _paper_file_exists(p):
             return default if default is not None else {}
-        with p.open("r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = json.loads(
+            _read_guarded_paper_text(p, encoding="utf-8", max_bytes=6 * 1024 * 1024)
+        )
         return data if isinstance(data, dict) else (default if default is not None else {})
     except Exception:
         return default if default is not None else {}
@@ -42081,11 +42312,10 @@ def _pcd_v1_load_json(path, default=None):
 def _pcd_v1_write_json(path, payload):
     try:
         p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(p.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
-        tmp.replace(p)
+        serializable_payload = json.loads(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        )
+        _write_central_paper_audit_json(p, serializable_payload)
         return True
     except Exception:
         return False
@@ -42099,9 +42329,10 @@ def _pcd_v1_append_event(event):
         event.setdefault("generated_at", _pcd_v1_now())
         event.setdefault("ts_epoch", _pcd_v1_epoch())
         event = _pcd_v1_sanitize_public(event)
-        PILOT_COOLDOWN_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with PILOT_COOLDOWN_V1_EVENTS_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        _append_central_paper_audit_event(
+            PILOT_COOLDOWN_V1_EVENTS_FILE,
+            json.dumps(event, ensure_ascii=False, default=str) + "\n",
+        )
         _pcd_v1_write_json(PILOT_COOLDOWN_V1_LATEST_FILE, event)
         return True
     except Exception:
@@ -42115,9 +42346,11 @@ def _pcd_v1_read_events(limit=20):
         limit = 20
     events = []
     try:
-        if PILOT_COOLDOWN_V1_EVENTS_FILE.exists():
-            lines = PILOT_COOLDOWN_V1_EVENTS_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
-            for line in lines[-limit:]:
+        if _paper_file_exists(PILOT_COOLDOWN_V1_EVENTS_FILE):
+            lines = _read_guarded_paper_tail_lines(
+                PILOT_COOLDOWN_V1_EVENTS_FILE, limit=limit, max_bytes=6 * 1024 * 1024
+            )
+            for line in lines:
                 try:
                     events.append(json.loads(line))
                 except Exception:
@@ -42631,9 +42864,11 @@ def _rcae_v1_float(value, default=None):
 def _rcae_v1_load_json(path, default=None):
     try:
         p = Path(path)
-        if not p.exists():
+        if not _paper_file_exists(p):
             return default if default is not None else {}
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(
+            _read_guarded_paper_text(p, encoding="utf-8", max_bytes=6 * 1024 * 1024)
+        )
         return data if isinstance(data, dict) else (default if default is not None else {})
     except Exception:
         return default if default is not None else {}
@@ -42642,10 +42877,10 @@ def _rcae_v1_load_json(path, default=None):
 def _rcae_v1_write_json(path, payload):
     try:
         p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(p.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        tmp.replace(p)
+        serializable_payload = json.loads(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        )
+        _write_central_paper_audit_json(p, serializable_payload)
         return True
     except Exception:
         return False
@@ -42678,9 +42913,10 @@ def _rcae_v1_append_event(event):
         event.setdefault("generated_at", _rcae_v1_now())
         event.setdefault("ts_epoch", _rcae_v1_epoch())
         event = _rcae_v1_sanitize_public(event)
-        REAL_CLOSE_AUTO_EVALUATOR_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with REAL_CLOSE_AUTO_EVALUATOR_V1_EVENTS_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        _append_central_paper_audit_event(
+            REAL_CLOSE_AUTO_EVALUATOR_V1_EVENTS_FILE,
+            json.dumps(event, ensure_ascii=False, default=str) + "\n",
+        )
         _rcae_v1_write_json(REAL_CLOSE_AUTO_EVALUATOR_V1_LATEST_FILE, event)
         return True
     except Exception:
@@ -42694,9 +42930,13 @@ def _rcae_v1_read_events(limit=20):
         limit = 20
     rows = []
     try:
-        if REAL_CLOSE_AUTO_EVALUATOR_V1_EVENTS_FILE.exists():
-            lines = REAL_CLOSE_AUTO_EVALUATOR_V1_EVENTS_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
-            for line in lines[-limit:]:
+        if _paper_file_exists(REAL_CLOSE_AUTO_EVALUATOR_V1_EVENTS_FILE):
+            lines = _read_guarded_paper_tail_lines(
+                REAL_CLOSE_AUTO_EVALUATOR_V1_EVENTS_FILE,
+                limit=limit,
+                max_bytes=6 * 1024 * 1024,
+            )
+            for line in lines:
                 try:
                     rows.append(json.loads(line))
                 except Exception:
@@ -43418,10 +43658,11 @@ def _rpd_v1_bool(value, default=False):
 def _rpd_v1_load_json(path, default=None):
     try:
         p = Path(path)
-        if not p.exists():
+        if not _paper_file_exists(p):
             return default if default is not None else {}
-        with p.open("r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(
+            _read_guarded_paper_text(p, encoding="utf-8", max_bytes=6 * 1024 * 1024)
+        )
     except Exception:
         return default if default is not None else {}
 
@@ -43429,11 +43670,10 @@ def _rpd_v1_load_json(path, default=None):
 def _rpd_v1_write_json(path, payload):
     try:
         p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(p.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
-        tmp.replace(p)
+        serializable_payload = json.loads(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        )
+        _write_central_paper_audit_json(p, serializable_payload)
         return True
     except Exception:
         return False
@@ -43445,9 +43685,10 @@ def _rpd_v1_append_event(event):
         event.setdefault("module", "real_pilot_dashboard_v1")
         event.setdefault("version", REAL_PILOT_DASHBOARD_V1_VERSION)
         event.setdefault("generated_at", _rpd_v1_now())
-        REAL_PILOT_DASHBOARD_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with REAL_PILOT_DASHBOARD_V1_EVENTS_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        _append_central_paper_audit_event(
+            REAL_PILOT_DASHBOARD_V1_EVENTS_FILE,
+            json.dumps(event, ensure_ascii=False, default=str) + "\n",
+        )
         _rpd_v1_write_json(REAL_PILOT_DASHBOARD_V1_LATEST_FILE, event)
     except Exception:
         pass
@@ -43460,9 +43701,12 @@ def _rpd_v1_read_events(limit=20):
         limit = 20
     rows = []
     try:
-        if REAL_PILOT_DASHBOARD_V1_EVENTS_FILE.exists():
-            with REAL_PILOT_DASHBOARD_V1_EVENTS_FILE.open("r", encoding="utf-8") as f:
-                lines = f.readlines()[-limit:]
+        if _paper_file_exists(REAL_PILOT_DASHBOARD_V1_EVENTS_FILE):
+            lines = _read_guarded_paper_tail_lines(
+                REAL_PILOT_DASHBOARD_V1_EVENTS_FILE,
+                limit=limit,
+                max_bytes=6 * 1024 * 1024,
+            )
             for line in lines:
                 line = line.strip()
                 if not line:
@@ -43990,10 +44234,10 @@ def _eaa_v1_sanitize(obj):
 
 def _eaa_v1_write_json(path, payload):
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        tmp.replace(path)
+        serializable_payload = json.loads(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        )
+        _write_central_paper_audit_json(Path(path), serializable_payload)
         return True
     except Exception:
         return False
@@ -44006,9 +44250,10 @@ def _eaa_v1_append(event):
         payload.setdefault("version", EXECUTION_ATTEMPT_AUDIT_V1_VERSION)
         payload.setdefault("generated_at", _eaa_v1_now())
         payload.setdefault("epoch", _eaa_v1_epoch())
-        EXECUTION_ATTEMPT_AUDIT_V1_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with EXECUTION_ATTEMPT_AUDIT_V1_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        _append_central_paper_audit_event(
+            EXECUTION_ATTEMPT_AUDIT_V1_FILE,
+            json.dumps(payload, ensure_ascii=False, default=str) + "\n",
+        )
         _eaa_v1_write_json(EXECUTION_ATTEMPT_AUDIT_V1_LATEST_FILE, payload)
         return True
     except Exception:
@@ -44297,9 +44542,11 @@ def _eaa_v1_read_jsonl(path, limit=100, source=None):
     rows = []
     try:
         p = Path(path)
-        if not p.exists():
+        if not _paper_file_exists(p):
             return rows
-        lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()[-max(1, int(limit)):]
+        lines = _read_guarded_paper_tail_lines(
+            p, limit=max(1, int(limit)), max_bytes=6 * 1024 * 1024
+        )
         for line in lines:
             try:
                 item = json.loads(line)
@@ -44339,7 +44586,11 @@ def _eaa_v1_combined_log(limit=50):
     for path, source in sources:
         try:
             path_str = str(path)
-            files.append({"source": source, "path": path_str, "exists": Path(path).exists()})
+            try:
+                exists = _paper_file_exists(Path(path))
+            except Exception:
+                exists = None
+            files.append({"source": source, "path": path_str, "exists": exists})
             for item in _eaa_v1_read_jsonl(path, limit=limit, source=source):
                 key = json.dumps({
                     "source": source,
@@ -44690,6 +44941,16 @@ def _md_v1_broker_mode():
 def _md_v1_read_json(path, default=None):
     try:
         p = Path(path)
+        if _is_central_data_path(p):
+            if not _paper_file_exists(p):
+                return default
+            return json.loads(
+                _read_guarded_paper_text(
+                    p, encoding="utf-8", max_bytes=6 * 1024 * 1024
+                )
+            )
+        if os.environ.get("RENDER", "").strip().lower() == "true":
+            return default
         if not p.exists():
             return default
         return json.loads(p.read_text(encoding="utf-8"))
@@ -44699,10 +44960,12 @@ def _md_v1_read_json(path, default=None):
 
 def _md_v1_write_snapshot(snapshot):
     try:
-        MEMORY_DIET_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = MEMORY_DIET_SNAPSHOT_FILE.with_suffix(MEMORY_DIET_SNAPSHOT_FILE.suffix + ".tmp")
-        tmp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        tmp.replace(MEMORY_DIET_SNAPSHOT_FILE)
+        serializable_snapshot = json.loads(
+            json.dumps(snapshot, ensure_ascii=False, indent=2, default=str)
+        )
+        _write_central_paper_audit_json(
+            MEMORY_DIET_SNAPSHOT_FILE, serializable_snapshot
+        )
         return True
     except Exception:
         return False
@@ -44728,14 +44991,26 @@ def _md_v1_latest_execution_audit():
     ]
     for path in candidates:
         try:
-            if not path.exists():
+            path = Path(path)
+            central_path = _is_central_data_path(path)
+            if central_path:
+                if not _paper_file_exists(path):
+                    continue
+            elif os.environ.get("RENDER", "").strip().lower() == "true":
+                continue
+            elif not path.exists():
                 continue
             if path.suffix == ".json":
                 item = _md_v1_read_json(path, {})
                 if isinstance(item, dict) and item:
                     return {"source": str(path), "item": item}
             else:
-                lines = path.read_text(encoding="utf-8").splitlines()
+                if central_path:
+                    lines = _read_guarded_paper_tail_lines(
+                        path, limit=50, max_bytes=6 * 1024 * 1024
+                    )
+                else:
+                    lines = path.read_text(encoding="utf-8").splitlines()[-50:]
                 for line in reversed(lines[-50:]):
                     try:
                         item = json.loads(line)
@@ -44975,7 +45250,10 @@ def ceo_daily_memory_diet_snapshot_route():
 @app.route("/memorydiet", methods=["GET"])
 def memory_diet_v1_health_route():
     mem = _md_v1_memory_snapshot()
-    snap_exists = MEMORY_DIET_SNAPSHOT_FILE.exists()
+    try:
+        snap_exists = _paper_file_exists(MEMORY_DIET_SNAPSHOT_FILE)
+    except Exception:
+        snap_exists = None
     return {
         "ok": True,
         "module": "memory_diet_v1",
@@ -46776,9 +47054,14 @@ def _fleag_v1_public(obj):
 
 def _fleag_v1_load_state():
     try:
-        if FALCON_LIVE_AUDIT_STATE_FILE.exists():
-            with open(FALCON_LIVE_AUDIT_STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+        if _paper_file_exists(FALCON_LIVE_AUDIT_STATE_FILE):
+            data = json.loads(
+                _read_guarded_paper_text(
+                    FALCON_LIVE_AUDIT_STATE_FILE,
+                    encoding="utf-8",
+                    max_bytes=6 * 1024 * 1024,
+                )
+            )
             if isinstance(data, dict):
                 data.setdefault("acked_bad_event_keys", [])
                 return data
@@ -46793,9 +47076,17 @@ def _fleag_v1_save_state(state):
         state.setdefault("version", FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION)
         state.setdefault("acked_bad_event_keys", [])
         state["updated_at"] = _fleag_v1_now()
-        FALCON_LIVE_AUDIT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(FALCON_LIVE_AUDIT_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_fleag_v1_public(state), f, ensure_ascii=False, indent=2, default=str)
+        serializable_state = json.loads(
+            json.dumps(
+                _fleag_v1_public(state),
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        )
+        _write_central_paper_audit_json(
+            FALCON_LIVE_AUDIT_STATE_FILE, serializable_state
+        )
         return True
     except Exception:
         return False
@@ -46809,11 +47100,16 @@ def _fleag_v1_append_event(event):
         row.setdefault("generated_at", _fleag_v1_now())
         row.setdefault("token_value_exposed", False)
         row = _fleag_v1_public(row)
-        FALCON_LIVE_AUDIT_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(FALCON_LIVE_AUDIT_EVENTS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-        with open(FALCON_LIVE_AUDIT_LATEST_FILE, "w", encoding="utf-8") as f:
-            json.dump(row, f, ensure_ascii=False, indent=2, default=str)
+        _append_central_paper_audit_event(
+            FALCON_LIVE_AUDIT_EVENTS_FILE,
+            json.dumps(row, ensure_ascii=False, default=str) + "\n",
+        )
+        serializable_row = json.loads(
+            json.dumps(row, ensure_ascii=False, indent=2, default=str)
+        )
+        _write_central_paper_audit_json(
+            FALCON_LIVE_AUDIT_LATEST_FILE, serializable_row
+        )
         return True
     except Exception:
         return False
@@ -46822,8 +47118,12 @@ def _fleag_v1_append_event(event):
 def _fleag_v1_read_events(limit=50):
     rows = []
     try:
-        if FALCON_LIVE_AUDIT_EVENTS_FILE.exists():
-            lines = FALCON_LIVE_AUDIT_EVENTS_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()[-max(1, int(limit or 50)):]
+        if _paper_file_exists(FALCON_LIVE_AUDIT_EVENTS_FILE):
+            lines = _read_guarded_paper_tail_lines(
+                FALCON_LIVE_AUDIT_EVENTS_FILE,
+                limit=max(1, int(limit or 50)),
+                max_bytes=6 * 1024 * 1024,
+            )
             for line in lines:
                 try:
                     item = json.loads(line)
@@ -47540,8 +47840,19 @@ def _fleag_v1_read_jsonl_file(path, limit=200):
     rows = []
     try:
         p = path if hasattr(path, "exists") else FALCON_LIVE_AUDIT_EVENTS_FILE.parent / str(path)
-        if p.exists():
+        if _is_central_data_path(p):
+            if not _paper_file_exists(p):
+                return rows
+            lines = _read_guarded_paper_tail_lines(
+                p, limit=max(1, int(limit or 200)), max_bytes=6 * 1024 * 1024
+            )
+        elif os.environ.get("RENDER", "").strip().lower() == "true":
+            return rows
+        elif p.exists():
             lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()[-max(1, int(limit or 200)): ]
+        else:
+            return rows
+        if lines:
             for line in lines:
                 try:
                     item = json.loads(line)
@@ -47770,8 +48081,14 @@ def falcon_live_execution_audit_guard_v1_status(
         status = "BLOCKED"
     latest = None
     try:
-        if FALCON_LIVE_AUDIT_LATEST_FILE.exists():
-            latest = json.loads(FALCON_LIVE_AUDIT_LATEST_FILE.read_text(encoding="utf-8", errors="ignore"))
+        if _paper_file_exists(FALCON_LIVE_AUDIT_LATEST_FILE):
+            latest = json.loads(
+                _read_guarded_paper_text(
+                    FALCON_LIVE_AUDIT_LATEST_FILE,
+                    encoding="utf-8",
+                    max_bytes=6 * 1024 * 1024,
+                )
+            )
     except Exception:
         latest = None
     ack_status = "CLEAR" if bad_events_unique and not bad_events else ("NO_BAD_EVENTS" if not bad_events_unique else "UNACKED_BAD_EVENTS")
@@ -51434,7 +51751,7 @@ def _trpsf_v1_falcon_live_entry_storage_readiness():
             )
             is True,
             "persistent_path": active_text.startswith("/data/"),
-            "active_file_exists": bool(active.exists()),
+            "active_file_exists": _paper_file_exists(active),
             "last_load_ok": _TRPSF_V1_STATE.get("last_load_ok") is True,
             "last_write_ok": _TRPSF_V1_STATE.get("last_write_ok") is True,
             "write_allowed": _TRPSF_V1_STATE.get("write_allowed") is True,
@@ -51485,42 +51802,34 @@ def _trpsf_v1_public(value, max_string=900):
 
 
 def _trpsf_v1_fsync_directory(path):
-    """Durably persist a directory entry update on supported POSIX filesystems."""
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    directory_fd = os.open(str(Path(path)), flags)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+    """Durably sync a directory through the validated PAPER storage guard."""
+    _fsync_guarded_paper_directory(Path(path))
 
 
 def _trpsf_v1_atomic_write_json(path, payload):
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        temp_fd = os.open(str(tmp), flags, 0o600)
-        with os.fdopen(temp_fd, "w", encoding="utf-8") as file_obj:
-            json.dump(payload, file_obj, ensure_ascii=False, indent=2, default=str)
-            file_obj.flush()
-            os.fsync(file_obj.fileno())
-        os.replace(str(tmp), str(path))
-        _trpsf_v1_fsync_directory(path.parent)
-        return True
-    except Exception:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise
+    serializable_payload = json.loads(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    )
+    _write_central_paper_audit_json(path, serializable_payload)
+    return True
 
 
 def _trpsf_v1_read_json(path):
     path = Path(path)
-    if not path.exists():
-        return None
     try:
+        if _is_central_data_path(path):
+            if not _paper_file_exists(path):
+                return None
+            return json.loads(
+                _read_guarded_paper_text(
+                    path, encoding="utf-8", max_bytes=128 * 1024 * 1024
+                )
+            )
+        if os.environ.get("RENDER", "").strip().lower() == "true":
+            return None
+        if not path.exists():
+            return None
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
@@ -51665,10 +51974,7 @@ def _trpsf_v1_legacy_candidate_paths():
     unique = []
     seen = set()
     for p in candidates:
-        try:
-            key = str(p.resolve()) if p.exists() else str(p)
-        except Exception:
-            key = str(p)
+        key = os.path.normcase(os.path.abspath(os.fspath(p)))
         if key in seen:
             continue
         seen.add(key)
@@ -51693,10 +51999,7 @@ def _trpsf_v1_temporary_registry_source(active_file):
     unique = []
     seen = set()
     for path in candidates:
-        try:
-            key = str(path.resolve()) if path.exists() else str(path)
-        except Exception:
-            key = str(path)
+        key = os.path.normcase(os.path.abspath(os.fspath(path)))
         if key in seen:
             continue
         seen.add(key)
@@ -51704,18 +52007,16 @@ def _trpsf_v1_temporary_registry_source(active_file):
     valid_sources = []
     invalid_shape = False
     read_errors = False
-    active_resolved = None
-    try:
-        active_resolved = str(Path(active_file).resolve())
-    except Exception:
-        active_resolved = None
+    active_key = os.path.normcase(os.path.abspath(os.fspath(active_file)))
     for path in unique:
+        path_key = os.path.normcase(os.path.abspath(os.fspath(path)))
+        if path_key == active_key:
+            continue
         try:
-            if active_resolved is not None and path.exists() and str(path.resolve()) == active_resolved:
+            if not _paper_file_exists(path):
                 continue
         except Exception:
-            pass
-        if not path.exists():
+            read_errors = True
             continue
         reg = _trpsf_v1_read_json(path)
         if not isinstance(reg, dict):
@@ -51746,14 +52047,13 @@ def _trpsf_v1_temporary_registry_source(active_file):
             return None, None, "REGISTRY_MIGRATION_SOURCE_AMBIGUOUS"
     chosen_path, chosen_registry = valid_sources[0]
     if original_path:
-        try:
-            original_resolved = str(Path(original_path).resolve())
-            for path, reg in valid_sources:
-                if str(path.resolve()) == original_resolved:
-                    chosen_path, chosen_registry = path, reg
-                    break
-        except Exception:
-            pass
+        original_key = os.path.normcase(
+            os.path.abspath(os.fspath(Path(original_path)))
+        )
+        for path, reg in valid_sources:
+            if os.path.normcase(os.path.abspath(os.fspath(path))) == original_key:
+                chosen_path, chosen_registry = path, reg
+                break
     return chosen_path, chosen_registry, None
 
 
@@ -51942,7 +52242,7 @@ def _trpsf_v1_bootstrap_registry(force=False, _lock_held=False):
     _TRPSF_V1_STATE["restart_readiness_attested"] = False
     active = _trpsf_v1_active_file()
     legacy_paths = _trpsf_v1_legacy_candidate_paths()
-    active_file_exists = active.exists()
+    active_file_exists = _paper_file_exists(active)
     active_reg = _trpsf_v1_read_json(active)
     active_shape_errors = (
         _trpsf_v1_registry_shape_errors(active_reg)
@@ -51996,7 +52296,10 @@ def _trpsf_v1_bootstrap_registry(force=False, _lock_held=False):
         try:
             if str(p) == str(active):
                 continue
-            source_exists = Path(p).exists()
+            try:
+                source_exists = _paper_file_exists(Path(p))
+            except Exception:
+                source_exists = False
             reg = _trpsf_v1_read_json(p)
             if source_exists and not isinstance(reg, dict):
                 source_read_errors.append("LEGACY_REGISTRY_READ_ERROR")
@@ -52261,17 +52564,10 @@ def _trpsf_v1_bootstrap_registry(force=False, _lock_held=False):
                 TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_LATEST_FILE,
                 status,
             )
-            with open(
+            _append_central_paper_audit_event(
                 TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_EVENTS_FILE,
-                "a",
-                encoding="utf-8",
-            ) as fh:
-                fh.write(
-                    json.dumps(
-                        _trpsf_v1_public(status), ensure_ascii=False
-                    )
-                    + "\n"
-                )
+                json.dumps(_trpsf_v1_public(status), ensure_ascii=False) + "\n",
+            )
         except Exception:
             pass
     _TRPSF_V1_STATE["migration_done"] = bool(
@@ -52295,7 +52591,7 @@ def _trpsf_v1_patched_load_registry():
             raise RuntimeError("REGISTRY_READ_GUARDS_UNAVAILABLE")
         with registry_lock:
             active_reg = _trpsf_v1_read_json(active)
-            if active.exists() or isinstance(active_reg, dict):
+            if _paper_file_exists(active) or isinstance(active_reg, dict):
                 if not isinstance(active_reg, dict):
                     raise RuntimeError("ACTIVE_REGISTRY_INVALID")
                 shape_errors = _trpsf_v1_registry_shape_errors(active_reg)
@@ -52344,7 +52640,7 @@ def _trpsf_v1_patched_save_registry(registry, _lock_held=False):
                 return _trpsf_v1_patched_save_registry(
                     registry, _lock_held=True
                 )
-        if not active.exists():
+        if not _paper_file_exists(active):
             _TRPSF_V1_STATE["last_write_ok"] = False
             _TRPSF_V1_STATE["last_error"] = "ACTIVE_REGISTRY_UNAVAILABLE"
             return False
@@ -52531,7 +52827,7 @@ def trade_registry_persistent_storage_fix_v1_status(
         current = _trpsf_v1_read_json(active)
         status["current_counts"] = _trpsf_v1_registry_counts(current or {})
         status["registry_file_active"] = str(active)
-        status["active_file_exists"] = active.exists()
+        status["active_file_exists"] = _paper_file_exists(active)
         status["trade_registry_module_file"] = str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", "")) if central_trade_registry is not None else None
         status["trade_registry_module_data_dir"] = str(getattr(central_trade_registry, "DATA_DIR", "")) if central_trade_registry is not None else None
         status["patched_load_registry"] = bool(getattr(central_trade_registry, "load_registry", None) is _trpsf_v1_patched_load_registry) if central_trade_registry is not None else False
@@ -54862,7 +55158,16 @@ def _trpsf_v1_stop_evidence_scan_file(
         return None
 
     path_obj = Path(path) if path is not None else None
-    if path_obj is None or not path_obj.exists():
+    try:
+        source_exists = _paper_file_exists(path_obj) if path_obj is not None else False
+    except Exception as exc:
+        result["checked"] = True
+        result["reason"] = "SOURCE_PATH_GUARD_REJECTED"
+        result["source_read_errors"].append(
+            {"source_file": source_file, "error_type": type(exc).__name__}
+        )
+        return result
+    if path_obj is None or not source_exists:
         result["reason"] = "SOURCE_NOT_FOUND"
         return result
 
@@ -54873,7 +55178,7 @@ def _trpsf_v1_stop_evidence_scan_file(
 
     result["checked"] = True
     try:
-        result["total_file_bytes"] = int(path_obj.stat().st_size)
+        result["total_file_bytes"] = int(_paper_file_stat(path_obj).st_size)
     except Exception:
         result["total_file_bytes"] = None
 
@@ -54886,7 +55191,7 @@ def _trpsf_v1_stop_evidence_scan_file(
             parsed_offsets = set()
             if full_scan_allowed:
                 line_number = 0
-                with open(path_obj, "rb") as file_obj:
+                with _open_guarded_paper_binary(path_obj, "rb") as file_obj:
                     while True:
                         line_start = file_obj.tell()
                         raw_line = file_obj.readline()
@@ -54962,7 +55267,7 @@ def _trpsf_v1_stop_evidence_scan_file(
                     )
 
                     try:
-                        with open(path_obj, "rb") as binary_obj:
+                        with _open_guarded_paper_binary(path_obj, "rb") as binary_obj:
                             file_size = int(result.get("total_file_bytes") or 0)
                             if source_scan_budget_bytes <= 4096:
                                 sample_offsets = [
@@ -55313,7 +55618,7 @@ def _trpsf_v1_stop_evidence_scan_file(
                 result["truncated"] = True
                 result["reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
                 return result
-            with open(path_obj, "r", encoding="utf-8") as file_obj:
+            with _open_guarded_paper_text(path_obj, "r", encoding="utf-8") as file_obj:
                 loaded = json.load(file_obj)
             if source_size is not None:
                 result["bytes_scanned"] = min(source_size, source_scan_budget_bytes)
@@ -55575,12 +55880,11 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
             "mtime_ns": None,
         }
         try:
-            if path_obj.exists():
-                stat_info = path_obj.stat()
-                signature_item["size"] = int(stat_info.st_size)
-                signature_item["mtime_ns"] = int(
-                    getattr(stat_info, "st_mtime_ns", int(float(stat_info.st_mtime) * 1_000_000_000))
-                )
+            stat_info = _paper_file_stat(path_obj)
+            signature_item["size"] = int(stat_info.st_size)
+            signature_item["mtime_ns"] = int(
+                getattr(stat_info, "st_mtime_ns", int(float(stat_info.st_mtime) * 1_000_000_000))
+            )
         except Exception:
             pass
         source_signature.append(signature_item)
@@ -55633,11 +55937,11 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
         try:
             if primary_path_text:
                 primary_path = Path(primary_path_text)
-                if primary_path.exists():
+                if _paper_file_exists(primary_path):
                     active_path = primary_path
                 elif legacy_path_text:
                     legacy_path = Path(legacy_path_text)
-                    if legacy_path.exists() and str(legacy_path) != str(primary_path):
+                    if _paper_file_exists(legacy_path) and str(legacy_path) != str(primary_path):
                         active_path = legacy_path
                     else:
                         active_path = primary_path
@@ -55654,16 +55958,15 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
         size = None
         mtime_ns = None
         try:
-            if active_path.exists():
-                stat_info = active_path.stat()
-                size = int(stat_info.st_size)
-                mtime_ns = int(
-                    getattr(
-                        stat_info,
-                        "st_mtime_ns",
-                        int(float(stat_info.st_mtime) * 1_000_000_000),
-                    )
+            stat_info = _paper_file_stat(active_path)
+            size = int(stat_info.st_size)
+            mtime_ns = int(
+                getattr(
+                    stat_info,
+                    "st_mtime_ns",
+                    int(float(stat_info.st_mtime) * 1_000_000_000),
                 )
+            )
         except Exception:
             pass
 
@@ -55943,7 +56246,15 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
 
     for source_file, source_path, kind in candidate_paths:
         source_path_obj = Path(source_path)
-        if not source_path_obj.exists():
+        try:
+            source_exists = _paper_file_exists(source_path_obj)
+        except Exception as exc:
+            payload["source_read_errors"].append(
+                {"source_file": source_file, "error_type": type(exc).__name__}
+            )
+            payload["sources_missing"].append(source_file)
+            continue
+        if not source_exists:
             payload["sources_missing"].append(source_file)
             payload["source_scan_stats"].append(
                 {
@@ -55969,7 +56280,7 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
 
         total_file_bytes = None
         try:
-            total_file_bytes = int(source_path_obj.stat().st_size)
+            total_file_bytes = int(_paper_file_stat(source_path_obj).st_size)
         except Exception:
             total_file_bytes = None
 
@@ -56882,10 +57193,10 @@ def _bdsp_v1_safe_sanitize(value):
 def _bdsp_v1_write_json_atomic(path, payload):
     try:
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(path)
+        serializable_payload = json.loads(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        )
+        _write_central_paper_audit_json(path, serializable_payload)
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -56893,9 +57204,10 @@ def _bdsp_v1_write_json_atomic(path, payload):
 
 def _bdsp_v1_append_event(payload):
     try:
-        BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_EVENTS_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        _append_central_paper_audit_event(
+            BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_EVENTS_FILE,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+        )
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -57446,10 +57758,12 @@ def _frpp_v1_safe_sanitize(value):
 def _frpp_v1_write_json_atomic(path, payload):
     try:
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str), encoding="utf-8")
-        tmp.replace(path)
+        serializable_payload = json.loads(
+            json.dumps(
+                payload, ensure_ascii=False, indent=2, sort_keys=True, default=str
+            )
+        )
+        _write_central_paper_audit_json(path, serializable_payload)
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -57457,9 +57771,10 @@ def _frpp_v1_write_json_atomic(path, payload):
 
 def _frpp_v1_append_event(payload):
     try:
-        FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_EVENTS_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+        _append_central_paper_audit_event(
+            FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_EVENTS_FILE,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n",
+        )
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -57469,9 +57784,11 @@ def _frpp_v1_read_jsonl(path, limit=300):
     rows = []
     try:
         path = Path(path)
-        if not path.exists():
+        if not _paper_file_exists(path):
             return rows
-        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()[-int(limit):]
+        lines = _read_guarded_paper_tail_lines(
+            path, limit=max(0, int(limit)), max_bytes=6 * 1024 * 1024
+        )
         for line in lines:
             line = line.strip()
             if not line:
@@ -57490,8 +57807,12 @@ def _frpp_v1_read_jsonl(path, limit=300):
 def _frpp_v1_load_json(path):
     try:
         path = Path(path)
-        if path.exists():
-            obj = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        if _paper_file_exists(path):
+            obj = json.loads(
+                _read_guarded_paper_text(
+                    path, encoding="utf-8", max_bytes=6 * 1024 * 1024
+                )
+            )
             return obj if isinstance(obj, dict) else {}
     except Exception:
         pass
@@ -58372,19 +58693,25 @@ def _flad_v1_public(obj, max_string=1200):
 
 def _flad_v1_write_snapshot(path, payload):
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(_flad_v1_public(payload), f, ensure_ascii=False, indent=2, default=str)
+        serializable_payload = json.loads(
+            json.dumps(
+                _flad_v1_public(payload),
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        )
+        _write_central_paper_audit_json(Path(path), serializable_payload)
         return True
     except Exception:
         return False
 
 def _flad_v1_append_event(path, payload):
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
         row = _flad_v1_public(payload)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        _append_central_paper_audit_event(
+            Path(path), json.dumps(row, ensure_ascii=False, default=str) + "\n"
+        )
         return True
     except Exception:
         return False
@@ -59783,10 +60110,10 @@ def _rcrm_v1_public(obj):
 def _rcrm_v1_write(path, payload):
     try:
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        tmp.replace(path)
+        serializable_payload = json.loads(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        )
+        _write_central_paper_audit_json(path, serializable_payload)
         return True
     except Exception:
         return False
@@ -59795,9 +60122,9 @@ def _rcrm_v1_write(path, payload):
 def _rcrm_v1_append(path, payload):
     try:
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as file_obj:
-            file_obj.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        _append_central_paper_audit_event(
+            path, json.dumps(payload, ensure_ascii=False, default=str) + "\n"
+        )
         return True
     except Exception:
         return False
@@ -61091,7 +61418,7 @@ def _eaa_v1_combined_log(limit=50):
                 items.append(item)
 
     try:
-        if Path(EXECUTION_ATTEMPT_AUDIT_V1_FILE).exists():
+        if _paper_file_exists(Path(EXECUTION_ATTEMPT_AUDIT_V1_FILE)):
             files.append({"source": "execution_attempt_audit_v1", "path": str(EXECUTION_ATTEMPT_AUDIT_V1_FILE), "exists": True})
             add_rows(_eaa_v1_read_jsonl(EXECUTION_ATTEMPT_AUDIT_V1_FILE, limit=limit, source="execution_attempt_audit_v1"), "execution_attempt_audit_v1")
         else:
@@ -61102,8 +61429,16 @@ def _eaa_v1_combined_log(limit=50):
     if central_broker is not None:
         audit_path = getattr(central_broker, "EXECUTION_AUDIT_LOG_FILE", None)
         exec_path = getattr(central_broker, "EXECUTIONS_LOG_FILE", None)
-        files.append({"source": "broker_execution_audit", "path": str(audit_path), "exists": bool(audit_path and Path(audit_path).exists())})
-        files.append({"source": "broker_executions_log", "path": str(exec_path), "exists": bool(exec_path and Path(exec_path).exists())})
+        try:
+            audit_exists = _paper_file_exists(Path(audit_path)) if audit_path else False
+        except Exception:
+            audit_exists = None
+        try:
+            executions_exists = _paper_file_exists(Path(exec_path)) if exec_path else False
+        except Exception:
+            executions_exists = None
+        files.append({"source": "broker_execution_audit", "path": str(audit_path), "exists": audit_exists})
+        files.append({"source": "broker_executions_log", "path": str(exec_path), "exists": executions_exists})
         try:
             add_rows(central_broker.get_execution_audit_log(limit=limit), "broker_execution_audit")
         except Exception:
@@ -62357,10 +62692,15 @@ def _fcor_v1_counts(plan):
 
 def _fcor_v1_atomic_write(path, payload):
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp = path.with_suffix(path.suffix + ".tmp")
-        temp.write_text(json.dumps(_flad_v1_public(payload), ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        os.replace(temp, path)
+        serializable_payload = json.loads(
+            json.dumps(
+                _flad_v1_public(payload),
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        )
+        _write_central_paper_audit_json(Path(path), serializable_payload)
         return True, None
     except Exception as exc:
         return False, f"{type(exc).__name__}:{exc}"
@@ -62368,9 +62708,11 @@ def _fcor_v1_atomic_write(path, payload):
 
 def _fcor_v1_append(path, payload):
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(_flad_v1_public(payload), ensure_ascii=False, default=str) + "\n")
+        _append_central_paper_audit_event(
+            Path(path),
+            json.dumps(_flad_v1_public(payload), ensure_ascii=False, default=str)
+            + "\n",
+        )
         return True, None
     except Exception as exc:
         return False, f"{type(exc).__name__}:{exc}"
@@ -63477,11 +63819,15 @@ def _fmcd_v1_read_falcon_memory():
 def _fmcd_v1_read_liveorder_detail_snapshot():
     try:
         path = FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_LATEST_FILE
-        if not path.exists():
+        if not _paper_file_exists(path):
             return [], "LIVEORDER_DETAIL_SNAPSHOT_NOT_FOUND"
-        if path.stat().st_size > _FMCD_V1_LIVEORDER_SNAPSHOT_MAX_BYTES:
-            return [], "LIVEORDER_DETAIL_SNAPSHOT_TOO_LARGE"
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(
+            _read_guarded_paper_text(
+                path,
+                encoding="utf-8",
+                max_bytes=_FMCD_V1_LIVEORDER_SNAPSHOT_MAX_BYTES,
+            )
+        )
         if not isinstance(payload, dict):
             return [], "LIVEORDER_DETAIL_SNAPSHOT_INVALID"
         orders = payload.get("orders") if isinstance(payload.get("orders"), list) else []
@@ -65248,12 +65594,18 @@ def _fdsff_v1_read_falcon_health(query):
 
 def _fdsff_v1_read_snapshot_records(path, source, query):
     try:
-        if path is None or not path.exists():
+        if path is None or not _paper_file_exists(path):
             return [], f"{source.upper().replace('.', '_')}_NOT_FOUND"
-        if path.stat().st_size > _FDSFF_V1_MAX_SNAPSHOT_BYTES:
-            return [], f"{source.upper().replace('.', '_')}_TOO_LARGE"
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(
+            _read_guarded_paper_text(
+                path,
+                encoding="utf-8",
+                max_bytes=_FDSFF_V1_MAX_SNAPSHOT_BYTES,
+            )
+        )
     except Exception as exc:
+        if "PAPER_FILE_SIZE_LIMIT_EXCEEDED" in str(exc):
+            return [], f"{source.upper().replace('.', '_')}_TOO_LARGE"
         return [], f"{source.upper().replace('.', '_')}_READ_ERROR:{type(exc).__name__}"
     direct_identity_keys = {
         "order_id", "orderId", "stop_order_id", "broker_stop_order_id",
@@ -65334,7 +65686,15 @@ def _fdsff_v1_read_local_events(query):
             metadata.append(source_meta)
             per_source_matches.append([])
             continue
-        if not path.exists():
+        try:
+            path_exists = _paper_file_exists(path)
+        except Exception as exc:
+            source_meta["read_error"] = f"PATH_GUARD_ERROR:{type(exc).__name__}"
+            errors.append(f"{source}:{source_meta['read_error']}")
+            metadata.append(source_meta)
+            per_source_matches.append([])
+            continue
+        if not path_exists:
             source_meta["read_error"] = "SOURCE_NOT_FOUND"
             errors.append(f"{source}:SOURCE_NOT_FOUND")
             metadata.append(source_meta)
@@ -69039,19 +69399,19 @@ def _pacs_v1_lifecycle_blockers(snapshot):
 
 def _pacs_v1_atomic_write_json(path, payload):
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp = target.with_suffix(target.suffix + ".tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    os.replace(temp, target)
+    serializable_payload = json.loads(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    )
+    _write_central_paper_audit_json(target, serializable_payload)
 
 
 def _pacs_v1_write_audit(payload):
     try:
         _pacs_v1_atomic_write_json(PREDATOR_AUTO_CLOSED_SYNC_V1_LATEST_FILE, payload)
         events = Path(PREDATOR_AUTO_CLOSED_SYNC_V1_EVENTS_FILE)
-        events.parent.mkdir(parents=True, exist_ok=True)
-        with events.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps({
+        _append_central_paper_audit_event(
+            events,
+            json.dumps({
                 "event": "PREDATOR_AUTO_CLOSED_SYNC_RUN",
                 "generated_at": payload.get("generated_at"),
                 "status": payload.get("status"),
@@ -69061,7 +69421,8 @@ def _pacs_v1_write_audit(payload):
                 "repaired_trade_ids": payload.get("repaired_trade_ids"),
                 "reason": payload.get("reason"),
                 "errors": payload.get("errors"),
-            }, ensure_ascii=False, default=str) + "\n")
+            }, ensure_ascii=False, default=str) + "\n",
+        )
         return None
     except Exception as exc:
         return str(exc)
@@ -70273,7 +70634,7 @@ def _trpsf_v1_preview_bootstrap_registry():
     with registry_lock:
         active = _trpsf_v1_active_file()
         legacy_paths = _trpsf_v1_legacy_candidate_paths()
-        active_exists = active.exists()
+        active_exists = _paper_file_exists(active)
         active_reg = _trpsf_v1_read_json(active)
         active_shape_errors = (
             _trpsf_v1_registry_shape_errors(active_reg)
@@ -70303,7 +70664,7 @@ def _trpsf_v1_preview_bootstrap_registry():
             try:
                 if str(path) == str(active):
                     continue
-                source_exists = Path(path).exists()
+                source_exists = _paper_file_exists(Path(path))
                 registry = _trpsf_v1_read_json(path)
                 if source_exists and not isinstance(registry, dict):
                     source_read_errors.append("LEGACY_REGISTRY_READ_ERROR")

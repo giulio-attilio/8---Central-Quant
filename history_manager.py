@@ -34,17 +34,25 @@ from history_memory_guard import (
     iter_jsonl_tail,
     validate_history_limits,
 )
+from paper_state_storage import (
+    ensure_paper_data_dir as _ensure_paper_data_dir,
+    open_paper_binary as _open_paper_binary,
+    open_paper_text as _open_paper_text,
+    paper_file_exists as _paper_file_exists,
+    paper_file_stat as _paper_file_stat,
+    resolve_paper_data_dir as _resolve_paper_data_dir,
+    write_json_atomically as _write_json_atomically,
+)
 
 
 TIMEZONE_BR = timezone(timedelta(hours=-3))
 
 BASE_DIR = Path(__file__).resolve().parent
 
-DATA_DIR = Path(
-    os.getenv("DATA_DIR", str(BASE_DIR / "data"))
-).resolve()
+DATA_DIR = _resolve_paper_data_dir(__file__)
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+if not _ensure_paper_data_dir(DATA_DIR):
+    raise RuntimeError("HISTORY_DATA_DIR_NOT_AVAILABLE")
 
 HISTORY_EVENTS_FILE = DATA_DIR / "history_events.jsonl"
 DECISION_LOG_FILE = DATA_DIR / "decision_log.jsonl"
@@ -115,7 +123,8 @@ _HISTORY_EVENTS_ROTATION_LOCK = threading.RLock()
 
 def ensure_history_files():
     """Garante que os arquivos básicos do Super History existam."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not _ensure_paper_data_dir(DATA_DIR):
+        raise RuntimeError("HISTORY_DATA_DIR_NOT_AVAILABLE")
 
     for file_path in [
         HISTORY_EVENTS_FILE,
@@ -123,17 +132,17 @@ def ensure_history_files():
         TIMELINE_LOG_FILE,
         CLOSED_TRADES_FILE,
     ]:
-        if not file_path.exists():
-            file_path.touch()
+        if not _paper_file_exists(file_path):
+            with _open_paper_text(file_path, "a", encoding="utf-8"):
+                pass
 
-    if not HISTORY_EXPORT_FILE.exists():
-        HISTORY_EXPORT_FILE.write_text("{}", encoding="utf-8")
+    if not _paper_file_exists(HISTORY_EXPORT_FILE):
+        if not _write_json(HISTORY_EXPORT_FILE, {}):
+            raise RuntimeError("HISTORY_EXPORT_INITIALIZATION_FAILED")
 
-    if not HISTORY_SEEN_FILE.exists():
-        HISTORY_SEEN_FILE.write_text("{}", encoding="utf-8")
-
-
-ensure_history_files()
+    if not _paper_file_exists(HISTORY_SEEN_FILE):
+        if not _write_json(HISTORY_SEEN_FILE, {}):
+            raise RuntimeError("HISTORY_SEEN_INITIALIZATION_FAILED")
 
 
 HISTORY_MAX_READ = min(
@@ -197,7 +206,6 @@ def _is_history_events_path(path):
 def _append_jsonl_unlocked(path: Path, item: dict):
     probe = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(item, ensure_ascii=False, default=_json_default) + "\n"
         try:
             from decision_log_forensics import decision_log_write_probe
@@ -211,7 +219,7 @@ def _append_jsonl_unlocked(path: Path, item: dict):
             probe.begin()
         except Exception:
             probe = None
-        with path.open("a", encoding="utf-8") as f:
+        with _open_paper_text(path, "a", encoding="utf-8") as f:
             f.write(line)
         if probe is not None:
             probe.finish(True)
@@ -264,9 +272,9 @@ def _read_jsonl_tail(path: Path, limit=None, max_bytes=None, include_metadata=Fa
 
 def _count_jsonl(path: Path):
     try:
-        if not path.exists():
+        if not _paper_file_exists(path):
             return 0
-        with path.open("r", encoding="utf-8") as f:
+        with _open_paper_text(path, "r", encoding="utf-8") as f:
             return sum(1 for line in f if line.strip())
     except Exception:
         return 0
@@ -274,9 +282,9 @@ def _count_jsonl(path: Path):
 
 def _read_json(path: Path, default):
     try:
-        if not path.exists():
+        if not _paper_file_exists(path):
             return default
-        with path.open("r", encoding="utf-8") as f:
+        with _open_paper_text(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
@@ -284,13 +292,16 @@ def _read_json(path: Path, default):
 
 def _write_json(path: Path, payload):
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2, default=_json_default)
-        return True
+        serializable = json.loads(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default)
+        )
+        return _write_json_atomically(path, serializable)
     except Exception as exc:
         print(f"ERRO HISTORY write_json {path}: {exc}")
         return False
+
+
+ensure_history_files()
 
 
 def normalize_symbol(symbol):
@@ -406,7 +417,7 @@ def _history_rotation_v1_parse_line(raw_line):
 
 def _history_rotation_v1_iter_snapshot(path, source_size):
     consumed = 0
-    with Path(path).open("rb") as handle:
+    with _open_paper_binary(Path(path), "rb") as handle:
         while consumed < source_size:
             raw_line = handle.readline(source_size - consumed)
             if not raw_line:
@@ -448,15 +459,12 @@ def preview_history_events_rotation(keep_recent=HISTORY_ROTATION_V1_KEEP_RECENT,
         "warnings": [],
     }
     try:
-        if not source.exists():
+        if not _paper_file_exists(source):
             base.update(reason="HISTORY_EVENTS_FILE_NOT_FOUND", errors=["HISTORY_EVENTS_FILE_NOT_FOUND"])
-            return base
-        if source.is_symlink() or not source.is_file():
-            base.update(reason="HISTORY_EVENTS_FILE_NOT_REGULAR", errors=["HISTORY_EVENTS_FILE_NOT_REGULAR"])
             return base
 
         with _HISTORY_EVENTS_ROTATION_LOCK:
-            source_stat = source.stat()
+            source_stat = _paper_file_stat(source)
             source_size = int(source_stat.st_size)
         base["current_size_mb"] = _history_rotation_v1_mb(source_size)
         base["source_size_bytes"] = source_size
@@ -541,9 +549,53 @@ def _history_rotation_v1_should_keep(event, is_recent):
     return classification != "DROPPABLE"
 
 
+def _history_rewrite_blocked_on_render(path):
+    """Fail closed for path-based history rewrites on Render.
+
+    The streaming maintenance routines below still use pathname-based temp
+    files and ``os.replace``. Until they are migrated to a descriptor-anchored
+    transaction, they must not rewrite persistent Render data. The path check
+    also covers a /data alias when the platform flag is absent.
+    """
+    if os.environ.get("RENDER", "").strip().lower() == "true":
+        return True
+    target = Path(os.path.abspath(os.fspath(path)))
+    data_root = Path("/data")
+    try:
+        target.relative_to(data_root)
+        return True
+    except ValueError:
+        pass
+    try:
+        target.resolve(strict=False).relative_to(data_root.resolve(strict=False))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _history_rewrite_blocked_result(path, *, operation):
+    return {
+        "ok": False,
+        "status": "BLOCKED_STORAGE_GUARD_REQUIRED",
+        "reason": "DESCRIPTOR_ANCHORED_REWRITE_NOT_IMPLEMENTED",
+        "operation": operation,
+        "file": str(path),
+        "dry_run": False,
+        "committed": False,
+        "safe_to_commit": False,
+        "errors": ["PERSISTENT_HISTORY_REWRITE_BLOCKED"],
+        "warnings": [],
+    }
+
+
 def commit_history_events_rotation(ack, keep_recent=HISTORY_ROTATION_V1_KEEP_RECENT, path=None):
     """Atomically compact history events after an explicit ACK."""
     source = Path(path or HISTORY_EVENTS_FILE)
+    if _history_rewrite_blocked_on_render(source):
+        return _history_rewrite_blocked_result(
+            source,
+            operation="history_events_rotation",
+        )
     preview = preview_history_events_rotation(keep_recent=keep_recent, path=source)
     result = {
         **preview,
@@ -865,11 +917,8 @@ def preview_history_events_emergency_rotation(
         "errors": [],
     }
     try:
-        if not source.exists():
+        if not _paper_file_exists(source):
             base.update(reason="HISTORY_EVENTS_FILE_NOT_FOUND", errors=["HISTORY_EVENTS_FILE_NOT_FOUND"])
-            return base
-        if source.is_symlink() or not source.is_file():
-            base.update(reason="HISTORY_EVENTS_FILE_NOT_REGULAR", errors=["HISTORY_EVENTS_FILE_NOT_REGULAR"])
             return base
 
         live_error = str(central_live_positions_error or "").strip() or None
@@ -898,7 +947,7 @@ def preview_history_events_emergency_rotation(
         base["central_live_positions_error"] = live_error
 
         with _HISTORY_EVENTS_ROTATION_LOCK:
-            source_stat = source.stat()
+            source_stat = _paper_file_stat(source)
             source_size = int(source_stat.st_size)
         source_hash = hashlib.sha256()
         events_read = 0
@@ -1082,7 +1131,7 @@ def _history_rotation_emergency_v1_write_json_fsync(path, payload):
 
 
 def _history_rotation_emergency_v1_validate_output(path, max_output_bytes):
-    output_size = Path(path).stat().st_size
+    output_size = _paper_file_stat(Path(path)).st_size
     if output_size > max_output_bytes:
         raise ValueError("EMERGENCY_OUTPUT_EXCEEDS_TARGET")
     records = 0
@@ -1107,6 +1156,11 @@ def commit_history_events_emergency_rotation(
 ):
     """Perform the separately acknowledged low-disk emergency rewrite."""
     source = Path(path or HISTORY_EVENTS_FILE)
+    if _history_rewrite_blocked_on_render(source):
+        return _history_rewrite_blocked_result(
+            source,
+            operation="history_events_emergency_rotation",
+        )
     if str(ack or "").strip() != HISTORY_ROTATION_EMERGENCY_V1_ACK:
         return {
             "ok": False,
@@ -2002,14 +2056,14 @@ def _load_closed_trade_keys(limit=None):
 
 def _closed_trade_key_index_size():
     try:
-        return int(CLOSED_TRADES_FILE.stat().st_size)
+        return int(_paper_file_stat(CLOSED_TRADES_FILE).st_size)
     except OSError:
         return 0
 
 
 def _closed_trade_key_index_watermark():
     try:
-        stat = CLOSED_TRADES_FILE.stat()
+        stat = _paper_file_stat(CLOSED_TRADES_FILE)
         return int(stat.st_size), int(stat.st_mtime_ns)
     except OSError:
         return 0, 0
@@ -2024,7 +2078,7 @@ def _rebuild_closed_trade_key_index_streaming():
     keys = set()
     invalid_lines = 0
     try:
-        with CLOSED_TRADES_FILE.open("r", encoding="utf-8") as handle:
+        with _open_paper_text(CLOSED_TRADES_FILE, "r", encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
                     continue
@@ -2055,17 +2109,9 @@ def _write_closed_trade_key_index(keys):
         "keys_checksum_sha256": _closed_trade_key_index_checksum(ordered_keys),
         "keys": ordered_keys,
     }
-    temp = CLOSED_TRADE_KEY_INDEX_FILE.with_suffix(".tmp")
     try:
-        CLOSED_TRADE_KEY_INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
-        temp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-        temp.replace(CLOSED_TRADE_KEY_INDEX_FILE)
-        return True
+        return _write_json_atomically(CLOSED_TRADE_KEY_INDEX_FILE, payload)
     except Exception:
-        try:
-            temp.unlink(missing_ok=True)
-        except Exception:
-            pass
         return False
 
 
@@ -2073,7 +2119,9 @@ def _closed_trade_key_index_state():
     """Load minimal persisted identities; rebuild only when absent, invalid or stale."""
     integrity_error = None
     try:
-        raw = json.loads(CLOSED_TRADE_KEY_INDEX_FILE.read_text(encoding="utf-8"))
+        raw = _read_json(CLOSED_TRADE_KEY_INDEX_FILE, None)
+        if raw is None:
+            raise ValueError("closed trade key index unavailable")
         keys = raw.get("keys") if isinstance(raw, dict) else None
         saved_size = raw.get("closed_trades_size") if isinstance(raw, dict) else None
         saved_mtime_ns = raw.get("closed_trades_mtime_ns") if isinstance(raw, dict) else None
@@ -2443,6 +2491,11 @@ def rebuild_closed_trades_v4_from_events(limit=None):
     Reconstrói closed_trades.jsonl a partir dos eventos TRADE_CLOSED,
     usando trade_record.py para gerar o schema TRADE_RECORD_V1.
     """
+    if _history_rewrite_blocked_on_render(CLOSED_TRADES_FILE):
+        return _history_rewrite_blocked_result(
+            CLOSED_TRADES_FILE,
+            operation="closed_trades_rebuild",
+        )
     try:
         ensure_history_files()
 
@@ -2640,6 +2693,11 @@ def backfill_closed_trades_from_events(limit=None, force=False):
     Por padrão é incremental e deduplicado. Use force=True apenas se quiser
     regravar o arquivo do zero.
     """
+    if force and _history_rewrite_blocked_on_render(CLOSED_TRADES_FILE):
+        return _history_rewrite_blocked_result(
+            CLOSED_TRADES_FILE,
+            operation="closed_trades_forced_backfill",
+        )
     try:
         ensure_history_files()
         if force:

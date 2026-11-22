@@ -23,6 +23,7 @@ from registry_execution_schema import (
     build_registry_v2_indexes,
     validate_registry_execution_row,
 )
+from paper_state_storage import open_paper_text
 
 
 REGISTRY_V2_READ_OK = "REGISTRY_V2_READ_OK"
@@ -156,7 +157,7 @@ def read_registry_v2(path: Any) -> RegistryV2ReadResult:
 
     try:
         path_object = Path(path)
-        with path_object.open("r", encoding="utf-8") as handle:
+        with open_paper_text(path_object, "r", encoding="utf-8") as handle:
             document = json.load(handle, parse_constant=_reject_non_finite)
     except FileNotFoundError:
         return _result(False, REGISTRY_V2_FILE_NOT_FOUND, path_text, errors=("file_not_found",))

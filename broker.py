@@ -60,6 +60,7 @@ from urllib.parse import urlencode
 
 import ccxt
 from runtime_drain_v1 import RUNTIME_DRAIN, guard_new_live_entries
+from paper_state_storage import append_paper_text, read_paper_tail_lines
 
 from account_client_order_id import (
     ROLE_BREAK_EVEN_STOP,
@@ -1229,10 +1230,11 @@ def log_execution_event(event: dict):
         payload.setdefault("execution_mode", EXECUTION_MODE)
         payload.setdefault("enable_real_trading", ENABLE_REAL_TRADING)
         path = Path(EXECUTIONS_LOG_FILE)
-        if path.parent:
-            path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, default=_json_default) + "\n")
+        append_paper_text(
+            path,
+            json.dumps(payload, ensure_ascii=False, default=_json_default) + "\n",
+            encoding="utf-8",
+        )
         return True
     except Exception:
         return False
@@ -1280,10 +1282,11 @@ def log_execution_audit_event(event: dict):
         payload.setdefault("broker_dry_run", BROKER_DRY_RUN)
         payload.setdefault("api_key_masked", mask_secret(BINGX_API_KEY))
         path = Path(EXECUTION_AUDIT_LOG_FILE)
-        if path.parent:
-            path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, default=_json_default) + "\n")
+        append_paper_text(
+            path,
+            json.dumps(payload, ensure_ascii=False, default=_json_default) + "\n",
+            encoding="utf-8",
+        )
         return True
     except Exception:
         return False
@@ -1294,9 +1297,10 @@ def _read_jsonl_file(path, limit=None, source=None):
         limit = int(limit or EXECUTION_AUDIT_LOG_MAX_READ)
         limit = max(1, min(limit, 500))
         p = Path(path)
-        if not p.exists():
+        try:
+            lines = read_paper_tail_lines(p, limit=limit, max_bytes=6 * 1024 * 1024)
+        except FileNotFoundError:
             return []
-        lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()[-limit:]
         out = []
         for line in lines:
             try:
@@ -1322,7 +1326,10 @@ def get_execution_audit_log(limit: int = None):
     rows = []
     rows.extend(_read_jsonl_file(EXECUTION_AUDIT_LOG_FILE, limit=limit, source="broker_execution_audit_primary"))
     try:
-        if str(BROKER_LEGACY_AUDIT_LOG_FILE) != str(EXECUTION_AUDIT_LOG_FILE):
+        if (
+            os.environ.get("RENDER", "").strip().lower() != "true"
+            and str(BROKER_LEGACY_AUDIT_LOG_FILE) != str(EXECUTION_AUDIT_LOG_FILE)
+        ):
             rows.extend(_read_jsonl_file(BROKER_LEGACY_AUDIT_LOG_FILE, limit=limit, source="broker_execution_audit_legacy"))
     except Exception:
         pass
@@ -1340,7 +1347,10 @@ def get_executions_log(limit: int = None):
     rows = []
     rows.extend(_read_jsonl_file(EXECUTIONS_LOG_FILE, limit=limit, source="broker_executions_primary"))
     try:
-        if str(BROKER_LEGACY_EXECUTIONS_LOG_FILE) != str(EXECUTIONS_LOG_FILE):
+        if (
+            os.environ.get("RENDER", "").strip().lower() != "true"
+            and str(BROKER_LEGACY_EXECUTIONS_LOG_FILE) != str(EXECUTIONS_LOG_FILE)
+        ):
             rows.extend(_read_jsonl_file(BROKER_LEGACY_EXECUTIONS_LOG_FILE, limit=limit, source="broker_executions_legacy"))
     except Exception:
         pass

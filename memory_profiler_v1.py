@@ -23,15 +23,27 @@ import threading
 import traceback
 from datetime import datetime
 from collections import Counter
+from pathlib import Path
 
 from memory_gc_coordinator import coordinate_memory_gc
+from paper_state_storage import (
+    append_paper_text,
+    ensure_paper_data_dir,
+    open_paper_binary,
+    paper_file_exists,
+    paper_file_stat,
+    read_paper_tail_lines,
+    resolve_paper_data_dir,
+    write_json_atomically,
+    write_paper_bytes_atomically,
+)
 
 VERSION = "2026-07-05-MEMORY-PROFILER-V1.4"
 
-DATA_DIR = os.environ.get("CENTRAL_DATA_DIR", "/opt/render/project/src/data")
-SNAPSHOT_FILE = os.path.join(DATA_DIR, "memory_profiler_snapshots.jsonl")
-STATE_FILE = os.path.join(DATA_DIR, "memory_profiler_state.json")
-ERROR_FILE = os.path.join(DATA_DIR, "memory_profiler_error.log")
+DATA_DIR = resolve_paper_data_dir(__file__)
+SNAPSHOT_FILE = DATA_DIR / "memory_profiler_snapshots.jsonl"
+STATE_FILE = DATA_DIR / "memory_profiler_state.json"
+ERROR_FILE = DATA_DIR / "memory_profiler_error.log"
 
 DEFAULT_LIMIT_MB = float(os.environ.get("RENDER_MEMORY_LIMIT_MB", os.environ.get("MEMORY_LIMIT_MB", "512")))
 DEFAULT_INTERVAL_SECONDS = int(os.environ.get("MEMORY_PROFILER_INTERVAL_SECONDS", "300"))
@@ -57,9 +69,9 @@ def _now_iso():
 
 def _ensure_data_dir():
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
+        return ensure_paper_data_dir(DATA_DIR)
     except Exception:
-        pass
+        return False
 
 
 def _safe_round(value, digits=2):
@@ -71,22 +83,21 @@ def _safe_round(value, digits=2):
 
 def _maybe_trim_snapshot_file():
     try:
-        if not os.path.exists(SNAPSHOT_FILE):
+        if not paper_file_exists(SNAPSHOT_FILE):
             return
-        size = os.path.getsize(SNAPSHOT_FILE)
+        size = paper_file_stat(SNAPSHOT_FILE).st_size
         if size <= SNAPSHOT_MAX_BYTES:
             return
 
         keep_bytes = max(128 * 1024, SNAPSHOT_MAX_BYTES // 2)
-        with open(SNAPSHOT_FILE, "rb") as f:
+        with open_paper_binary(SNAPSHOT_FILE, "rb") as f:
             f.seek(max(0, size - keep_bytes))
             data = f.read()
 
         if b"\n" in data:
             data = data.split(b"\n", 1)[1]
 
-        with open(SNAPSHOT_FILE, "wb") as f:
-            f.write(data)
+        write_paper_bytes_atomically(SNAPSHOT_FILE, data)
     except Exception:
         pass
 
@@ -262,29 +273,12 @@ def _get_tracemalloc_summary(force=False):
 
 
 def _read_last_snapshots(limit=8):
-    if not os.path.exists(SNAPSHOT_FILE):
-        return []
-
     try:
-        with open(SNAPSHOT_FILE, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            end = f.tell()
-            block_size = 4096
-            data = b""
-            pos = end
-
-            while pos > 0 and data.count(b"\n") <= limit:
-                read_size = min(block_size, pos)
-                pos -= read_size
-                f.seek(pos)
-                data = f.read(read_size) + data
-
-            lines = data.splitlines()[-limit:]
-
+        lines = read_paper_tail_lines(SNAPSHOT_FILE, limit=limit)
         out = []
         for line in lines:
             try:
-                out.append(json.loads(line.decode("utf-8")))
+                out.append(json.loads(line))
             except Exception:
                 pass
         return out
@@ -293,24 +287,28 @@ def _read_last_snapshots(limit=8):
 
 
 def _append_snapshot(snapshot):
-    _ensure_data_dir()
+    if not _ensure_data_dir():
+        raise OSError("MEMORY_PROFILER_DATA_DIR_NOT_PERSISTENT")
     _maybe_trim_snapshot_file()
-    with open(SNAPSHOT_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(snapshot, ensure_ascii=False, sort_keys=True) + "\n")
+    append_paper_text(
+        SNAPSHOT_FILE,
+        json.dumps(snapshot, ensure_ascii=False, sort_keys=True) + "\n",
+    )
 
 
 def _save_state(snapshot):
-    _ensure_data_dir()
+    if not _ensure_data_dir():
+        raise OSError("MEMORY_PROFILER_DATA_DIR_NOT_PERSISTENT")
     state = {
         "ok": True,
         "version": VERSION,
         "updated_at": _now(),
-        "snapshot_file": SNAPSHOT_FILE,
-        "state_file": STATE_FILE,
+        "snapshot_file": str(SNAPSHOT_FILE),
+        "state_file": str(STATE_FILE),
         "last_snapshot": snapshot,
     }
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+    if not write_json_atomically(STATE_FILE, state):
+        raise OSError("MEMORY_PROFILER_STATE_WRITE_FAILED")
 
 
 def _profiler_malloc_trim_safe():
@@ -666,8 +664,8 @@ def start_memory_profiler(interval_seconds=DEFAULT_INTERVAL_SECONDS):
         "started": True,
         "version": VERSION,
         "interval_seconds": interval_seconds,
-        "snapshot_file": SNAPSHOT_FILE,
-        "state_file": STATE_FILE,
+        "snapshot_file": str(SNAPSHOT_FILE),
+        "state_file": str(STATE_FILE),
     }
 
 
@@ -703,9 +701,11 @@ def _memory_loop(interval_seconds):
             )
         except Exception:
             try:
-                _ensure_data_dir()
-                with open(ERROR_FILE, "a", encoding="utf-8") as f:
-                    f.write(_now() + " | " + traceback.format_exc() + "\n")
+                if _ensure_data_dir():
+                    append_paper_text(
+                        ERROR_FILE,
+                        _now() + " | " + traceback.format_exc() + "\n",
+                    )
             except Exception:
                 pass
 

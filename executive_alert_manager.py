@@ -25,12 +25,12 @@ import hashlib
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from paper_state_storage import append_paper_text, paper_data_mount_verified, paper_file_exists, read_paper_text, resolve_paper_data_dir, write_json_atomically
 
 
 VERSION = "2026-07-07-EXECUTIVE-ALERT-MANAGER-V2.1"
 
-DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = resolve_paper_data_dir(__file__)
 
 EXECUTIVE_ALERT_STATE_FILE = DATA_DIR / "executive_alert_state.json"
 EXECUTIVE_ALERT_LOG_FILE = DATA_DIR / "executive_alert_log.jsonl"
@@ -77,21 +77,23 @@ def _now_br() -> str:
 
 
 def _read_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
+    if not paper_data_mount_verified(path):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        if not paper_file_exists(path):
+            return default
+        return json.loads(read_paper_text(path, encoding="utf-8"))
     except Exception:
         return default
 
 
 def _write_json(path: Path, payload: Any) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if not write_json_atomically(path, payload):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED_OR_WRITE_FAILED")
 
 
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    append_paper_text(path, json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -807,7 +809,7 @@ def build_executive_alerts_text(limit: int = 10, notify_only: bool = False) -> s
 
 
 def read_executive_alert_log(limit: int = 20) -> Dict[str, Any]:
-    if not EXECUTIVE_ALERT_LOG_FILE.exists():
+    if not paper_file_exists(EXECUTIVE_ALERT_LOG_FILE):
         return {
             "ok": True,
             "generated_at": _now_br(),
@@ -815,7 +817,7 @@ def read_executive_alert_log(limit: int = 20) -> Dict[str, Any]:
             "items": [],
         }
 
-    lines = EXECUTIVE_ALERT_LOG_FILE.read_text(encoding="utf-8").splitlines()
+    lines = read_paper_text(EXECUTIVE_ALERT_LOG_FILE, encoding="utf-8").splitlines()
     selected = lines[-max(1, int(limit)):]
 
     items = []

@@ -111,6 +111,10 @@ def _compile_stop_evidence_namespace(
         "CENTRAL_DATA_DIR": tmp_path,
         "Path": Path,
         "json": json,
+        "_paper_file_exists": lambda path: Path(path).is_file(),
+        "_paper_file_stat": lambda path: Path(path).stat(),
+        "_open_guarded_paper_binary": lambda path, mode: Path(path).open(mode),
+        "_open_guarded_paper_text": lambda path, mode="r", **kwargs: Path(path).open(mode, **kwargs),
         "request": SimpleNamespace(args=request_args or {}),
         "_trpsf_v1_truncated_number": lambda value: float(value) if isinstance(value, (int, float, str)) and str(value).strip() not in {"", "None"} else None,
     }

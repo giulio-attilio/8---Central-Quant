@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 from paper_state_storage import (
     ensure_paper_data_dir,
     paper_data_mount_verified,
+    paper_file_exists,
     read_paper_text,
     resolve_paper_data_dir,
 )
@@ -145,7 +146,23 @@ def _outcome_summary() -> Dict[str, Any]:
             "r_total": None,
             "r_avg": None,
         }
-    if not OUTCOME_STATS_FILE.is_file():
+    try:
+        stats_file_present = paper_file_exists(OUTCOME_STATS_FILE)
+    except OSError:
+        return {
+            "exists": None,
+            "status": "PAPER_DATA_MOUNT_NOT_VERIFIED",
+            "updated_at": None,
+            "trades": None,
+            "wins": None,
+            "losses": None,
+            "win_rate_pct": None,
+            "tp50_hit_rate_pct": None,
+            "pnl_total_pct": None,
+            "r_total": None,
+            "r_avg": None,
+        }
+    if not stats_file_present:
         return {
             "exists": False,
             "status": "OUTCOME_STATS_MISSING",
@@ -192,7 +209,7 @@ def _outcome_summary() -> Dict[str, Any]:
         }
 
     return {
-        "exists": OUTCOME_STATS_FILE.exists(),
+        "exists": stats_file_present,
         "status": "OK",
         "updated_at": stats.get("updated_at") if isinstance(stats, dict) else None,
         "trades": global_stats.get("trades", 0),
@@ -230,8 +247,12 @@ def _adaptive_summary() -> Dict[str, Any]:
     if not isinstance(global_w, dict):
         global_w = {}
 
+    try:
+        weights_file_present = paper_file_exists(ADAPTIVE_WEIGHTS_FILE)
+    except OSError:
+        weights_file_present = None
     return {
-        "exists": ADAPTIVE_WEIGHTS_FILE.exists(),
+        "exists": weights_file_present,
         "updated_at": weights.get("updated_at") if isinstance(weights, dict) else None,
         "source_outcome_updated_at": weights.get("source_outcome_updated_at") if isinstance(weights, dict) else None,
         "trades": global_w.get("trades", 0),

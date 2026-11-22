@@ -76,6 +76,44 @@ def test_disabled_by_default(monkeypatch, tmp_path):
     assert instance.list_events()["items"] == []
 
 
+def test_default_data_dir_honors_data_dir(monkeypatch, tmp_path):
+    monkeypatch.delenv("TRADE_LIFECYCLE_SHADOW_DATA_DIR", raising=False)
+    monkeypatch.delenv("CENTRAL_DATA_DIR", raising=False)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+
+    instance = TradeLifecycleShadowObservability(enabled=True)
+
+    assert instance.data_dir == tmp_path
+
+
+def test_render_rejects_ephemeral_observability_reads(monkeypatch, tmp_path):
+    if os.name == "nt":
+        pytest.skip("Render mount enforcement is POSIX-specific")
+    monkeypatch.setenv("RENDER", "true")
+    instance = TradeLifecycleShadowObservability(enabled=True, data_dir=tmp_path)
+
+    result = instance.list_events()
+
+    assert result["ok"] is False
+    assert result["status"] == "UNAVAILABLE"
+    assert result["items"] == []
+
+
+def test_observability_files_use_shared_guarded_openers():
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    direct_path_opens = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "open"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr in {"state_file", "events_file", "divergences_file"}
+    ]
+
+    assert direct_path_opens == []
+
+
 def test_health_authorities_and_schema(obs):
     health = obs.get_health()
     assert health["schema_version"] == "1.0"

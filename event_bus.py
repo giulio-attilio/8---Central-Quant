@@ -14,6 +14,7 @@ import threading
 import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from paper_state_storage import append_paper_text, paper_data_mount_verified, paper_file_exists, read_paper_text, resolve_paper_data_dir, write_json_atomically
 
 try:
     import history_manager
@@ -24,8 +25,7 @@ except Exception as exc:
 
 TIMEZONE_BR = timezone(timedelta(hours=-3))
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR = resolve_paper_data_dir(__file__)
 EVENT_BUS_LOG_FILE = DATA_DIR / "event_bus.jsonl"
 EVENT_BUS_SEEN_FILE = DATA_DIR / "event_bus_seen.json"
 EVENT_BUS_SEEN_MAX = max(1, int(os.environ.get("EVENT_BUS_SEEN_MAX", "5000")))
@@ -45,28 +45,30 @@ def _json_default(value):
 
 
 def _read_json(path, default):
+    if not paper_data_mount_verified(Path(path)):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
     try:
-        if not path.exists():
+        if not paper_file_exists(Path(path)):
             return default
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(read_paper_text(Path(path), encoding="utf-8"))
     except Exception:
         return default
 
 
 def _write_json(path, payload):
     try:
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2, default=_json_default)
-        return True
+        serializable = json.loads(json.dumps(payload, ensure_ascii=False, default=_json_default))
+        return write_json_atomically(Path(path), serializable)
     except Exception:
         return False
 
 
 def _append_jsonl(path, item):
     try:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(item, ensure_ascii=False, default=_json_default) + "\n")
+        append_paper_text(
+            Path(path),
+            json.dumps(item, ensure_ascii=False, default=_json_default) + "\n",
+        )
         return True
     except Exception:
         return False

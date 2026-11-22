@@ -207,6 +207,8 @@ def test_symlink_is_not_followed(tmp_path):
 
 
 def test_non_regular_file_is_rejected(tmp_path):
+    if os.name == "nt":
+        pytest.skip("directory-open rejection is POSIX-specific")
     with pytest.raises(ValueError, match="regular file"):
         guard.iter_jsonl_tail(tmp_path, 10, 1024)
 
@@ -367,6 +369,89 @@ def test_history_manager_uses_bounded_reader_and_metadata(tmp_path, monkeypatch)
         assert [row["id"] for row in page["records"]] == [3, 4]
         assert page["partial"] is True
         assert page["max_records"] == 2
+
+
+def test_history_manager_prefers_central_data_dir_and_uses_guarded_basic_io(tmp_path, monkeypatch):
+    central_dir = tmp_path / "central-data"
+    legacy_dir = tmp_path / "legacy-data"
+    monkeypatch.setenv("CENTRAL_DATA_DIR", str(central_dir))
+    monkeypatch.setenv("DATA_DIR", str(legacy_dir))
+    monkeypatch.delenv("RENDER", raising=False)
+
+    with _temporary_history_manager_module() as module:
+        assert module.DATA_DIR == central_dir
+        assert not legacy_dir.exists()
+        assert module.HISTORY_EXPORT_FILE.read_text(encoding="utf-8") == "{}"
+        assert module.HISTORY_SEEN_FILE.read_text(encoding="utf-8") == "{}"
+
+        assert module._append_jsonl(module.HISTORY_EVENTS_FILE, {"event": "TEST"}) is True
+        assert module._count_jsonl(module.HISTORY_EVENTS_FILE) == 1
+        assert module._read_jsonl_tail(module.HISTORY_EVENTS_FILE) == [{"event": "TEST"}]
+        path_value = Path("history-state-example")
+        assert module._write_json(module.HISTORY_SEEN_FILE, {"seen": 1, "path": path_value}) is True
+        assert module._read_json(module.HISTORY_SEEN_FILE, {}) == {
+            "seen": 1,
+            "path": str(path_value),
+        }
+
+
+def test_history_manager_basic_persistence_helpers_use_storage_guard():
+    tree = ast.parse((ROOT / "history_manager.py").read_text(encoding="utf-8"))
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for name in (
+        "ensure_history_files",
+        "_append_jsonl_unlocked",
+        "_count_jsonl",
+        "_read_json",
+        "_write_json",
+        "_closed_trade_key_index_size",
+        "_closed_trade_key_index_watermark",
+        "_rebuild_closed_trade_key_index_streaming",
+        "_write_closed_trade_key_index",
+        "_closed_trade_key_index_state",
+    ):
+        source = ast.unparse(functions[name])
+        assert ".open(" not in source
+        assert ".write_text(" not in source
+        assert ".touch(" not in source
+        assert ".mkdir(" not in source
+        assert ".read_text(" not in source
+        assert ".stat(" not in source
+        assert ".replace(" not in source
+        if name in {"_append_jsonl_unlocked", "_rebuild_closed_trade_key_index_streaming"}:
+            assert "_open_paper_text" in source
+        if name in {"_closed_trade_key_index_size", "_closed_trade_key_index_watermark"}:
+            assert "_paper_file_stat" in source
+        if name == "_write_closed_trade_key_index":
+            assert "_write_json_atomically" in source
+        if name in {"ensure_history_files", "_count_jsonl", "_read_json"}:
+            assert "_paper_file_exists" in source
+        if name == "_closed_trade_key_index_state":
+            assert "_read_json" in source
+
+    for name in (
+        "_history_rotation_v1_iter_snapshot",
+        "preview_history_events_rotation",
+        "preview_history_events_emergency_rotation",
+        "_history_rotation_emergency_v1_validate_output",
+    ):
+        source = ast.unparse(functions[name])
+        assert ".open(" not in source
+        assert ".stat(" not in source
+        assert ".exists(" not in source
+        if name == "_history_rotation_v1_iter_snapshot":
+            assert "_open_paper_binary" in source
+        if name in {"preview_history_events_rotation", "preview_history_events_emergency_rotation"}:
+            assert "_paper_file_exists" in source
+            assert "_paper_file_stat" in source
+        if name == "_history_rotation_emergency_v1_validate_output":
+            assert "_paper_file_stat" in source
+        if name == "_write_json":
+            assert "_write_json_atomically" in source
 
 
 def test_query_and_payload_declare_partial_coverage(tmp_path, monkeypatch):

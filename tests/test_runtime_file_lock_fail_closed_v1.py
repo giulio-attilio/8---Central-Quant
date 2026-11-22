@@ -26,7 +26,15 @@ def _lock_function():
 LOCK_FUNCTION = _lock_function()
 
 
-def _namespace(tmp_path, fcntl, *, handles=None, open_fn=open):
+def _namespace(
+    tmp_path,
+    fcntl,
+    *,
+    handles=None,
+    open_fn=open,
+    central_path=False,
+    guarded_open_fn=None,
+):
     return {
         "re": re,
         "os": os,
@@ -37,6 +45,8 @@ def _namespace(tmp_path, fcntl, *, handles=None, open_fn=open):
         "BASE_DIR": tmp_path,
         "data_hora_sp_str": lambda: "synthetic-time",
         "open": open_fn,
+        "_is_central_data_path": lambda _path: central_path,
+        "_open_guarded_paper_binary": guarded_open_fn or open_fn,
         "print": lambda *_args, **_kwargs: None,
     }
 
@@ -174,6 +184,42 @@ def test_duplicate_same_process_lock_request_is_denied(tmp_path):
         assert metadata["pid"] == os.getpid()
         assert acquire("central_telegram_polling") is False
         assert handles["central_telegram_polling"] is held
+    finally:
+        held.close()
+
+
+def test_central_lock_uses_guarded_binary_opener(tmp_path):
+    class WorkingFcntl:
+        LOCK_EX = 1
+        LOCK_NB = 2
+
+        @staticmethod
+        def flock(_fd, _flags):
+            return None
+
+    calls = []
+
+    def guarded_open(path, mode):
+        calls.append((Path(path), mode))
+        return open(path, mode)
+
+    handles = {}
+    acquire = _compile_lock(_namespace(
+        tmp_path,
+        WorkingFcntl,
+        handles=handles,
+        central_path=True,
+        guarded_open_fn=guarded_open,
+    ))
+
+    assert acquire("central_telegram_polling") is True
+    held = handles["central_telegram_polling"]
+    try:
+        assert calls == [(tmp_path / "central_telegram_polling.lock", "a+b")]
+        metadata = json.loads(
+            (tmp_path / "central_telegram_polling.lock").read_text(encoding="utf-8")
+        )
+        assert metadata["lock"] == "central_telegram_polling"
     finally:
         held.close()
 

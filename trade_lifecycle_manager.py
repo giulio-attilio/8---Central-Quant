@@ -17,6 +17,15 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+from paper_state_storage import (
+    append_paper_text,
+    ensure_paper_data_dir,
+    paper_file_exists,
+    read_paper_text,
+    resolve_paper_data_dir,
+    write_json_atomically,
+)
+
 
 TRADE_LIFECYCLE_SHADOW_MODE = True
 VERSION = "3.0.0-SHADOW"
@@ -277,8 +286,7 @@ _last_error: Optional[str] = None
 
 def _resolve_data_dir() -> Path:
     configured = os.environ.get("TRADE_LIFECYCLE_SHADOW_DATA_DIR")
-    fallback = os.environ.get("CENTRAL_DATA_DIR")
-    return Path(configured or fallback or (Path(__file__).resolve().parent / "data"))
+    return Path(configured) if configured else resolve_paper_data_dir(__file__)
 
 
 DATA_DIR = _resolve_data_dir()
@@ -332,10 +340,14 @@ def _ensure_loaded() -> None:
         if _loaded:
             return
         _loaded = True
-        if not SNAPSHOT_FILE.exists():
-            return
         try:
-            data = json.loads(SNAPSHOT_FILE.read_text(encoding="utf-8"))
+            if not paper_file_exists(SNAPSHOT_FILE):
+                return
+            data = json.loads(
+                read_paper_text(
+                    SNAPSHOT_FILE, encoding="utf-8", max_bytes=128 * 1024 * 1024
+                )
+            )
             if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
                 raise ValueError("unsupported or invalid snapshot schema")
             records = data.get("lifecycles")
@@ -350,7 +362,8 @@ def _ensure_loaded() -> None:
 
 
 def _ensure_storage_dir() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not ensure_paper_data_dir(DATA_DIR):
+        raise OSError("TRADE_LIFECYCLE_SHADOW_STORAGE_NOT_VERIFIED")
 
 
 def _atomic_write_snapshot() -> None:
@@ -364,15 +377,17 @@ def _atomic_write_snapshot() -> None:
         "divergence_count": _divergence_count,
         "lifecycles": _lifecycles,
     }
-    temp = SNAPSHOT_FILE.with_suffix(SNAPSHOT_FILE.suffix + ".tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temp, SNAPSHOT_FILE)
+    if not write_json_atomically(SNAPSHOT_FILE, payload):
+        raise OSError("TRADE_LIFECYCLE_SHADOW_SNAPSHOT_WRITE_BLOCKED")
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
     _ensure_storage_dir()
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+    append_paper_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, default=str) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _persist_all() -> Optional[str]:
@@ -1619,6 +1634,16 @@ def reset_shadow_storage(confirm: bool = False) -> Dict[str, Any]:
         raise TypeError("confirm must be bool")
     if not confirm:
         return {"ok": False, "status": "CONFIRM_REQUIRED", "shadow_mode": True, "reset": False}
+    if os.environ.get("RENDER", "").strip().lower() == "true" or any(
+        _is_persistent_data_path(path)
+        for path in (SNAPSHOT_FILE, EVENTS_FILE, DIVERGENCES_FILE)
+    ):
+        return {
+            "ok": False,
+            "status": "PERSISTENT_SHADOW_RESET_REQUIRES_SEPARATE_MAINTENANCE",
+            "shadow_mode": True,
+            "reset": False,
+        }
     with _lock:
         _lifecycles = {}
         _event_count = 0
@@ -1633,6 +1658,21 @@ def reset_shadow_storage(confirm: bool = False) -> Dict[str, Any]:
             except OSError as exc:
                 errors.append(f"{path}: {exc}")
         return {"ok": not errors, "status": "RESET" if not errors else "RESET_PARTIAL", "shadow_mode": True, "reset": True, "errors": errors}
+
+
+def _is_persistent_data_path(path: Path) -> bool:
+    target = Path(os.path.abspath(os.fspath(path)))
+    root = Path("/data")
+    try:
+        target.relative_to(root)
+        return True
+    except ValueError:
+        pass
+    try:
+        target.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 __all__ = [

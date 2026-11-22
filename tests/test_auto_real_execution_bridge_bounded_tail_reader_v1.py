@@ -48,7 +48,7 @@ def _load_reader(namespace):
 @pytest.fixture()
 def reader(tmp_path):
     path = tmp_path / "data" / "auto_real_execution_bridge_v1_events.jsonl"
-    path.parent.mkdir(parents=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     namespace = {
         "json": json,
         "os": os,
@@ -333,6 +333,42 @@ def test_symlink_and_non_regular_file_are_rejected(reader, tmp_path, monkeypatch
     directory_result = reader["_arb_v1_read_events"]()
     assert directory_result["ok"] is False
     assert "NOT_REGULAR_FILE" in directory_result["error"]
+
+
+def test_render_persistent_reader_uses_guarded_descriptor_not_path_open(
+    reader, tmp_path
+):
+    data_root = tmp_path / "data"
+    path = data_root / "auto_real_execution_bridge_v1_events.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [_event(1), _event(2)]
+    _write_rows(path, rows)
+    calls = []
+
+    class NoPathOpenOs:
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        @staticmethod
+        def open(*_args, **_kwargs):
+            raise AssertionError("persistent path must use the storage guard")
+
+    reader["os"] = NoPathOpenOs()
+    reader["CENTRAL_DATA_DIR"] = data_root
+    reader["_is_central_data_path"] = lambda candidate: Path(candidate) == path
+    reader["_paper_file_stat"] = lambda candidate, **_kwargs: Path(candidate).stat()
+
+    def guarded_open(candidate, mode, **kwargs):
+        calls.append((Path(candidate), mode, kwargs.get("data_root")))
+        return open(candidate, mode)
+
+    reader["_open_guarded_paper_binary"] = guarded_open
+
+    page = reader["_arb_v1_read_events_page"](path, limit=10)
+
+    assert page["rows"] == rows
+    assert page["total_count"] == 2
+    assert calls == [(path, "rb", data_root)]
 
 
 def test_alternate_and_traversal_paths_are_rejected(reader):

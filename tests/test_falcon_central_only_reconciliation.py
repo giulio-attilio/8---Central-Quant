@@ -318,6 +318,17 @@ def _harness(
         "last_error": None,
         "last_reconciled_count": 0,
     }
+
+    def guarded_write(path, payload):
+        Path(path).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def guarded_append(path, event_text):
+        with Path(path).open("a", encoding="utf-8") as handle:
+            handle.write(event_text)
+
     namespace = {
         "Path": Path,
         "json": json,
@@ -331,6 +342,8 @@ def _harness(
         "_flad_v1_norm_symbol": _norm_symbol,
         "_flad_v1_norm_side": _norm_side,
         "_flad_v1_public": _public,
+        "_write_central_paper_audit_json": guarded_write,
+        "_append_central_paper_audit_event": guarded_append,
         "central_trade_registry": registry,
         "central_broker": ForbiddenBroker(),
         "LOADED_BOTS": {"FALCON": module},

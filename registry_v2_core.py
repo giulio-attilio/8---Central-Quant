@@ -19,6 +19,7 @@ from typing import Any
 import registry_execution_schema as schema
 import registry_v2_reader as reader
 import registry_v2_wal as wal
+import paper_state_storage
 
 
 REGISTER = "REGISTER"
@@ -751,7 +752,7 @@ def _snapshot_digest_candidates(snapshot: Mapping[str, Any]) -> frozenset[str]:
 
 def _load_snapshot_or_empty(storage: wal.RegistryV2WalStorage) -> tuple[dict[str, Any], bool]:
     path = storage.snapshot_path
-    if not path.exists():
+    if not paper_state_storage.paper_file_exists(path):
         return _empty_snapshot(), False
     result = reader.read_registry_v2(path)
     if result.ok and result.document is not None:
@@ -759,7 +760,7 @@ def _load_snapshot_or_empty(storage: wal.RegistryV2WalStorage) -> tuple[dict[str
     if result.document is None or "operation_ledger" not in result.errors:
         raise _CoreError(wal.WAL_SNAPSHOT_INVALID, result.errors or (result.status,))
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        with paper_state_storage.open_paper_text(path, "r", encoding="utf-8") as handle:
             raw = json.load(handle)
         if not isinstance(raw, Mapping) or "operation_ledger" in raw:
             raise ValueError("operation_ledger_fallback_not_applicable")

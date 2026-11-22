@@ -19,14 +19,16 @@
 import os
 import json
 import time
+from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from paper_state_storage import append_paper_text, ensure_paper_data_dir, paper_data_mount_verified, paper_file_exists, read_paper_text, resolve_paper_data_dir, write_json_atomically
 
 
 EXECUTIVE_POLICY_MANAGER_VERSION = "2026-07-04-EXECUTIVE-POLICY-MANAGER-V1.1"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = str(resolve_paper_data_dir(__file__))
 POLICY_FILE = os.path.join(DATA_DIR, "executive_policy.json")
 POLICY_LOG_FILE = os.path.join(DATA_DIR, "executive_policy_log.jsonl")
 
@@ -59,39 +61,32 @@ def _safe_bool(value: Any, default: bool = False) -> bool:
 
 
 def _ensure_data_dir() -> None:
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-    except Exception:
-        pass
+    if not ensure_paper_data_dir(resolve_paper_data_dir(__file__)):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED_OR_DIRECTORY_UNAVAILABLE")
 
 
 def _read_json(path: str, default: Any) -> Any:
+    target = Path(path)
+    if not paper_data_mount_verified(target):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
     try:
-        if not os.path.exists(path):
+        if not paper_file_exists(target):
             return default
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(read_paper_text(target, encoding="utf-8"))
     except Exception:
         return default
 
 
 def _write_json(path: str, payload: Any) -> bool:
     try:
-        _ensure_data_dir()
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-        return True
+        return write_json_atomically(Path(path), payload)
     except Exception:
         return False
 
 
 def _append_jsonl(path: str, payload: Dict[str, Any]) -> bool:
     try:
-        _ensure_data_dir()
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        append_paper_text(Path(path), json.dumps(payload, ensure_ascii=False) + "\n")
         return True
     except Exception:
         return False

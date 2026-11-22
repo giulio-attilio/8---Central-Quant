@@ -18,6 +18,7 @@ import pytest
 def journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     data_dir = tmp_path / "data"
     monkeypatch.setenv("DATA_DIR", str(data_dir))
+    monkeypatch.setenv("CENTRAL_DATA_DIR", str(data_dir))
     original = sys.modules.get("journal_manager")
     sys.modules.pop("journal_manager", None)
     module = importlib.import_module("journal_manager")
@@ -539,7 +540,7 @@ def test_concurrent_append_returns_initial_eof_snapshot_and_next_read_sees_appen
     appended_row = _event(3)
     _write_rows(journal.LIFECYCLE_FILE, rows)
     initial_size = journal.LIFECYCLE_FILE.stat().st_size
-    real_fdopen = os.fdopen
+    real_open_paper_binary = journal.open_paper_binary
     append_done = False
 
     class AppendAfterRead:
@@ -570,9 +571,11 @@ def test_concurrent_append_returns_initial_eof_snapshot_and_next_read_sees_appen
             return data
 
     monkeypatch.setattr(
-        journal.os,
-        "fdopen",
-        lambda *args, **kwargs: AppendAfterRead(real_fdopen(*args, **kwargs)),
+        journal,
+        "open_paper_binary",
+        lambda *args, **kwargs: AppendAfterRead(
+            real_open_paper_binary(*args, **kwargs)
+        ),
     )
 
     first = journal._read_lifecycle_jsonl_tail_page(journal.LIFECYCLE_FILE, limit=3)

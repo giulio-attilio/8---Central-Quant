@@ -26,12 +26,14 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
+from pathlib import Path
+from paper_state_storage import append_paper_text, ensure_paper_data_dir, paper_data_mount_verified, paper_file_exists, read_paper_text, resolve_paper_data_dir, write_json_atomically
 
 VERSION = "2026-07-05-EXECUTIVE-POLICY-PRIORITY-V1.1"
 MODULE = "executive_policy_priority"
 
 TIMEZONE_BR = timezone(timedelta(hours=-3))
-DATA_DIR = os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data")
+DATA_DIR = str(resolve_paper_data_dir(__file__))
 PRIORITY_LOG_FILE = os.path.join(DATA_DIR, "executive_policy_priority_log.jsonl")
 PRIORITY_STATE_FILE = os.path.join(DATA_DIR, "executive_policy_priority_state.json")
 
@@ -98,39 +100,31 @@ def _now_br() -> str:
 
 
 def _ensure_data_dir() -> None:
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-    except Exception:
-        pass
+    if not ensure_paper_data_dir(resolve_paper_data_dir(__file__)):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED_OR_DIRECTORY_UNAVAILABLE")
 
 
 def _safe_read_json(path: str, default: Any = None) -> Any:
+    if not paper_data_mount_verified(Path(path)):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
     try:
-        if not path or not os.path.exists(path):
+        if not path or not paper_file_exists(Path(path)):
             return default
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(read_paper_text(Path(path), encoding="utf-8"))
     except Exception:
         return default
 
 
 def _safe_write_json(path: str, data: Any) -> bool:
     try:
-        _ensure_data_dir()
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-        return True
+        return write_json_atomically(Path(path), data)
     except Exception:
         return False
 
 
 def _append_jsonl(path: str, payload: Dict[str, Any]) -> bool:
     try:
-        _ensure_data_dir()
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        append_paper_text(Path(path), json.dumps(payload, ensure_ascii=False) + "\n")
         return True
     except Exception:
         return False
@@ -790,13 +784,12 @@ def read_executive_policy_priority_log(limit: int = 20) -> Dict[str, Any]:
     except Exception:
         limit = 20
 
-    if not os.path.exists(PRIORITY_LOG_FILE):
+    if not paper_file_exists(Path(PRIORITY_LOG_FILE)):
         return {"ok": True, "items": [], "count": 0, "log_file": PRIORITY_LOG_FILE}
 
     items: List[Dict[str, Any]] = []
     try:
-        with open(PRIORITY_LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-limit:]
+        lines = read_paper_text(Path(PRIORITY_LOG_FILE), encoding="utf-8").splitlines()[-limit:]
         for line in lines:
             try:
                 items.append(json.loads(line))

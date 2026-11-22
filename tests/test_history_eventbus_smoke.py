@@ -81,6 +81,9 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
             mock.patch.object(event_bus, "history_manager", history_manager),
             mock.patch.object(central_main, "CENTRAL_TIMELINE_LOG_FILE", self.central_timeline_log),
             mock.patch.object(central_main, "CENTRAL_DECISION_LOG_FILE", self.central_decision_log),
+            # HTTP route smoke tests run against an already-booted local app;
+            # production keeps this gate false until runtime initialization ends.
+            mock.patch.object(central_main, "CENTRAL_RUNTIME_READY", True),
         ]
         for patcher in self.patches:
             patcher.start()

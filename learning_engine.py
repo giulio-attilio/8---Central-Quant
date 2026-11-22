@@ -19,11 +19,17 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import Counter, defaultdict
+from paper_state_storage import (
+    append_paper_text,
+    paper_file_exists,
+    read_paper_text,
+    resolve_paper_data_dir,
+    write_json_atomically,
+)
 
 TIMEZONE_BR = timezone(timedelta(hours=-3))
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).resolve()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = resolve_paper_data_dir(__file__)
 
 LEARNING_STATE_FILE = DATA_DIR / "learning_state.json"
 LEARNING_AUDIT_FILE = DATA_DIR / "learning_audit.jsonl"
@@ -95,29 +101,27 @@ def _round(value, ndigits=2, default=0.0):
 
 def _write_json(path: Path, payload):
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2, default=_json_default)
-        return True
+        return bool(write_json_atomically(Path(path), payload))
     except Exception:
         return False
 
 
 def _read_json(path: Path, default):
     try:
-        if not path.exists():
+        if not paper_file_exists(Path(path)):
             return default
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(read_paper_text(Path(path), encoding="utf-8"))
     except Exception:
         return default
 
 
 def _append_jsonl(path: Path, item: dict):
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(item, ensure_ascii=False, default=_json_default) + "\n")
+        append_paper_text(
+            Path(path),
+            json.dumps(item, ensure_ascii=False, default=_json_default) + "\n",
+            encoding="utf-8",
+        )
         return True
     except Exception:
         return False

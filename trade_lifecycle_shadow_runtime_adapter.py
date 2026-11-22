@@ -19,6 +19,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 import trade_lifecycle_manager as lifecycle_manager
+from paper_state_storage import (
+    append_paper_text,
+    ensure_paper_data_dir,
+    open_paper_binary,
+    open_paper_text,
+    paper_file_exists,
+    write_json_atomically,
+)
 
 
 VERSION = "1.0.0-SHADOW"
@@ -577,8 +585,9 @@ def _storage_lock(path: Path) -> threading.RLock:
 @contextmanager
 def _cross_process_file_lock(path: Path):
     """Serialize validation-journal append across local worker processes."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as handle:
+    if not ensure_paper_data_dir(path.parent):
+        raise OSError("SHADOW_STORAGE_NOT_VERIFIED")
+    with open_paper_binary(path, "a+b") as handle:
         handle.seek(0, os.SEEK_END)
         if handle.tell() == 0:
             handle.write(b"\0")
@@ -709,7 +718,14 @@ class TradeLifecycleShadowRuntimeAdapter:
         configured = True if raw_enabled is None else raw_enabled.strip().lower() not in _FALSE
         self.enabled = configured if enabled is None else bool(enabled)
         self.manager = manager or lifecycle_manager
-        root = Path(data_dir) if data_dir is not None else Path(os.getenv("TRADE_LIFECYCLE_SHADOW_DATA_DIR") or os.getenv("CENTRAL_DATA_DIR") or Path(__file__).resolve().parent / "data")
+        configured_root = os.getenv("TRADE_LIFECYCLE_SHADOW_DATA_DIR")
+        root = (
+            Path(data_dir)
+            if data_dir is not None
+            else Path(configured_root)
+            if configured_root
+            else Path(lifecycle_manager.DATA_DIR)
+        )
         self.events_file = root / "trade_lifecycle_shadow_runtime_events.jsonl"
         self.divergences_file = root / "trade_lifecycle_shadow_runtime_divergences.jsonl"
         self.state_file = root / "trade_lifecycle_shadow_runtime_state.json"
@@ -733,15 +749,22 @@ class TradeLifecycleShadowRuntimeAdapter:
         }
 
     def _append(self, path: Path, item: Mapping[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(item, ensure_ascii=False, default=str) + "\n")
+        if not ensure_paper_data_dir(path.parent):
+            raise OSError("SHADOW_STORAGE_NOT_VERIFIED")
+        append_paper_text(
+            path,
+            json.dumps(item, ensure_ascii=False, default=str) + "\n",
+            encoding="utf-8",
+        )
 
     def _persist_state(self) -> None:
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.state_file.with_suffix(self.state_file.suffix + ".tmp")
-        temp.write_text(json.dumps({"version": VERSION, "updated_at": _now(), "metrics": self._metrics}, indent=2), encoding="utf-8")
-        os.replace(temp, self.state_file)
+        if not ensure_paper_data_dir(self.state_file.parent):
+            raise OSError("SHADOW_STORAGE_NOT_VERIFIED")
+        if not write_json_atomically(
+            self.state_file,
+            {"version": VERSION, "updated_at": _now(), "metrics": self._metrics},
+        ):
+            raise OSError("SHADOW_STATE_WRITE_BLOCKED")
 
     def _event_id(self, event_type: str, identity: str, source: Mapping[str, Any]) -> str:
         supplied = _first(source, ("event_id",))
@@ -1111,8 +1134,8 @@ class TradeLifecycleShadowRuntimeAdapter:
                 known = _VALIDATION_EVENT_IDS.setdefault(path_key, set())
                 # Re-read under the process lock so another worker's append is
                 # visible even after this process initialized its local index.
-                if self.events_file.exists():
-                    with self.events_file.open("r", encoding="utf-8") as handle:
+                if paper_file_exists(self.events_file):
+                    with open_paper_text(self.events_file, "r", encoding="utf-8") as handle:
                         for line in handle:
                             try:
                                 row = json.loads(line)

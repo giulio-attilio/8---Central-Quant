@@ -15,11 +15,11 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
+from paper_state_storage import append_paper_text, paper_data_mount_verified, paper_file_exists, read_paper_text, resolve_paper_data_dir, write_json_atomically
 
 TIMEZONE_BR = timezone(timedelta(hours=-3))
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).resolve()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = resolve_paper_data_dir(__file__)
 
 POLICY_STATE_FILE = DATA_DIR / "policy_state.json"
 POLICY_AUDIT_FILE = DATA_DIR / "policy_audit.jsonl"
@@ -137,11 +137,13 @@ def _safe_int(value, default=0):
 
 
 def _read_json(path, default):
+    path = Path(path)
+    if not paper_data_mount_verified(path):
+        raise OSError("PAPER_DATA_MOUNT_NOT_VERIFIED")
     try:
-        if not path.exists():
+        if not paper_file_exists(path):
             return default
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = json.loads(read_paper_text(path, encoding="utf-8"))
         return data if isinstance(data, dict) else default
     except Exception:
         return default
@@ -149,19 +151,18 @@ def _read_json(path, default):
 
 def _write_json(path, payload):
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2, default=_json_default)
-        return True
+        serializable = json.loads(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default))
+        return write_json_atomically(Path(path), serializable)
     except Exception:
         return False
 
 
 def _append_jsonl(path, item):
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(item, ensure_ascii=False, default=_json_default) + "\n")
+        append_paper_text(
+            Path(path),
+            json.dumps(item, ensure_ascii=False, default=_json_default) + "\n",
+        )
         return True
     except Exception:
         return False
@@ -182,12 +183,13 @@ def _merge_defaults(default, current):
 
 
 def ensure_policy_state():
-    if not POLICY_STATE_FILE.exists():
+    if not paper_file_exists(POLICY_STATE_FILE):
         state = dict(DEFAULT_POLICY)
         state["updated_at"] = data_hora_sp_str()
-        _write_json(POLICY_STATE_FILE, state)
-    if not POLICY_AUDIT_FILE.exists():
-        POLICY_AUDIT_FILE.touch()
+        if not _write_json(POLICY_STATE_FILE, state):
+            raise OSError("POLICY_STATE_INITIALIZATION_FAILED")
+    if not paper_file_exists(POLICY_AUDIT_FILE):
+        append_paper_text(POLICY_AUDIT_FILE, "")
 
 
 ensure_policy_state()
@@ -397,9 +399,8 @@ def build_policy_audit_payload(limit=100):
         limit = 100
     rows = []
     try:
-        if POLICY_AUDIT_FILE.exists():
-            with POLICY_AUDIT_FILE.open("r", encoding="utf-8") as f:
-                for line in f.readlines()[-limit:]:
+        if paper_file_exists(POLICY_AUDIT_FILE):
+            for line in read_paper_text(POLICY_AUDIT_FILE, encoding="utf-8").splitlines()[-limit:]:
                     line = line.strip()
                     if not line:
                         continue

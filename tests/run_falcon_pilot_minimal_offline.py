@@ -1,7 +1,7 @@
 """Run the existing Falcon safety regressions without external access.
 
 Usage: python3 -I tests/run_falcon_pilot_minimal_offline.py
-       [--upstash-sdk-contract|--account-client-order-authority|--live-position-risk-gate|--position-snapshot-reuse|--paper-registry-source-preview|--paper-registry-source-capture|--history-memory-state-io|--personal-lifecycle-no-ccxt]
+       [--upstash-sdk-contract|--account-client-order-authority|--live-position-risk-gate|--position-snapshot-reuse|--paper-registry-source-preview|--paper-registry-source-capture|--history-memory-state-io|--history-render-rewrite-guard|--lifecycle-shadow-bridge-storage-guard|--central-runtime-lock-guard|--paper-main-storage-guard|--data-status-lock-guard|--arb-tail-storage-guard|--policy-storage-guard|--journal-learning-storage-guard|--memory-profiler-storage-guard|--paper-integrated-disk-guard-no-flask|--personal-lifecycle-no-ccxt]
 Some tests import main.py, so runtime auto-start is disabled before collection.
 Pytest is loaded only after network, subprocess and .env-file access are denied.
 """
@@ -190,11 +190,19 @@ if __name__ == "__main__":
             "test_falcon_management_safety_v1.py",
         )
     elif sys.argv[1:] in (["--registry-lock-audit"], ["--registry-writers"]):
-        cases = ("test_registry_remaining_writers_atomic_rmw_v1.py",)
+        cases = (
+            "test_registry_remaining_writers_atomic_rmw_v1.py",
+            "test_trade_registry_atomic_durable_write_v1.py",
+        )
+    elif sys.argv[1:] == ["--registry-atomic-storage"]:
+        cases = ("test_trade_registry_atomic_durable_write_v1.py",)
     elif sys.argv[1:] == ["--registry-sync"]:
         cases = ("test_main_traderegistry_sync_v2_ownership.py",)
     elif sys.argv[1:] == ["--registry-v2-migration-audit"]:
         cases = ("test_registry_v2_migration_audit.py",)
+    elif sys.argv[1:] == ["--registry-stop-evidence"]:
+        cases = ("test_trade_registry_closed_identity_conflict_sources_v1.py",)
+        filters = ["-k", "stop_evidence"]
     elif sys.argv[1:] == ["--paper-registry-source-preview"]:
         cases = ("test_paper_registry_source_preview.py",)
     elif sys.argv[1:] == ["--paper-registry-source-capture"]:
@@ -202,7 +210,39 @@ if __name__ == "__main__":
     elif sys.argv[1:] == ["--history-memory-state-io"]:
         cases = (
             "test_history_events_memory_containment.py",
+            "test_history_events_rotation_v1.py",
+            "test_closed_trade_key_index_v1.py",
             "test_real_pnl_r_mapper_closed_identity_v1.py",
+        )
+    elif sys.argv[1:] == ["--history-storage-serialization"]:
+        cases = ("test_history_events_memory_containment.py",)
+    elif sys.argv[1:] == ["--history-render-rewrite-guard"]:
+        cases = ("test_history_rewrite_render_block_v1.py",)
+    elif sys.argv[1:] == ["--lifecycle-shadow-bridge-storage-guard"]:
+        cases = ("test_trade_lifecycle_shadow_bridge.py",)
+    elif sys.argv[1:] == ["--central-runtime-lock-guard"]:
+        cases = ("test_runtime_file_lock_fail_closed_v1.py",)
+    elif sys.argv[1:] == ["--paper-main-storage-guard"]:
+        cases = ("test_main_paper_audit_storage_guard_v1.py",)
+    elif sys.argv[1:] == ["--arb-tail-storage-guard"]:
+        cases = ("test_auto_real_execution_bridge_bounded_tail_reader_v1.py",)
+    elif sys.argv[1:] == ["--data-status-lock-guard"]:
+        cases = ("test_main_paper_audit_storage_guard_v1.py",)
+    elif sys.argv[1:] == ["--policy-storage-guard"]:
+        cases = (
+            "test_policy_persistent_storage_guard_v1.py",
+            "test_history_eventbus_smoke.py",
+        )
+    elif sys.argv[1:] == ["--journal-learning-storage-guard"]:
+        cases = (
+            "test_policy_persistent_storage_guard_v1.py",
+            "test_lifecycle_bounded_tail_reader_v2.py",
+            "test_automatic_learning_refresh.py",
+        )
+    elif sys.argv[1:] == ["--memory-profiler-storage-guard"]:
+        cases = (
+            "test_memory_profiler_storage_guard_v1.py",
+            "test_memory_gc_coordinator_v1.py",
         )
     elif sys.argv[1:] == ["--can-open-risk"]:
         cases = (
@@ -222,6 +262,11 @@ if __name__ == "__main__":
             "test_c3_dormant_startup_same_coordinator_v2.py",
             "test_c3_dormant_root_head_startup_integration_v1.py",
         )
+    elif sys.argv[1:] == ["--c3-dormant-startup-verbose"]:
+        cases = (
+            "test_c3_dormant_startup_same_coordinator_v2.py",
+            "test_c3_dormant_root_head_startup_integration_v1.py",
+        )
     elif sys.argv[1:] == ["--market-data-throttle"]:
         cases = (
             "test_exchange_manager_throttle_v1.py",
@@ -235,6 +280,15 @@ if __name__ == "__main__":
             "test_broker_order_constraints_fail_closed_v1.py",
             "test_broker_account_client_order_boundary_v1.py",
         )
+    elif sys.argv[1:] == ["--broker-log-storage-guard"]:
+        cases = ("test_broker_execution_log_storage_guard_v1.py",)
+    elif sys.argv[1:] == ["--registry-v2-paper-storage-guard"]:
+        cases = (
+            "test_registry_v2_reader.py",
+            "test_registry_v2_core.py",
+            "test_registry_v2_paper_runtime_adapter.py",
+            "test_registry_v2_paper_runtime_integration.py",
+        )
     elif sys.argv[1:] == ["--paper-integrated-disk-guard"]:
         cases = (
             "test_paper_executor_integrated_idempotency_v1.py",
@@ -243,8 +297,23 @@ if __name__ == "__main__":
             "test_adaptive_weights_data_dir_guard_v1.py",
             "test_paper_state_storage_render_paths_v1.py",
             "test_main_paper_audit_storage_guard_v1.py",
+            "test_runtime_file_lock_fail_closed_v1.py",
             "test_outcome_evaluator_closed_identity_v1.py",
             "test_trade_close_outcome_semantic_recurrence_v1.py",
+            "test_trade_lifecycle_shadow_storage_guard_v1.py",
+        )
+    elif sys.argv[1:] == ["--paper-integrated-disk-guard-no-flask"]:
+        cases = (
+            "test_paper_executor_integrated_idempotency_v1.py",
+            "test_paper_executor_data_dir_resolution_v1.py",
+            "test_execution_pipeline_status_paper_state_v1.py",
+            "test_adaptive_weights_data_dir_guard_v1.py",
+            "test_paper_state_storage_render_paths_v1.py",
+            "test_main_paper_audit_storage_guard_v1.py",
+            "test_runtime_file_lock_fail_closed_v1.py",
+            "test_outcome_evaluator_closed_identity_v1.py",
+            "test_trade_close_outcome_semantic_recurrence_v1.py",
+            "test_trade_lifecycle_shadow_storage_guard_v1.py",
         )
     elif sys.argv[1:] == ["--paper-lifecycle-disk-failures"]:
         cases = ("test_timeline_single_writer.py",)
@@ -375,6 +444,8 @@ if __name__ == "__main__":
             "test_broker_account_client_order_boundary_v1.py",
             "test_broker_entry_fill_stop_sizing_v1.py",
         )
+    elif sys.argv[1:] == ["--preflight-storage-readiness"]:
+        cases = ("test_falcon_real_pilot_preflight_fail_closed_v1.py",)
     else:
         cases = CASES
     if sys.argv[1:] == ["--registry-lock-audit"]:
@@ -391,6 +462,30 @@ if __name__ == "__main__":
         filters = []
     elif sys.argv[1:] == ["--history-memory-state-io"]:
         filters = []
+    elif sys.argv[1:] == ["--history-storage-serialization"]:
+        filters = ["-k", "history_manager_prefers_central_data_dir_and_uses_guarded_basic_io"]
+    elif sys.argv[1:] == ["--history-render-rewrite-guard"]:
+        filters = []
+    elif sys.argv[1:] == ["--lifecycle-shadow-bridge-storage-guard"]:
+        filters = []
+    elif sys.argv[1:] == ["--central-runtime-lock-guard"]:
+        filters = []
+    elif sys.argv[1:] == ["--paper-main-storage-guard"]:
+        filters = []
+    elif sys.argv[1:] == ["--arb-tail-storage-guard"]:
+        filters = []
+    elif sys.argv[1:] == ["--data-status-lock-guard"]:
+        filters = ["-k", "data_status_lock_inventory_uses_guarded_listing"]
+    elif sys.argv[1:] == ["--policy-storage-guard"]:
+        filters = []
+    elif sys.argv[1:] == ["--journal-learning-storage-guard"]:
+        filters = []
+    elif sys.argv[1:] == ["--memory-profiler-storage-guard"]:
+        filters = []
+    elif sys.argv[1:] == ["--paper-integrated-disk-guard-no-flask"]:
+        filters = ["-k", "not test_daily_history_blocks_ephemeral_render_fallback"]
+    elif sys.argv[1:] == ["--preflight-storage-readiness"]:
+        filters = ["-k", "preflight_storage_real_status or live_entry_storage_readiness_fails_closed_without_process_lock"]
     elif sys.argv[1:] == ["--can-open-risk"]:
         filters = [
             "-k",
@@ -401,9 +496,15 @@ if __name__ == "__main__":
         ]
     elif sys.argv[1:] == ["--c3-dormant-startup"]:
         filters = []
+    elif sys.argv[1:] == ["--c3-dormant-startup-verbose"]:
+        filters = []
     elif sys.argv[1:] == ["--market-data-throttle"]:
         filters = []
     elif sys.argv[1:] == ["--broker-paper-disk-guard"]:
+        filters = []
+    elif sys.argv[1:] == ["--broker-log-storage-guard"]:
+        filters = []
+    elif sys.argv[1:] == ["--registry-v2-paper-storage-guard"]:
         filters = []
     elif sys.argv[1:] == ["--paper-integrated-disk-guard"]:
         filters = []
@@ -463,14 +564,21 @@ if __name__ == "__main__":
         # The suite runner forbids subprocess creation; this test's isolated
         # child-process import check is exercised separately outside the runner.
         filters.extend(["-k", "not test_no_test_uses_real_data_network_redis_or_broker"])
-    pytest_args = ["-q", "-p", "no:cacheprovider"]
+    pytest_args = [
+        "-vv" if sys.argv[1:] == ["--c3-dormant-startup-verbose"] else "-q",
+        "-p",
+        "no:cacheprovider",
+    ]
     # The unittest-based C3 startup integration tests use pytest's trace-option
     # lookup in pytest's unittest adapter, so keep the built-in debugging
     # plugin registered for this focused mode (the option remains false).
     if sys.argv[1:] not in (
         ["--c3-dormant-startup"],
+        ["--c3-dormant-startup-verbose"],
         ["--can-open-risk"],
         ["--paper-integrated-disk-guard"],
+        ["--paper-integrated-disk-guard-no-flask"],
+        ["--policy-storage-guard"],
     ):
         pytest_args.extend(["-p", "no:debugging"])
     raise SystemExit(

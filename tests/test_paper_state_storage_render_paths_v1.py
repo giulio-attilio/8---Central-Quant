@@ -38,6 +38,35 @@ def test_non_render_local_paths_remain_available_for_offline_tests(
     ) is True
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX dir_fd/O_NOFOLLOW")
+def test_guarded_directory_listing_rejects_symlinks_and_filters_files(tmp_path):
+    root = tmp_path / "data"
+    directory = root / "daily_history"
+    directory.mkdir(parents=True)
+    (directory / "2026-11-20.json").write_text("{}", encoding="utf-8")
+    (directory / "ignore.txt").write_text("x", encoding="utf-8")
+
+    assert paper_state_storage.list_paper_files(
+        directory, suffix=".json", data_root=root, require_mount=False
+    ) == ["2026-11-20.json"]
+    assert paper_state_storage.paper_file_stat(
+        directory / "2026-11-20.json", data_root=root, require_mount=False
+    ).st_size == 2
+
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    (directory / "linked.json").symlink_to(outside)
+    with pytest.raises(OSError, match="PAPER_SYMLINK_REJECTED"):
+        paper_state_storage.list_paper_files(
+            directory, suffix=".json", data_root=root, require_mount=False
+        )
+    with pytest.raises(OSError) as stat_error:
+        paper_state_storage.paper_file_stat(
+            directory / "linked.json", data_root=root, require_mount=False
+        )
+    assert stat_error.value.errno == errno.ELOOP
+
+
 def test_policy_outcome_log_reader_refuses_unverified_paper_path(
     monkeypatch, tmp_path
 ):
@@ -392,6 +421,48 @@ def test_paper_file_exists_reports_missing_then_present(tmp_path):
     assert paper_state_storage.paper_file_exists(path) is False
     path.write_text("{}", encoding="utf-8")
     assert paper_state_storage.paper_file_exists(path) is True
+
+
+def test_guarded_tail_reader_returns_only_complete_last_lines(tmp_path):
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(b'{"n":1}\n{"n":2}\n{"n":3}\n')
+
+    assert paper_state_storage.read_paper_tail_lines(
+        path, limit=2, max_bytes=1024
+    ) == ['{"n":2}', '{"n":3}']
+
+
+def test_guarded_tail_reader_discards_partial_edges_and_bounds_bytes(tmp_path):
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(b'{"large":"' + b"x" * 40 + b'"}\n{"n":2}\n{"n":3}')
+
+    assert paper_state_storage.read_paper_tail_lines(
+        path, limit=10, max_bytes=20
+    ) == ['{"n":2}']
+
+    path.write_bytes(b'{"n":1}\n{"n":2}\n{"n":3}')
+    assert paper_state_storage.read_paper_tail_lines(
+        path, limit=10, max_bytes=1024
+    ) == ['{"n":1}', '{"n":2}']
+
+
+def test_guarded_tail_reader_rejects_invalid_bounds_without_opening(
+    monkeypatch, tmp_path
+):
+    opened = []
+
+    def fail_open(*_args, **_kwargs):
+        opened.append(True)
+        raise AssertionError("invalid bounds must fail before opening")
+
+    monkeypatch.setattr(paper_state_storage, "open_paper_binary", fail_open)
+    with pytest.raises(ValueError, match="PAPER_TAIL_LINE_LIMIT_INVALID"):
+        paper_state_storage.read_paper_tail_lines(tmp_path / "events.jsonl", limit=-1)
+    with pytest.raises(ValueError, match="PAPER_TAIL_BYTE_LIMIT_INVALID"):
+        paper_state_storage.read_paper_tail_lines(
+            tmp_path / "events.jsonl", limit=1, max_bytes=0
+        )
+    assert opened == []
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX dir_fd/O_NOFOLLOW")

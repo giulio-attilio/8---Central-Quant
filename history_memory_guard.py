@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 
-from paper_state_storage import open_paper_binary
+from paper_state_storage import open_paper_binary, paper_file_exists
 
 
 MIB = 1024 * 1024
@@ -185,7 +185,7 @@ def iter_jsonl_tail(
     }
 
     with history_memory_probe(operation, source) as probe:
-        if not source.exists():
+        if not paper_file_exists(source):
             result = {"records": [], **metadata}
             probe.finish(0, False)
             return result

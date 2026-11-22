@@ -33,6 +33,7 @@ from trade_evidence_physical_window_contract_v1 import (
     parse_timestamp as _physical_parse_timestamp,
     path_fingerprint as _physical_path_fingerprint,
 )
+from paper_state_storage import open_paper_binary, open_paper_text, paper_file_stat
 
 
 VERSION = "2026-08-14-TRADE-TIMELINE-RECENT-IDENTITY-SCAN-V1"
@@ -998,7 +999,7 @@ def _read_path(
         if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
             raise ValueError("JSONL source must be a regular non-symlink file")
 
-        with path.open("rb") as handle:
+        with open_paper_binary(path, "rb") as handle:
             descriptor_stat = os.fstat(handle.fileno())
             if (
                 int(descriptor_stat.st_dev) != int(path_stat.st_dev)
@@ -1338,11 +1339,13 @@ def _read_path(
                     yield item
         return
 
-    if not path.exists() or not path.is_file():
+    try:
+        file_stat = paper_file_stat(path)
+    except FileNotFoundError:
         stats["stop_reason"] = "SOURCE_MISSING"
         return
     stats["files_read"] = int(stats.get("files_read", 0) or 0) + 1
-    file_size = path.stat().st_size
+    file_size = file_stat.st_size
     stats.update({
         "bytes_scanned": file_size,
         "source_size_bytes": file_size,
@@ -1351,7 +1354,7 @@ def _read_path(
         "direction": "FULL_DOCUMENT",
         "stop_reason": "FULL_DOCUMENT",
     })
-    with path.open("r", encoding="utf-8") as handle:
+    with open_paper_text(path, "r", encoding="utf-8") as handle:
         data = json.load(handle)
     stats["valid_lines"] = 1
     if isinstance(data, Mapping):

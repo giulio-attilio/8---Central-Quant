@@ -15,6 +15,12 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from paper_state_storage import (
+    ensure_paper_data_dir as _ensure_persistent_data_dir,
+    paper_file_exists as _paper_file_exists,
+    read_paper_text as _read_paper_text,
+    write_json_atomically as _write_json_atomically,
+)
 from trade_registry_closed_identity_conflict_repair_runtime_seam_v1 import _c3_closed_repair_writer_mutation_v1
 TIMEZONE_BR = timezone(timedelta(hours=-3))
 LOGGER = logging.getLogger(__name__)
@@ -74,7 +80,8 @@ def _now() -> str:
 
 
 def _ensure_data_dir() -> None:
-    Path(TRADE_REGISTRY_FILE).parent.mkdir(parents=True, exist_ok=True)
+    if not _ensure_persistent_data_dir(Path(TRADE_REGISTRY_FILE).parent):
+        raise OSError("PERSISTENT_TRADE_REGISTRY_DIRECTORY_UNAVAILABLE")
 
 
 def _is_persistent_registry_path(path: Any) -> bool:
@@ -285,13 +292,13 @@ def _normalize_registry(data: Any) -> Dict[str, Any]:
 def load_registry() -> Dict[str, Any]:
     path = Path(TRADE_REGISTRY_FILE)
     with _c3_closed_repair_writer_mutation_v1("TRADE_REGISTRY_LOAD_INITIALIZE_OR_MIGRATE"), _lock:
-        if not path.exists() and _is_persistent_registry_path(path):
+        if not _paper_file_exists(path) and _is_persistent_registry_path(path):
             raise FileNotFoundError(
                 "PERSISTENT_TRADE_REGISTRY_MISSING_FAIL_CLOSED"
             )
-        if not path.exists() and TRADE_REGISTRY_LEGACY_FILE != TRADE_REGISTRY_FILE and Path(TRADE_REGISTRY_LEGACY_FILE).exists():
+        if not _paper_file_exists(path) and TRADE_REGISTRY_LEGACY_FILE != TRADE_REGISTRY_FILE and _paper_file_exists(Path(TRADE_REGISTRY_LEGACY_FILE)):
             legacy = json.loads(
-                Path(TRADE_REGISTRY_LEGACY_FILE).read_text(encoding="utf-8")
+                _read_paper_text(Path(TRADE_REGISTRY_LEGACY_FILE), encoding="utf-8")
             )
             if not isinstance(legacy, dict):
                 raise ValueError("invalid legacy trade registry payload")
@@ -300,13 +307,13 @@ def load_registry() -> Dict[str, Any]:
             if write_result is False:
                 raise OSError("trade registry migration was not persisted")
             return reg
-        if not path.exists():
+        if not _paper_file_exists(path):
             reg = _empty_registry()
             write_result = save_registry(reg)
             if write_result is False:
                 raise OSError("empty trade registry initialization was not persisted")
             return reg
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(_read_paper_text(path, encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError("invalid trade registry payload")
         return _normalize_registry(data)
@@ -318,11 +325,15 @@ def load_registry_read_only() -> Dict[str, Any]:
     legacy_path = Path(TRADE_REGISTRY_LEGACY_FILE)
     with _lock:
         source = path
-        if not source.exists() and legacy_path != path and legacy_path.exists():
+        if not _paper_file_exists(source) and legacy_path != path and _paper_file_exists(legacy_path):
             source = legacy_path
-        if not source.exists():
+        if not _paper_file_exists(source):
+            if _is_persistent_registry_path(path):
+                raise FileNotFoundError(
+                    "PERSISTENT_TRADE_REGISTRY_MISSING_FAIL_CLOSED"
+                )
             return _normalize_registry(_empty_registry())
-        payload = json.loads(source.read_text(encoding="utf-8"))
+        payload = json.loads(_read_paper_text(source, encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("invalid trade registry payload")
         return _normalize_registry(payload)
@@ -334,16 +345,20 @@ def load_registry_raw_read_only() -> Dict[str, Any]:
     legacy_path = Path(TRADE_REGISTRY_LEGACY_FILE)
     with _lock:
         source = path
-        if not source.exists() and legacy_path != path and legacy_path.exists():
+        if not _paper_file_exists(source) and legacy_path != path and _paper_file_exists(legacy_path):
             source = legacy_path
-        if not source.exists():
+        if not _paper_file_exists(source):
+            if _is_persistent_registry_path(path):
+                raise FileNotFoundError(
+                    "PERSISTENT_TRADE_REGISTRY_MISSING_FAIL_CLOSED"
+                )
             return {
                 "ok": True,
                 "version": VERSION,
                 "open_trades": {},
                 "closed_trades": [],
             }
-        payload = json.loads(source.read_text(encoding="utf-8"))
+        payload = json.loads(_read_paper_text(source, encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("invalid trade registry payload")
         result = copy.deepcopy(payload)
@@ -356,21 +371,12 @@ def save_registry(registry: Dict[str, Any]) -> bool:
     _ensure_data_dir()
     registry = _normalize_registry(registry)
     registry["updated_at"] = _now()
-    tmp = str(TRADE_REGISTRY_FILE) + ".tmp"
     with _lock:
-        try:
-            with open(tmp, "w", encoding="utf-8") as file_obj:
-                json.dump(registry, file_obj, ensure_ascii=False, indent=2, default=str)
-                file_obj.flush()
-                os.fsync(file_obj.fileno())
-            os.replace(tmp, TRADE_REGISTRY_FILE)
-            _fsync_registry_parent(Path(TRADE_REGISTRY_FILE))
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
-            raise
+        # Preserve the Registry's historical default=str serialization while
+        # delegating the actual same-directory replace to the guarded store.
+        serializable = json.loads(json.dumps(registry, ensure_ascii=False, default=str))
+        if not _write_json_atomically(Path(TRADE_REGISTRY_FILE), serializable):
+            raise OSError("PERSISTENT_TRADE_REGISTRY_WRITE_FAILED")
     return True
 
 

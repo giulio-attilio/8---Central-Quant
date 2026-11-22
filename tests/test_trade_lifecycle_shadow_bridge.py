@@ -337,6 +337,62 @@ def test_47_reset_removes_only_bridge_files(bridge):
     assert not Path(paths["ingestion"]).exists() and not Path(paths["dead_letters"]).exists()
 
 
+def test_render_shadow_storage_defaults_to_data_dir(bridge, monkeypatch):
+    monkeypatch.delenv("TRADE_LIFECYCLE_SHADOW_DATA_DIR", raising=False)
+    monkeypatch.delenv("CENTRAL_DATA_DIR", raising=False)
+    monkeypatch.setenv("DATA_DIR", "/data")
+    monkeypatch.setenv("RENDER", "true")
+
+    assert bridge._storage_paths()[0] == Path("/data/trade_lifecycle_shadow_ingestion.jsonl")
+
+
+def test_render_shadow_append_rejects_path_outside_persistent_root(bridge, tmp_path, monkeypatch):
+    monkeypatch.setenv("RENDER", "true")
+    monkeypatch.setattr(bridge, "ensure_paper_data_dir", lambda _path: False)
+    target = tmp_path / "shadow.jsonl"
+
+    error = bridge._append(target, {"event": "test"})
+
+    assert error and "PAPER_DATA_MOUNT_NOT_VERIFIED" in error
+    assert not target.exists()
+
+
+def test_render_shadow_read_rejects_path_outside_persistent_root(bridge, monkeypatch):
+    path = Path(bridge.shadow_bridge_health()["storage_paths"]["ingestion"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"event":"must-not-be-read"}\n', encoding="utf-8")
+    monkeypatch.setenv("RENDER", "true")
+
+    result = bridge.read_shadow_ingestion_log()
+
+    assert result["ok"] is False
+    assert result["items"] == []
+    assert not result.get("error", "").endswith("must-not-be-read")
+
+
+def test_render_shadow_reset_is_blocked_without_deleting_files(bridge, monkeypatch):
+    create(bridge)
+    paths = bridge.shadow_bridge_health()["storage_paths"]
+    before = {
+        name: Path(path).read_bytes()
+        for name, path in paths.items()
+        if Path(path).exists()
+    }
+    monkeypatch.setenv("RENDER", "true")
+
+    result = bridge.reset_shadow_bridge_storage(confirm=True)
+
+    assert result["ok"] is False
+    assert result["status"] == "BLOCKED_PERSISTENT_STORAGE_RESET"
+    assert result["reset"] is False
+    after = {
+        name: Path(path).read_bytes()
+        for name, path in paths.items()
+        if Path(path).exists()
+    }
+    assert after == before
+
+
 def test_48_reset_does_not_remove_manager_storage(bridge):
     create(bridge)
     manager_path = bridge._manager.SNAPSHOT_FILE

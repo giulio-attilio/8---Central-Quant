@@ -18,11 +18,20 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, Counter
+from paper_state_storage import (
+    append_paper_text,
+    ensure_paper_data_dir,
+    open_paper_binary,
+    paper_file_exists,
+    read_paper_tail_lines,
+    read_paper_text,
+    resolve_paper_data_dir,
+    write_json_atomically,
+)
 
 TIMEZONE_BR = timezone(timedelta(hours=-3))
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).resolve()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = resolve_paper_data_dir(__file__)
 
 JOURNAL_FILE = DATA_DIR / "trade_journal.jsonl"
 JOURNAL_SEEN_FILE = DATA_DIR / "trade_journal_seen.json"
@@ -37,17 +46,15 @@ _JOURNAL_SEEN_LOCK = threading.RLock()
 
 
 def ensure_journal_files():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not JOURNAL_FILE.exists():
-        JOURNAL_FILE.touch()
-    if not JOURNAL_SEEN_FILE.exists():
-        JOURNAL_SEEN_FILE.write_text("{}", encoding="utf-8")
-    if not JOURNAL_EXPORT_FILE.exists():
-        JOURNAL_EXPORT_FILE.write_text("{}", encoding="utf-8")
-    if not LIFECYCLE_FILE.exists():
-        LIFECYCLE_FILE.touch()
-    if not LIFECYCLE_EXPORT_FILE.exists():
-        LIFECYCLE_EXPORT_FILE.write_text("{}", encoding="utf-8")
+    if not ensure_paper_data_dir(DATA_DIR):
+        raise OSError("JOURNAL_DATA_DIR_NOT_PERSISTENT")
+    for path in (JOURNAL_FILE, LIFECYCLE_FILE):
+        if not paper_file_exists(path):
+            append_paper_text(path, "", encoding="utf-8")
+    for path in (JOURNAL_SEEN_FILE, JOURNAL_EXPORT_FILE, LIFECYCLE_EXPORT_FILE):
+        if not paper_file_exists(path):
+            if not write_json_atomically(path, {}):
+                raise OSError("JOURNAL_JSON_STATE_INITIALIZATION_FAILED")
 
 
 ensure_journal_files()
@@ -70,29 +77,27 @@ def _json_default(value):
 
 def _read_json(path, default):
     try:
-        if not path.exists():
+        if not paper_file_exists(Path(path)):
             return default
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(read_paper_text(Path(path), encoding="utf-8"))
     except Exception:
         return default
 
 
 def _write_json(path, payload):
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2, default=_json_default)
-        return True
+        return bool(write_json_atomically(Path(path), payload))
     except Exception:
         return False
 
 
 def _append_jsonl(path, item):
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(item, ensure_ascii=False, default=_json_default) + "\n")
+        append_paper_text(
+            Path(path),
+            json.dumps(item, ensure_ascii=False, default=_json_default) + "\n",
+            encoding="utf-8",
+        )
         return True
     except Exception as exc:
         print(f"ERRO JOURNAL append_jsonl {path}: {exc}")
@@ -102,10 +107,11 @@ def _append_jsonl(path, item):
 def _read_jsonl_tail(path, limit=None):
     try:
         limit = int(limit or JOURNAL_MAX_READ)
-        if not path.exists():
+        if not paper_file_exists(Path(path)):
             return []
-        with path.open("r", encoding="utf-8") as f:
-            lines = f.readlines()[-limit:]
+        lines = read_paper_tail_lines(
+            Path(path), limit=max(0, limit), max_bytes=6 * 1024 * 1024
+        )
         rows = []
         for line in lines:
             line = line.strip()
@@ -215,10 +221,10 @@ def _read_lifecycle_jsonl_tail_page(
     if not stat.S_ISREG(initial_path.st_mode):
         raise ValueError("LIFECYCLE_TAIL_NOT_REGULAR_FILE")
 
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(os.fspath(source), flags)
+    handle = open_paper_binary(source, "rb")
+    descriptor = None
     try:
-        initial_open = os.fstat(descriptor)
+        initial_open = os.fstat(handle.fileno())
         if not stat.S_ISREG(initial_open.st_mode):
             raise ValueError("LIFECYCLE_TAIL_NOT_REGULAR_FILE")
         for name in ("st_dev", "st_ino"):
@@ -229,8 +235,6 @@ def _read_lifecycle_jsonl_tail_page(
         source_size = int(initial_open.st_size)
         metadata["source_size_bytes"] = source_size
 
-        handle = os.fdopen(descriptor, "rb", closefd=True)
-        descriptor = None
         cursor = source_size
         pending_prefix = b""
         reversed_records = []

@@ -5,6 +5,7 @@ import builtins
 import copy
 import inspect
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -387,7 +388,7 @@ def test_040_no_runtime_imports():
             roots.update(alias.name.split(".", maxsplit=1)[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             roots.add(node.module.split(".", maxsplit=1)[0])
-    assert roots <= {"__future__", "copy", "hashlib", "json", "collections", "dataclasses", "pathlib", "typing", "registry_execution_schema"}
+    assert roots <= {"__future__", "copy", "hashlib", "json", "collections", "dataclasses", "pathlib", "typing", "registry_execution_schema", "paper_state_storage"}
     assert roots.isdisjoint({"bots", "broker", "flask", "main", "redis", "requests", "subprocess", "trade_registry"})
 
 
@@ -507,3 +508,16 @@ def test_reader_does_not_call_mutating_builtins(monkeypatch, tmp_path):
     result = reader.read_registry_v2(path)
     assert result.ok is True
     assert path.read_bytes() == before
+
+
+def test_render_reader_rejects_snapshot_outside_persistent_mount(monkeypatch, tmp_path):
+    if os.name == "nt":
+        pytest.skip("Render mount enforcement is POSIX-specific")
+    monkeypatch.setenv("RENDER", "true")
+    path = tmp_path / "registry-v2.json"
+
+    result = reader.read_registry_v2(path)
+
+    assert result.ok is False
+    assert result.status == reader.REGISTRY_V2_DOCUMENT_INVALID
+    assert "file_read_failed" in result.errors

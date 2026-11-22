@@ -77,6 +77,38 @@ class ExecutionPipelinePaperStateTest(unittest.TestCase):
         self.assertIsNone(result["trades"])
         self.assertIsNone(result["wins"])
 
+    def test_outcome_summary_uses_guarded_presence_check(self):
+        with mock.patch.object(pipeline, "paper_data_mount_verified", return_value=True), mock.patch.object(
+            pipeline, "paper_file_exists", return_value=False
+        ) as guarded_exists:
+            result = pipeline._outcome_summary()
+
+        guarded_exists.assert_called_once_with(pipeline.OUTCOME_STATS_FILE)
+        self.assertEqual(result["status"], "OUTCOME_STATS_MISSING")
+        self.assertIsNone(result["trades"])
+
+    def test_outcome_summary_fails_closed_on_presence_guard_error(self):
+        with mock.patch.object(pipeline, "paper_data_mount_verified", return_value=True), mock.patch.object(
+            pipeline, "paper_file_exists", side_effect=OSError("symlink rejected")
+        ):
+            result = pipeline._outcome_summary()
+
+        self.assertEqual(result["status"], "PAPER_DATA_MOUNT_NOT_VERIFIED")
+        self.assertIsNone(result["exists"])
+        self.assertIsNone(result["trades"])
+
+    def test_adaptive_summary_does_not_follow_unverified_presence_path(self):
+        patches = self._healthy_components()
+        with patches[0], patches[1], patches[2], patches[3], mock.patch.object(
+            pipeline, "get_adaptive_weights", return_value={"ok": True, "weights": {}}
+        ), mock.patch.object(
+            pipeline, "paper_file_exists", side_effect=OSError("symlink rejected")
+        ) as guarded_exists:
+            result = pipeline._adaptive_summary()
+
+        guarded_exists.assert_called_once_with(pipeline.ADAPTIVE_WEIGHTS_FILE)
+        self.assertIsNone(result["exists"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,8 +17,9 @@ from datetime import datetime, timezone, timedelta
 
 TIMEZONE_BR = timezone(timedelta(hours=-3))
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).resolve()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+from paper_state_storage import resolve_paper_data_dir
+
+DATA_DIR = resolve_paper_data_dir(__file__)
 
 CONTEXT_EXPORT_FILE = DATA_DIR / "context_export.json"
 CONTEXT_SEEN_FILE = DATA_DIR / "context_seen.json"

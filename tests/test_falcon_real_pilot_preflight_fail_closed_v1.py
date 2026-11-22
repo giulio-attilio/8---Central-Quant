@@ -309,6 +309,7 @@ def test_preflight_storage_real_status_is_observational_and_preserves_readiness(
         },
         {
             "central_trade_registry": registry,
+            "_paper_file_exists": lambda path: path.exists(),
             "_TRPSF_V1_STATE": state,
             "TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION": "synthetic-version",
             "_trpsf_v1_now": lambda: "synthetic-time",
@@ -370,6 +371,7 @@ def test_live_entry_storage_readiness_fails_closed_without_process_lock():
         {"_trpsf_v1_falcon_live_entry_storage_readiness", "_trpsf_v1_registry_lock"},
         {
             "central_trade_registry": SimpleNamespace(_lock=None),
+            "_paper_file_exists": lambda path: path.exists(),
             "_TRPSF_V1_STATE": state,
             "TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION": "synthetic-version",
             "_trpsf_v1_active_file": lambda: active,
