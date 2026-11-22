@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from history_memory_guard import AUTOMATIC_MAX_BYTES, AUTOMATIC_MAX_RECORDS, iter_jsonl_tail
-from paper_state_storage import append_paper_text
+from paper_state_storage import append_paper_text, paper_file_exists
 
 
 VERSION = "2026-07-12-PREDATOR-DAILY-SUMMARY-FROM-EVENT-LOG-V1"
@@ -78,7 +78,7 @@ def read_predator_event_log() -> Dict[str, Any]:
 
     def read_rows(source_path: Path, central_history: bool = False) -> None:
         nonlocal invalid
-        if not source_path.exists():
+        if not paper_file_exists(source_path):
             warnings.append(f"Fonte persistente não existe: {source_path}")
             return
         page = iter_jsonl_tail(
@@ -139,7 +139,10 @@ def read_predator_event_log() -> Dict[str, Any]:
         return {"ok": False, "status": "EVENT_LOG_READ_ERROR", "events": [], "invalid_lines": 0, "warnings": [str(exc)], "path": str(path)}
     if invalid:
         warnings.append(f"Event logs contêm {invalid} linha(s) inválida(s).")
-    ok = path.exists() or history_event_log_path().exists()
+    # The page list is populated only after the storage guard accepted a source
+    # and its bounded reader returned. Path.exists() follows symlinks and can
+    # otherwise report a false-positive LOADED state for a rejected source.
+    ok = bool(source_pages)
     partial = any(bool(page.get("partial")) for page in source_pages)
     return {
         "ok": ok,

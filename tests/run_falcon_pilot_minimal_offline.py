@@ -1,7 +1,7 @@
 """Run the existing Falcon safety regressions without external access.
 
 Usage: python3 -I tests/run_falcon_pilot_minimal_offline.py
-       [--upstash-sdk-contract|--account-client-order-authority|--live-position-risk-gate|--position-snapshot-reuse|--paper-registry-source-preview|--paper-registry-source-capture|--history-memory-state-io|--history-render-rewrite-guard|--lifecycle-shadow-bridge-storage-guard|--central-runtime-lock-guard|--paper-main-storage-guard|--data-status-lock-guard|--arb-tail-storage-guard|--policy-storage-guard|--journal-learning-storage-guard|--memory-profiler-storage-guard|--paper-integrated-disk-guard-no-flask|--personal-lifecycle-no-ccxt]
+       [--upstash-sdk-contract|--account-client-order-authority|--live-position-risk-gate|--position-snapshot-reuse|--paper-registry-source-preview|--paper-registry-source-capture|--history-memory-state-io|--history-render-rewrite-guard|--lifecycle-shadow-bridge-storage-guard|--central-runtime-lock-guard|--paper-main-storage-guard|--data-status-lock-guard|--arb-tail-storage-guard|--policy-storage-guard|--journal-learning-storage-guard|--memory-profiler-storage-guard|--paper-integrated-disk-guard-no-flask|--predator-daily-summary-storage-guard|--personal-lifecycle-no-ccxt]
 Some tests import main.py, so runtime auto-start is disabled before collection.
 Pytest is loaded only after network, subprocess and .env-file access are denied.
 """
@@ -244,6 +244,8 @@ if __name__ == "__main__":
             "test_memory_profiler_storage_guard_v1.py",
             "test_memory_gc_coordinator_v1.py",
         )
+    elif sys.argv[1:] == ["--predator-daily-summary-storage-guard"]:
+        cases = ("test_predator_daily_summary_paper_storage_v1.py",)
     elif sys.argv[1:] == ["--can-open-risk"]:
         cases = (
             "test_history_eventbus_smoke.py",

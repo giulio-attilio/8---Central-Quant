@@ -58,3 +58,27 @@ def test_predator_paper_event_writer_has_no_direct_path_open_or_mkdir():
     assert "append_paper_text" in calls
     assert "mkdir" not in calls
     assert "open" not in calls
+
+
+def test_predator_event_log_read_fails_closed_when_storage_guard_rejects_existing_path(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("CENTRAL_DATA_DIR", raising=False)
+    monkeypatch.setenv("RENDER", "true")
+    event_path = tmp_path / "predator_paper_events.jsonl"
+    event_path.write_text('{"event":"SYNTHETIC"}\n', encoding="utf-8")
+    assert event_path.exists()
+
+    def reject_event_source(path):
+        if Path(path) == event_path:
+            raise OSError("PAPER_SYMLINK_REJECTED")
+        return False
+
+    monkeypatch.setattr(predator_daily_summary, "paper_file_exists", reject_event_source)
+
+    result = predator_daily_summary.read_predator_event_log()
+
+    assert result["ok"] is False
+    assert result["status"] == "EVENT_LOG_READ_ERROR"
+    assert result["events"] == []
