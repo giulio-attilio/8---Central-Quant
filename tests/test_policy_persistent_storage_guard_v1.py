@@ -99,6 +99,13 @@ def test_trade_journal_and_learning_modules_route_io_through_shared_storage():
             "write_json_atomically",
             "append_paper_text",
         },
+        "executive_policy_learning": {
+            "resolve_paper_data_dir",
+            "ensure_paper_data_dir",
+            "paper_data_mount_verified",
+            "open_paper_text",
+            "write_json_atomically",
+        },
         "context_manager": {"resolve_paper_data_dir"},
     }
     forbidden_path_calls = {
@@ -128,3 +135,95 @@ def test_trade_journal_and_learning_modules_route_io_through_shared_storage():
                     and func.attr in {"open", "replace", "remove", "unlink", "makedirs"}
                 ):
                     raise AssertionError(f"unguarded os I/O in {module_name}:{node.lineno}")
+
+
+@pytest.mark.parametrize(
+    "seed_function_name",
+    ["seed_executive_policy_learning_events", "seed_policy_effect_decision"],
+)
+def test_policy_learning_seed_fails_closed_without_creating_unmounted_data_dir(
+    seed_function_name, tmp_path, monkeypatch
+):
+    import executive_policy_learning as learning
+
+    target = tmp_path / "would-be-ephemeral-data"
+    monkeypatch.setattr(learning, "DATA_DIR", target)
+    monkeypatch.setattr(learning, "TIMELINE_FILE", target / "timeline.jsonl")
+    monkeypatch.setattr(learning, "DECISION_LOG_FILE", target / "decision.jsonl")
+    monkeypatch.setattr(learning, "ensure_paper_data_dir", lambda _path: False)
+
+    seed = getattr(learning, seed_function_name)
+    with pytest.raises(OSError, match="POLICY_LEARNING_DATA_DIR_NOT_AVAILABLE"):
+        seed(commit=True)
+
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    ("seed_function_name", "writer_name"),
+    [
+        ("seed_executive_policy_learning_events", "_append_log"),
+        ("seed_policy_effect_decision", "open_paper_text"),
+    ],
+)
+def test_policy_learning_seed_check_only_performs_no_filesystem_writes(
+    seed_function_name, writer_name, tmp_path, monkeypatch
+):
+    import executive_policy_learning as learning
+
+    target = tmp_path / "check-only-data"
+    monkeypatch.setattr(learning, "DATA_DIR", target)
+    monkeypatch.setattr(learning, "TIMELINE_FILE", target / "timeline.jsonl")
+    monkeypatch.setattr(learning, "LOG_FILE", target / "learning.jsonl")
+    monkeypatch.setattr(learning, "DECISION_LOG_FILE", target / "decision.jsonl")
+    monkeypatch.setattr(learning, "V2_LOG_FILE", target / "effect.jsonl")
+    monkeypatch.setattr(
+        learning,
+        "ensure_paper_data_dir",
+        lambda _path: pytest.fail("check-only must not initialize storage"),
+    )
+    calls = []
+    monkeypatch.setattr(
+        learning,
+        writer_name,
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    result = getattr(learning, seed_function_name)(commit=False)
+
+    assert result["ok"] is True
+    assert result["commit"] is False
+    assert calls == []
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    "seed_function_name",
+    ["seed_executive_policy_learning_events", "seed_policy_effect_decision"],
+)
+def test_policy_learning_seed_commit_uses_only_temporary_paper_storage(
+    seed_function_name, tmp_path, monkeypatch
+):
+    import executive_policy_learning as learning
+
+    monkeypatch.delenv("RENDER", raising=False)
+    target = tmp_path / "paper-state"
+    monkeypatch.setattr(learning, "DATA_DIR", target)
+    monkeypatch.setattr(learning, "TIMELINE_FILE", target / "timeline.jsonl")
+    monkeypatch.setattr(learning, "LOG_FILE", target / "learning.jsonl")
+    monkeypatch.setattr(learning, "DECISION_LOG_FILE", target / "decision.jsonl")
+    monkeypatch.setattr(learning, "V2_LOG_FILE", target / "effect.jsonl")
+
+    result = getattr(learning, seed_function_name)(commit=True)
+
+    assert result["ok"] is True
+    assert result["commit"] is True
+    assert target.is_dir()
+    if seed_function_name == "seed_executive_policy_learning_events":
+        assert len((target / "timeline.jsonl").read_text(encoding="utf-8").splitlines()) == 7
+        assert (target / "learning.jsonl").is_file()
+        assert not (target / "decision.jsonl").exists()
+    else:
+        assert len((target / "decision.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+        assert len((target / "effect.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+        assert not (target / "timeline.jsonl").exists()

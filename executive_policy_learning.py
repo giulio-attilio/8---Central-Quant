@@ -822,7 +822,8 @@ def seed_executive_policy_learning_events(commit=True):
     - Não executam trades.
     - Não alteram policies ativas.
     """
-    DATA_DIR.mkdir(exist_ok=True)
+    if commit and not ensure_paper_data_dir(DATA_DIR):
+        raise OSError("POLICY_LEARNING_DATA_DIR_NOT_AVAILABLE")
 
     now = _now()
     seed_id = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -922,10 +923,11 @@ def seed_executive_policy_learning_events(commit=True):
         ],
     }
 
-    _append_log({
-        "event": "POLICY_LEARNING_SEED",
-        **result,
-    })
+    if commit:
+        _append_log({
+            "event": "POLICY_LEARNING_SEED",
+            **result,
+        })
 
     return result
 
@@ -1966,7 +1968,8 @@ def seed_policy_effect_decision(commit=True):
     - Não altera policies reais.
     - Não cria posição.
     """
-    DATA_DIR.mkdir(exist_ok=True)
+    if commit and not ensure_paper_data_dir(DATA_DIR):
+        raise OSError("POLICY_LEARNING_DATA_DIR_NOT_AVAILABLE")
 
     now = _now()
     seed_id = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -2039,14 +2042,15 @@ def seed_policy_effect_decision(commit=True):
         ],
     }
 
-    try:
-        with open_paper_text(V2_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "event": "POLICY_EFFECT_DECISION_SEED",
-                **result,
-            }, ensure_ascii=False, sort_keys=True) + "\n")
-    except Exception:
-        pass
+    if commit:
+        try:
+            with open_paper_text(V2_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "event": "POLICY_EFFECT_DECISION_SEED",
+                    **result,
+                }, ensure_ascii=False, sort_keys=True) + "\n")
+        except Exception:
+            pass
 
     return result
 
