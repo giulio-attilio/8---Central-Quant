@@ -27,6 +27,7 @@ from redis_bandwidth import (
 )
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 from telegram_notification_policy import send_automatic_telegram
+from telegram_command_auth_v1 import telegram_command_authorized
 
 try:
     import trade_registry as central_trade_registry
@@ -2340,7 +2341,10 @@ def listen_commands():
                 if not msg:
                     continue
                 chat_id = str(msg.get("chat", {}).get("id"))
-                if str(CHAT_ID) != chat_id:
+                if not telegram_command_authorized(
+                    msg, CHAT_ID,
+                    ("COBRA_TELEGRAM_OWNER_USER_ID", "CENTRAL_TELEGRAM_OWNER_USER_ID"),
+                ):
                     continue
                 texto = msg.get("text", "")
                 if not texto:

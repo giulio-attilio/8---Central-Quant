@@ -52,6 +52,7 @@ from account_client_order_id import (
 )
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 from telegram_notification_policy import send_automatic_telegram
+from telegram_command_auth_v1 import telegram_command_authorized
 from static_operational_runtime import (
     large_redis_snapshot_allowed,
     static_operational_runtime_blocked_log,
@@ -4561,7 +4562,10 @@ def listen_commands():
                 if not texto or not chat_id:
                     continue
 
-                if CHAT_ID and str(chat_id) != str(CHAT_ID):
+                if not telegram_command_authorized(
+                    msg, CHAT_ID,
+                    ("PREDATOR_TELEGRAM_OWNER_USER_ID", "CENTRAL_TELEGRAM_OWNER_USER_ID"),
+                ):
                     continue
 
                 cmd = texto.strip().split()[0].lower()

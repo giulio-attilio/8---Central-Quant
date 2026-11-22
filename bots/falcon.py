@@ -21,6 +21,7 @@
 # Variáveis principais:
 # - ENABLE_FALCON=true
 # - FALCON_TOKEN / FALCON_CHAT_ID
+# - FALCON_TELEGRAM_OWNER_USER_ID (optional for private chats; required for groups)
 # - UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN
 # - FALCON_WATCHLIST_FILE=watchlists/falcon.json
 # - FALCON_ENABLED_SETUPS=15,30
@@ -46,6 +47,7 @@ from paper_state_storage import (
 from personal_http_auth import central_personal_http_auth
 from runtime_drain_v1 import RUNTIME_DRAIN, guard_live_flow, runtime_drain_blocked_result
 from telegram_notification_policy import send_automatic_telegram
+from telegram_command_auth_v1 import telegram_command_authorized
 import pandas as pd
 import numpy as np
 from exchange_manager import get_exchange, load_markets_once
@@ -6125,6 +6127,20 @@ def telegram_reply(chat_id, text):
         return False
 
 
+def _falcon_telegram_command_authorized(message, chat_id):
+    """Use the shared fail-closed authorization policy for Falcon commands."""
+    if not isinstance(message, dict):
+        return False
+    chat = message.get("chat")
+    if not isinstance(chat, dict) or str(chat.get("id")) != str(chat_id):
+        return False
+    return telegram_command_authorized(
+        message,
+        CHAT_ID,
+        ("FALCON_TELEGRAM_OWNER_USER_ID", "CENTRAL_TELEGRAM_OWNER_USER_ID"),
+    )
+
+
 def commands_loop():
     offset = None
     while True:
@@ -6136,6 +6152,8 @@ def commands_loop():
                 text = (msg.get("text") or "").strip()
                 chat_id = (msg.get("chat") or {}).get("id")
                 if not text or not chat_id:
+                    continue
+                if not _falcon_telegram_command_authorized(msg, chat_id):
                     continue
                 cmd = text.split()[0].lower().split("@")[0]
                 if cmd == "/health":
@@ -6156,13 +6174,10 @@ def commands_loop():
                     redis_set_json(LAST_CANDLES_KEY, {})
                     telegram_reply(chat_id, "✅ Reset operacional Falcon realizado. Posições e trades NÃO foram apagados.")
                 elif cmd == "/reset_falcon_all":
-                    redis_set_json(POSITIONS_KEY, {})
-                    redis_set_json(SIGNALS_KEY, [])
-                    redis_set_json(TRADES_KEY, [])
-                    redis_set_json(EVENTS_KEY, [])
-                    redis_set_json(FUNNEL_KEY, {})
-                    redis_set_json(LAST_CANDLES_KEY, {})
-                    telegram_reply(chat_id, "✅ Falcon zerado: posições, sinais, trades, eventos e funil apagados.")
+                    telegram_reply(
+                        chat_id,
+                        "Comando desativado para preservar posições e histórico Falcon.",
+                    )
                 elif cmd == "/comandos":
                     telegram_reply(chat_id, "🦅 Comandos Falcon:\n/health\n/posicoes\n/resumo\n/funil\n/eventos\n/watchlist\n/reset")
             HEALTH["last_command_run"] = data_hora_sp_str()

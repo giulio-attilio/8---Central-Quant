@@ -52,6 +52,7 @@ import threading
 import requests
 from personal_http_auth import central_personal_http_auth
 from telegram_notification_policy import send_automatic_telegram
+from telegram_command_auth_v1 import telegram_command_authorized
 import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
 from runtime_drain_v1 import RUNTIME_DRAIN, guard_management_cycle
@@ -4770,7 +4771,10 @@ def listen_commands():
                 texto = msg.get("text", "")
                 chat_id = msg.get("chat", {}).get("id")
 
-                if not chat_id:
+                if not telegram_command_authorized(
+                    msg, CHAT_ID,
+                    ("TRENDPRO_TELEGRAM_OWNER_USER_ID", "CENTRAL_TELEGRAM_OWNER_USER_ID"),
+                ):
                     continue
 
                 if texto == "/status":
@@ -5050,7 +5054,10 @@ def listen_donkey_commands():
                 msg = update.get("message", {})
                 texto = msg.get("text", "")
                 chat_id = msg.get("chat", {}).get("id")
-                if not chat_id:
+                if not telegram_command_authorized(
+                    msg, DONKEY_CHAT_ID,
+                    ("DONKEY_TELEGRAM_OWNER_USER_ID", "CENTRAL_TELEGRAM_OWNER_USER_ID"),
+                ):
                     continue
                 comando = texto.strip().split()[0].lower() if texto else ""
                 if "@" in comando:

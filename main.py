@@ -47,6 +47,7 @@ from urllib.parse import urlsplit
 
 from memory_gc_coordinator import coordinate_memory_gc
 from registry_execution_identity import is_v2_execution_id
+from telegram_command_auth_v1 import telegram_command_authorized
 from trade_evidence_identity_offset_runtime_shadow_post_protection_runtime_proof_finalizer_v3 import (
     finalize_c3_post_protection_runtime_proof_v3,
 )
@@ -2642,6 +2643,15 @@ BOT_CONFIGS = {
         "extra_chat_envs": ["FALCON_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"],
     },
 }
+
+
+def _central_telegram_command_authorized(message, allowed_chat, bot_key=None):
+    """Require both the configured Telegram chat and its authorized human."""
+    owner_env_names = []
+    if bot_key:
+        owner_env_names.append(f"{str(bot_key).strip().upper()}_TELEGRAM_OWNER_USER_ID")
+    owner_env_names.append("CENTRAL_TELEGRAM_OWNER_USER_ID")
+    return telegram_command_authorized(message, allowed_chat, tuple(owner_env_names))
 
 LOADED_BOTS = {}
 LOAD_ERRORS = {}
@@ -33053,7 +33063,7 @@ def central_telegram_command_loop():
 
                 if not text.startswith("/"):
                     continue
-                if allowed_chat and chat_id != str(allowed_chat):
+                if not _central_telegram_command_authorized(msg, allowed_chat):
                     continue
 
                 if _is_duplicate_recent_central_command(chat_id, text):
@@ -33766,7 +33776,7 @@ def central_command_router_loop(key: str, cfg: dict):
 
                 if not text.startswith("/"):
                     continue
-                if allowed_chat and chat_id != str(allowed_chat):
+                if not _central_telegram_command_authorized(msg, allowed_chat, key):
                     continue
                 if not TELEGRAM_MANUAL_COMMANDS_ENABLED:
                     telegram_send_with_token(

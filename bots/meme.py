@@ -52,6 +52,7 @@ import threading
 import requests
 from personal_http_auth import central_personal_http_auth
 from telegram_notification_policy import send_automatic_telegram
+from telegram_command_auth_v1 import telegram_command_authorized
 import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
 from runtime_drain_v1 import RUNTIME_DRAIN, guard_management_cycle
@@ -4117,7 +4118,10 @@ def listen_commands():
                 texto_raw = msg.get("text", "") or ""
                 texto = texto_raw.strip().split()[0].lower() if texto_raw.strip() else ""
                 chat_id = msg.get("chat", {}).get("id")
-                if not chat_id or str(chat_id) != str(CHAT_ID):
+                if not telegram_command_authorized(
+                    msg, CHAT_ID,
+                    ("MEME_TELEGRAM_OWNER_USER_ID", "CENTRAL_TELEGRAM_OWNER_USER_ID"),
+                ):
                     continue
                 cmd = texto.strip().split()[0].lower()
                 if "@" in cmd:
