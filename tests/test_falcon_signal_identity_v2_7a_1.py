@@ -23,7 +23,8 @@ HELPER_SOURCE = ROOT / "falcon_signal_identity.py"
 def _signal(**overrides):
     signal = {
         "id": "FALCON15:BTCUSDT:LONG:2026-08-09",
-        "bot": "Falcon Strike ORB PRO",
+        "bot": "FALCON",
+        "bot_name": "Falcon Strike ORB PRO",
         "setup": "FALCON15",
         "setup_label": "Falcon 15",
         "symbol": "BTCUSDT",
@@ -67,7 +68,8 @@ def _birth_facts(**overrides):
 def _expected_v1_signal(created_at):
     return {
         "id": "FALCON15:BTCUSDT:LONG:2026-08-09",
-        "bot": "Falcon Strike ORB PRO",
+        "bot": "FALCON",
+        "bot_name": "Falcon Strike ORB PRO",
         "setup": "FALCON15",
         "setup_label": "Falcon 15",
         "symbol": "BTCUSDT",
@@ -206,6 +208,8 @@ def test_productive_signal_birth_attaches_only_additive_identity_fields():
         "signal_identity_provenance",
     }
     assert signal["id"] == "FALCON15:BTCUSDT:LONG:2026-08-09"
+    assert signal["bot"] == "FALCON"
+    assert signal["bot_name"] == "Falcon Strike ORB PRO"
     assert signal["signal_id"].startswith(FALCON_SIGNAL_ID_PREFIX)
     assert signal["signal_id"] != signal["id"]
     assert signal["signal_identity_version"] == FALCON_SIGNAL_IDENTITY_VERSION

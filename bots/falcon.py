@@ -2013,7 +2013,8 @@ def analyze_symbol_setup(symbol, setup_key, setup_cfg, closed):
 
     signal = {
         "id": position_id(symbol, setup_key, side, ny_date),
-        "bot": BOT_NAME,
+        "bot": "FALCON",
+        "bot_name": BOT_NAME,
         "setup": setup_key,
         "setup_label": setup_cfg["label"],
         "symbol": symbol,
