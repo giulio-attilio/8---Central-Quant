@@ -4739,10 +4739,25 @@ def execute_signal_if_allowed(sig, positions=None):
     paper_latch_reader = globals().get(
         "falcon_paper_persistence_reconciliation_required"
     )
+    persisted_position_marker = bool(
+        mode == "PAPER"
+        and isinstance(positions, dict)
+        and any(
+            isinstance(position, dict)
+            and "falcon_persistence_failure_components" in position
+            for position in positions.values()
+        )
+    )
+    if persisted_position_marker:
+        HEALTH["falcon_paper_persistence_reconciliation_required"] = True
+        HEALTH["falcon_paper_persistence_latch_status"] = (
+            "POSITION_PERSISTENCE_RECONCILIATION_REQUIRED"
+        )
     if (
         mode == "PAPER"
         and (
             HEALTH.get("falcon_paper_persistence_reconciliation_required") is True
+            or persisted_position_marker
             or (
                 callable(paper_latch_reader)
                 and paper_latch_reader() is True
@@ -5237,6 +5252,33 @@ def falcon_persist_accepted_signal(sig, positions):
             }
             HEALTH["last_trade_registry_event"] = dict(result)
             return result
+        recorded_failures = existing.get("falcon_persistence_failure_components")
+        allowed_failures = {
+            "REGISTRY_SYNC_FAILED",
+            "FALCON_MEMORY_SYNC_FAILED",
+        }
+        pending_failures = sorted(
+            {
+                value
+                for value in recorded_failures
+                if isinstance(value, str) and value in allowed_failures
+            }
+        ) if isinstance(recorded_failures, (list, tuple, set)) else []
+        if "falcon_persistence_failure_components" in existing:
+            return {
+                "ok": False,
+                "status": (
+                    "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED"
+                    if pending_failures
+                    else "FALCON_PERSISTENCE_STATE_INVALID"
+                ),
+                "position_recognized": True,
+                "registry_write_attempted": False,
+                "memory_write_attempted": False,
+                "failure_components": pending_failures,
+                "reconciliation_required": True,
+                "idempotent": True,
+            }
         return {
             "ok": True,
             "status": "FALCON_ACCEPTED_SIGNAL_ALREADY_SYNCHRONIZED",
@@ -5246,22 +5288,74 @@ def falcon_persist_accepted_signal(sig, positions):
             "idempotent": True,
         }
 
+    def persist_memory_projection(failure_components=()):
+        safe_components = sorted(
+            {
+                value
+                for value in failure_components
+                if isinstance(value, str)
+                and value in {
+                    "REGISTRY_SYNC_FAILED",
+                    "FALCON_MEMORY_SYNC_FAILED",
+                }
+            }
+        )
+        if safe_components:
+            sig["falcon_persistence_failure_components"] = safe_components
+        else:
+            sig.pop("falcon_persistence_failure_components", None)
+        positions[pid] = sig
+        try:
+            persisted = save_positions(positions) is True
+        except Exception:
+            persisted = False
+        if not persisted:
+            HEALTH["last_warning"] = "FALCON_ACCEPTED_SIGNAL_MEMORY_WRITE_FAILED"
+        return persisted
+
     # The registry is the durable factual writer authority.  A restart may
     # lose the in-memory/positions projection while the registry write already
     # succeeded; confirm the exact lifecycle/order/client identity before
     # attempting another OPEN write.
     registry = globals().get("central_trade_registry")
     registry_reader = getattr(registry, "load_registry_read_only", None)
+    registry_read_failed = not callable(registry_reader)
+    registry_snapshot = None
     if callable(registry_reader):
         try:
             registry_snapshot = registry_reader()
         except Exception:
-            registry_snapshot = {}
-        open_trades = (
-            registry_snapshot.get("open_trades")
-            if isinstance(registry_snapshot, dict)
-            else {}
-        )
+            registry_read_failed = True
+    open_trades = (
+        registry_snapshot.get("open_trades")
+        if isinstance(registry_snapshot, dict)
+        else None
+    )
+    if not isinstance(open_trades, (dict, list)):
+        registry_read_failed = True
+
+    if registry_read_failed:
+        # A failed or malformed factual read is not evidence that the Registry
+        # is empty. Preserve the accepted signal in Falcon memory if possible,
+        # but never attempt a second Registry OPEN write on that assumption.
+        failure_components = ["REGISTRY_SYNC_FAILED"]
+        memory_ok = persist_memory_projection(failure_components)
+        if not memory_ok:
+            failure_components.append("FALCON_MEMORY_SYNC_FAILED")
+            sig["falcon_persistence_failure_components"] = failure_components
+        return {
+            "ok": False,
+            "status": "FALCON_REGISTRY_READ_FAILED_RECONCILIATION_REQUIRED",
+            "position_recognized": True,
+            "registry_write_attempted": False,
+            "registry_write_succeeded": False,
+            "memory_write_attempted": True,
+            "memory_write_succeeded": memory_ok,
+            "failure_components": failure_components,
+            "reconciliation_required": True,
+        }
+
+    if isinstance(open_trades, (dict, list)):
         rows = (
             list(open_trades.values())
             if isinstance(open_trades, dict)
@@ -5301,15 +5395,25 @@ def falcon_persist_accepted_signal(sig, positions):
                 and str(row_client) == signal_client
                 and str(row_order) == signal_order
             ):
-                positions[pid] = sig
-                memory_result = save_positions(positions)
+                memory_ok = persist_memory_projection()
+                failure_components = (
+                    [] if memory_ok else ["FALCON_MEMORY_SYNC_FAILED"]
+                )
+                if not memory_ok:
+                    sig["falcon_persistence_failure_components"] = failure_components
                 return {
-                    "ok": memory_result is True,
-                    "status": "FALCON_ACCEPTED_SIGNAL_ALREADY_REGISTERED",
+                    "ok": memory_ok,
+                    "status": (
+                        "FALCON_ACCEPTED_SIGNAL_ALREADY_REGISTERED"
+                        if memory_ok
+                        else "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED"
+                    ),
                     "position_recognized": True,
                     "registry_write_attempted": False,
                     "memory_write_attempted": True,
-                    "memory_write_succeeded": memory_result is True,
+                    "memory_write_succeeded": memory_ok,
+                    "failure_components": failure_components,
+                    "reconciliation_required": not memory_ok,
                     "idempotent": True,
                 }
 
@@ -5317,9 +5421,13 @@ def falcon_persist_accepted_signal(sig, positions):
     registry_ok = bool(
         isinstance(registry_result, dict) and registry_result.get("ok") is True
     )
-    positions[pid] = sig
-    memory_result = save_positions(positions)
-    memory_ok = memory_result is True
+    failure_components = []
+    if not registry_ok:
+        failure_components.append("REGISTRY_SYNC_FAILED")
+    memory_ok = persist_memory_projection(failure_components)
+    if not memory_ok:
+        failure_components.append("FALCON_MEMORY_SYNC_FAILED")
+        sig["falcon_persistence_failure_components"] = failure_components
     result = {
         "ok": bool(registry_ok and memory_ok),
         "status": (
@@ -5332,6 +5440,9 @@ def falcon_persist_accepted_signal(sig, positions):
         "registry_write_succeeded": registry_ok,
         "memory_write_attempted": True,
         "memory_write_succeeded": memory_ok,
+        # Stable, allow-listed categories only: never copy exception text,
+        # trade identifiers, Redis values, or registry payloads into health.
+        "failure_components": failure_components,
         "reconciliation_required": bool(
             sig.get("reconciliation_required") or not registry_ok or not memory_ok
         ),
@@ -5411,9 +5522,29 @@ def _falcon_process_entry_signal(sig, positions):
         # failure cannot leave this process eligible for another PAPER entry.
         HEALTH["falcon_paper_persistence_reconciliation_required"] = True
         latch_writer = globals().get("falcon_persist_paper_persistence_latch")
+        allowed_failure_components = {
+            "REGISTRY_SYNC_FAILED",
+            "FALCON_MEMORY_SYNC_FAILED",
+        }
+        raw_failure_components = (
+            persistence.get("failure_components")
+            if isinstance(persistence, dict)
+            else None
+        )
+        safe_failure_components = sorted(
+            {
+                value
+                for value in raw_failure_components
+                if isinstance(value, str) and value in allowed_failure_components
+            }
+        ) if isinstance(raw_failure_components, (list, tuple, set)) else []
+        latch_reason = "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED"
+        if safe_failure_components:
+            latch_reason += ":" + "+".join(safe_failure_components)
+            blocked["persistence_failure_components"] = safe_failure_components
         try:
             latch_result = (
-                latch_writer("FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED")
+                latch_writer(latch_reason)
                 if callable(latch_writer)
                 else {"ok": False, "status": "PAPER_PERSISTENCE_LATCH_WRITER_UNAVAILABLE"}
             )

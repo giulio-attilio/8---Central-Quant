@@ -36,6 +36,13 @@ class _RegistryProbe:
         self.updates = []
         self.opens = []
 
+    def load_registry_read_only(self):
+        return {
+            "open_trades": {
+                str(index): dict(row) for index, row in enumerate(self.opens)
+            }
+        }
+
     def register_open_trade(self, **payload):
         self.opens.append(payload)
         return {"ok": True, "action": "OPEN_REGISTERED", "trade_id": "FALCON:FALCON15:SOLUSDT:SHORT"}
@@ -297,6 +304,7 @@ def test_protected_entry_with_ack_persistence_failure_is_consumed_and_registered
     persist = _function(
         "falcon_persist_accepted_signal",
         {
+            "central_trade_registry": registry,
             "register_falcon_trade_registry_open": register,
             "save_positions": lambda positions: memory_writes.append(
                 dict(positions)
@@ -372,6 +380,253 @@ def test_paper_entry_stops_when_accepted_signal_persistence_requires_reconciliat
     assert events == []
 
 
+@pytest.mark.parametrize(
+    ("registry_ok", "memory_ok", "expected_failures"),
+    [
+        (False, True, ["REGISTRY_SYNC_FAILED"]),
+        (True, False, ["FALCON_MEMORY_SYNC_FAILED"]),
+        (
+            False,
+            False,
+            ["REGISTRY_SYNC_FAILED", "FALCON_MEMORY_SYNC_FAILED"],
+        ),
+    ],
+)
+def test_accepted_signal_persistence_classifies_each_failed_writer(
+    registry_ok, memory_ok, expected_failures
+):
+    class RegistryReader:
+        @staticmethod
+        def load_registry_read_only():
+            return {"open_trades": {}}
+
+    persist = _function(
+        "falcon_persist_accepted_signal",
+        {
+            "central_trade_registry": RegistryReader(),
+            "register_falcon_trade_registry_open": lambda _signal: {
+                "ok": registry_ok
+            },
+            "save_positions": lambda _positions: memory_ok,
+            "HEALTH": {},
+        },
+    )
+
+    result = persist({"id": "PAPER-TEST"}, {})
+
+    assert result["failure_components"] == expected_failures
+    assert result["registry_write_succeeded"] is registry_ok
+    assert result["memory_write_succeeded"] is memory_ok
+    assert result["ok"] is False
+
+
+def test_accepted_signal_registry_read_failure_never_attempts_registry_open():
+    class RegistryReader:
+        @staticmethod
+        def load_registry_read_only():
+            raise OSError("synthetic registry read failure")
+
+    saved = []
+    persist = _function(
+        "falcon_persist_accepted_signal",
+        {
+            "central_trade_registry": RegistryReader(),
+            "register_falcon_trade_registry_open": lambda _signal: pytest.fail(
+                "must not write after an unreadable Registry snapshot"
+            ),
+            "save_positions": lambda positions: saved.append(dict(positions)) or True,
+            "HEALTH": {},
+        },
+    )
+
+    positions = {}
+    result = persist({"id": "FALCON-PAPER-READ-FAIL"}, positions)
+
+    assert result["ok"] is False
+    assert result["status"] == "FALCON_REGISTRY_READ_FAILED_RECONCILIATION_REQUIRED"
+    assert result["registry_write_attempted"] is False
+    assert result["memory_write_succeeded"] is True
+    assert result["failure_components"] == ["REGISTRY_SYNC_FAILED"]
+    assert result["reconciliation_required"] is True
+    assert len(saved) == 1
+    assert saved[0]["FALCON-PAPER-READ-FAIL"][
+        "falcon_persistence_failure_components"
+    ] == ["REGISTRY_SYNC_FAILED"]
+    assert positions["FALCON-PAPER-READ-FAIL"]["id"] == "FALCON-PAPER-READ-FAIL"
+
+
+def test_accepted_signal_memory_write_exception_is_classified_and_rolled_back():
+    class RegistryReader:
+        @staticmethod
+        def load_registry_read_only():
+            return {"open_trades": {}}
+
+    registry_writes = []
+
+    def fail_memory_write(_positions):
+        raise OSError("synthetic redis failure")
+
+    persist = _function(
+        "falcon_persist_accepted_signal",
+        {
+            "central_trade_registry": RegistryReader(),
+            "register_falcon_trade_registry_open": lambda signal: (
+                registry_writes.append(signal) or {"ok": True}
+            ),
+            "save_positions": fail_memory_write,
+            "HEALTH": {},
+        },
+    )
+
+    positions = {}
+    result = persist({"id": "FALCON-PAPER-REDIS-FAIL"}, positions)
+
+    assert result["ok"] is False
+    assert result["failure_components"] == ["FALCON_MEMORY_SYNC_FAILED"]
+    assert result["registry_write_succeeded"] is True
+    assert result["memory_write_succeeded"] is False
+    assert result["reconciliation_required"] is True
+    assert len(registry_writes) == 1
+    assert positions["FALCON-PAPER-REDIS-FAIL"][
+        "falcon_persistence_failure_components"
+    ] == ["FALCON_MEMORY_SYNC_FAILED"]
+
+
+def test_idempotent_registry_match_classifies_memory_write_failure():
+    class RegistryReader:
+        @staticmethod
+        def load_registry_read_only():
+            return {
+                "open_trades": {
+                    "existing": {
+                        "lifecycle_id": "LIFE-1",
+                        "client_order_id": "CLIENT-1",
+                        "broker_order_id": "ORDER-1",
+                    }
+                }
+            }
+
+    persist = _function(
+        "falcon_persist_accepted_signal",
+        {
+            "central_trade_registry": RegistryReader(),
+            "register_falcon_trade_registry_open": lambda _signal: pytest.fail(
+                "exact existing lifecycle must not register twice"
+            ),
+            "save_positions": lambda _positions: False,
+            "_falcon_terminal_registry_field": lambda row, *fields: next(
+                (row.get(field) for field in fields if row.get(field) not in (None, "")),
+                None,
+            ),
+            "HEALTH": {},
+        },
+    )
+
+    result = persist(
+        {
+            "id": "FALCON-PAPER-MEMORY-FAIL",
+            "lifecycle_id": "LIFE-1",
+            "live_client_order_id": "CLIENT-1",
+            "live_order_id": "ORDER-1",
+        },
+        {},
+    )
+
+    assert result["ok"] is False
+    assert result["failure_components"] == ["FALCON_MEMORY_SYNC_FAILED"]
+    assert result["registry_write_attempted"] is False
+    assert result["status"] == "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED"
+    assert result["reconciliation_required"] is True
+
+
+def test_in_memory_pending_persistence_marker_cannot_be_treated_as_synchronized():
+    persist = _function(
+        "falcon_persist_accepted_signal",
+        {"HEALTH": {}},
+    )
+
+    result = persist(
+        {
+            "id": "FALCON-PAPER-PENDING",
+            "falcon_persistence_failure_components": ["REGISTRY_SYNC_FAILED"],
+        },
+        {
+            "FALCON-PAPER-PENDING": {
+                "id": "FALCON-PAPER-PENDING",
+                "falcon_persistence_failure_components": [
+                    "REGISTRY_SYNC_FAILED"
+                ],
+            }
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED"
+    assert result["registry_write_attempted"] is False
+    assert result["failure_components"] == ["REGISTRY_SYNC_FAILED"]
+    assert result["reconciliation_required"] is True
+
+
+def test_paper_persistence_latch_records_only_allowlisted_failure_components():
+    health = {}
+    latch_reasons = []
+    process = _function(
+        "_falcon_process_entry_signal",
+        {
+            "guard_live_flow": lambda *_args, **_kwargs: lambda fn: fn,
+            "RUNTIME_DRAIN": object(),
+            "_falcon_live_entry_flow_enabled": lambda: False,
+            "_falcon_runtime_drain_denial": lambda *_args, **_kwargs: (False, {}),
+            "execute_signal_if_allowed": lambda _sig, positions=None: (
+                True,
+                {"allowed": True, "decision": "PAPER", "sent": False},
+            ),
+            "falcon_persist_accepted_signal": lambda _sig, _positions: {
+                "ok": False,
+                "status": "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED",
+                "failure_components": [
+                    "FALCON_MEMORY_SYNC_FAILED",
+                    "UNTRUSTED_EXCEPTION_TEXT_WITH_SECRET",
+                    "REGISTRY_SYNC_FAILED",
+                ],
+                "reconciliation_required": True,
+            },
+            "falcon_persist_paper_persistence_latch": lambda reason: (
+                latch_reasons.append(reason)
+                or {"ok": True, "status": "PAPER_PERSISTENCE_LATCH_PERSISTED"}
+            ),
+            "HEALTH": health,
+            "redis_list_append": lambda *_args: pytest.fail("must not append signal"),
+            "SIGNALS_KEY": "signals",
+            "record_event": lambda *_args: pytest.fail("must not record event"),
+            "signal_message": lambda _sig: "signal",
+            "execution_decision_text": lambda _decision: "decision",
+            "safe_send_telegram": lambda *_args, **_kwargs: pytest.fail(
+                "must not send notification"
+            ),
+            "FALCON_MODE": "PAPER",
+            "funnel_inc": lambda *_args: pytest.fail("must stop before funnel"),
+        },
+    )
+
+    allowed, decision = process(
+        {"id": "PAPER-SECRET-IDENTIFIER", "execution_mode": "PAPER"}, {}
+    )
+
+    assert allowed is False
+    assert decision["persistence_failure_components"] == [
+        "FALCON_MEMORY_SYNC_FAILED",
+        "REGISTRY_SYNC_FAILED",
+    ]
+    assert latch_reasons == [
+        "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED:"
+        "FALCON_MEMORY_SYNC_FAILED+REGISTRY_SYNC_FAILED"
+    ]
+    assert "PAPER-SECRET-IDENTIFIER" not in latch_reasons[0]
+    assert "UNTRUSTED_EXCEPTION_TEXT_WITH_SECRET" not in latch_reasons[0]
+    assert health["falcon_paper_persistence_reconciliation_required"] is True
+
+
 def test_paper_entry_stays_latched_if_latch_writer_raises_or_returns_invalid_result():
     expected_statuses = (
         "PAPER_PERSISTENCE_LATCH_WRITE_FAILED:OSError",
@@ -444,6 +699,59 @@ def test_paper_reconciliation_latch_blocks_followup_entries_in_same_process():
     assert signal["execution_mode"] == "PAPER"
     assert signal["execution_decision"] is decision
     assert health["last_execution_decision"] is decision
+
+
+def test_persisted_position_failure_marker_blocks_paper_after_runtime_restart():
+    health = {}
+    execute = _function(
+        "execute_signal_if_allowed",
+        {
+            "FALCON_MODE": "PAPER",
+            "HEALTH": health,
+            "falcon_paper_persistence_reconciliation_required": lambda: False,
+        },
+        definition_index=0,
+    )
+    signal = {"id": "PAPER-AFTER-RESTART"}
+    positions = {
+        "accepted-but-not-reconciled": {
+            "falcon_persistence_failure_components": ["REGISTRY_SYNC_FAILED"]
+        }
+    }
+
+    allowed, decision = execute(signal, positions=positions)
+
+    assert allowed is False
+    assert decision["status"] == "FALCON_PAPER_PERSISTENCE_RECONCILIATION_REQUIRED"
+    assert decision["reconciliation_required"] is True
+    assert health["falcon_paper_persistence_reconciliation_required"] is True
+    assert health["falcon_paper_persistence_latch_status"] == (
+        "POSITION_PERSISTENCE_RECONCILIATION_REQUIRED"
+    )
+
+
+def test_paper_persistence_marker_does_not_change_live_mode_gate():
+    health = {"falcon_live_management_reconciliation_ready": False}
+    execute = _function(
+        "execute_signal_if_allowed",
+        {"FALCON_MODE": "LIVE", "HEALTH": health},
+        definition_index=0,
+    )
+
+    allowed, decision = execute(
+        {"id": "SYNTHETIC-LIVE"},
+        positions={
+            "paper": {
+                "falcon_persistence_failure_components": [
+                    "REGISTRY_SYNC_FAILED"
+                ]
+            }
+        },
+    )
+
+    assert allowed is False
+    assert decision["status"] == "FALCON_LIVE_MANAGEMENT_RECONCILIATION_NOT_READY"
+    assert health.get("falcon_paper_persistence_reconciliation_required") is None
 
 
 def test_paper_persistence_latch_survives_fresh_runtime_and_fails_closed_on_corruption(
