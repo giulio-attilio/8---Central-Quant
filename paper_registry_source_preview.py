@@ -257,6 +257,73 @@ def _identity_alias_conflict_counts(rows: list[Mapping[str, Any]]) -> dict[str, 
     return {field: int(count) for field, count in sorted(counts.items())}
 
 
+def _identity_alias_conflict_pairs(row: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
+    """Return fixed source-field pairs that differ, never their values."""
+    fields = {**_IDENTITY_ALIASES, **_COMPOSITE_ALIASES}
+    sources: list[tuple[str, Mapping[str, Any]]] = [("row", row)]
+    metadata = row.get("metadata")
+    if isinstance(metadata, Mapping):
+        sources.append(("metadata", metadata))
+
+    result: dict[str, tuple[str, ...]] = {}
+    for field, aliases in fields.items():
+        if field == "fill_id":
+            continue
+        entries: list[tuple[str, str]] = []
+        for source_name, source in sources:
+            for alias in aliases:
+                value = source.get(alias)
+                if isinstance(value, (str, int)) and not isinstance(value, bool):
+                    normalized = str(value).strip()
+                    if normalized:
+                        entries.append((f"{source_name}.{alias}", normalized))
+
+        if aliases == _IDENTITY_ALIASES["trade_id"]:
+            open_result = row.get("trade_registry_open_result")
+            if isinstance(open_result, Mapping):
+                nested_trade = open_result.get("trade")
+                nested_values = [
+                    ("row.trade_registry_open_result.trade_id", open_result.get("trade_id")),
+                ]
+                if isinstance(nested_trade, Mapping):
+                    nested_values.append((
+                        "row.trade_registry_open_result.trade.trade_id",
+                        nested_trade.get("trade_id"),
+                    ))
+                for label, value in nested_values:
+                    if isinstance(value, (str, int)) and not isinstance(value, bool):
+                        normalized = str(value).strip()
+                        if normalized:
+                            entries.append((label, normalized))
+
+        conflicting_pairs = set()
+        for index, (left_label, left_value) in enumerate(entries):
+            for right_label, right_value in entries[index + 1:]:
+                left = _canonical_bot_name(left_value) if field == "bot" else left_value
+                right = _canonical_bot_name(right_value) if field == "bot" else right_value
+                if left != right:
+                    pair = tuple(sorted((left_label, right_label)))
+                    conflicting_pairs.add("<>".join(pair))
+        if conflicting_pairs:
+            result[field] = tuple(sorted(conflicting_pairs))
+    return result
+
+
+def _identity_alias_conflict_pair_counts(
+    rows: list[Mapping[str, Any]],
+) -> dict[str, dict[str, int]]:
+    counts = Counter(
+        (field, pair)
+        for row in rows
+        for field, pairs in _identity_alias_conflict_pairs(row).items()
+        for pair in pairs
+    )
+    result: dict[str, dict[str, int]] = {}
+    for (field, pair), count in sorted(counts.items()):
+        result.setdefault(field, {})[pair] = int(count)
+    return result
+
+
 def _mode_status(registry_row: Mapping[str, Any], source_row: Mapping[str, Any]) -> str:
     # A generic ``mode`` can describe a bot/scanner/registry mode rather than
     # the mode in which a factual position was executed. Only the explicit
@@ -759,6 +826,20 @@ def preview_paper_registry_sources(
             "registry_open": registry_open_alias_conflicts,
             "registry_closed": registry_closed_alias_conflicts,
             "source_by_bot": source_alias_conflicts_by_bot,
+        },
+        "identity_alias_conflict_pair_counts": {
+            "registry_open": _identity_alias_conflict_pair_counts(
+                [row for _, _, row in registry]
+            ),
+            "registry_closed": _identity_alias_conflict_pair_counts(
+                [row for _, _, row in closed_registry]
+            ),
+            "source_by_bot": {
+                bot: _identity_alias_conflict_pair_counts(
+                    [row for _, source_bot, _, row in sources if source_bot == bot]
+                )
+                for bot in _EXPECTED_SOURCE_BOTS
+            },
         },
         "source_reconciliation_counts": source_reconciliation_counts,
         "source_snapshot_complete": source_complete,

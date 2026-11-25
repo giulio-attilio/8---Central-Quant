@@ -109,6 +109,12 @@ def test_capture_emits_fixed_alias_conflict_field_counts_without_values(tmp_path
     assert report["identity_alias_conflict_field_counts"]["source_by_bot"]["TURTLE"] == {
         "symbol": 1,
     }
+    assert report["identity_alias_conflict_pair_counts"]["registry_open"]["lifecycle_id"] == {
+        "row.execution_id<>row.lifecycle_id": 1,
+    }
+    assert report["identity_alias_conflict_pair_counts"]["source_by_bot"]["TURTLE"]["symbol"] == {
+        "row.symbol<>row.ticker": 1,
+    }
     for value in ("private-conflicting-id", "private-symbol-a", "private-symbol-b"):
         assert value not in encoded
     assert report["all_rows_ineligible_for_import"] is True

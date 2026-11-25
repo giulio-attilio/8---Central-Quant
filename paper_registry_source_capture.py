@@ -278,6 +278,9 @@ def capture_paper_registry_sources(
         "identity_alias_conflict_field_counts": preview[
             "identity_alias_conflict_field_counts"
         ],
+        "identity_alias_conflict_pair_counts": preview[
+            "identity_alias_conflict_pair_counts"
+        ],
         "registry_status_counts": preview["registry_status_counts"],
         "registry_closed_status_counts": preview["registry_closed_status_counts"],
         "registry_mode_claim_counts": preview["registry_mode_claim_counts"],

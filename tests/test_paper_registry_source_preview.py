@@ -747,7 +747,18 @@ def test_alias_conflict_diagnostics_report_only_fixed_field_group_counts():
     assert diagnostics["registry_open"] == {"lifecycle_id": 1}
     assert diagnostics["registry_closed"] == {"symbol": 1}
     assert diagnostics["source_by_bot"]["TURTLE"] == {"symbol": 1}
+    pairs = report["identity_alias_conflict_pair_counts"]
+    assert pairs["registry_open"]["lifecycle_id"] == {
+        "row.execution_id<>row.lifecycle_id": 1,
+    }
+    assert pairs["registry_closed"]["symbol"] == {
+        "row.symbol<>row.ticker": 1,
+    }
+    assert pairs["source_by_bot"]["TURTLE"]["symbol"] == {
+        "row.symbol<>row.ticker": 1,
+    }
     assert all(value not in encoded for value in private_values)
+    assert all(value not in json.dumps(pairs, sort_keys=True) for value in private_values)
     assert "private-position-key" not in encoded
     assert report["all_rows_ineligible_for_import"] is True
 
