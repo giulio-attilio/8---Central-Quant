@@ -5526,6 +5526,23 @@ def _falcon_process_entry_signal(sig, positions):
             "REGISTRY_SYNC_FAILED",
             "FALCON_MEMORY_SYNC_FAILED",
         }
+        safe_persistence_status_categories = {
+            "FALCON_ACCEPTED_SIGNAL_ID_REQUIRED": "ID_MISSING",
+            "FALCON_ACCEPTED_SIGNAL_IDENTITY_COLLISION": (
+                "IDENTITY_COLLISION"
+            ),
+            "FALCON_PERSISTENCE_STATE_INVALID": "STATE_INVALID",
+            "FALCON_REGISTRY_READ_FAILED_RECONCILIATION_REQUIRED": (
+                "REGISTRY_READ"
+            ),
+            "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED": (
+                "SYNC_UNCONFIRMED"
+            ),
+            "PERSISTENCE_RESULT_INVALID": "RESULT_INVALID",
+        }
+        safe_status_category = safe_persistence_status_categories.get(
+            persistence_status, "UNCLASSIFIED"
+        )
         raw_failure_components = (
             persistence.get("failure_components")
             if isinstance(persistence, dict)
@@ -5539,6 +5556,7 @@ def _falcon_process_entry_signal(sig, positions):
             }
         ) if isinstance(raw_failure_components, (list, tuple, set)) else []
         latch_reason = "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED"
+        latch_reason += ":STATUS_" + safe_status_category
         if safe_failure_components:
             latch_reason += ":" + "+".join(safe_failure_components)
             blocked["persistence_failure_components"] = safe_failure_components

@@ -20,13 +20,17 @@ candidato preservam as alterações para revisão; não alteram a instância Liv
   de falha de sincronização estavam falsos. A leitura do operador em 2026-11-25
   confirma novamente a existência da trava, a versão V1, a categoria
   `accepted_signal_reconciliation` e ausência dos dois marcadores classificados.
-  Isso comprova que a trava continua ativa, não a causa original: no código,
-  quando a persistência exige reconciliação sem componentes classificados, o
-  motivo gravado permanece genérico (`FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED`).
-  `registry_sync_failed=False` e `falcon_memory_sync_failed=False` significam
-  somente que esses rótulos não aparecem no motivo; não provam que todos os
-  writers concluíram com sucesso. Não há prova para apagar a trava, criar
-  ledgers vazios ou importar registros.
+  Isso comprova que a trava continua ativa, não a causa original: o SHA Live
+  `3502638` grava um motivo genérico quando não há componentes de writer
+  classificados. Isso também pode ocorrer em retornos seguros distintos, como
+  ID de sinal ausente, colisão de identidade ou marcador persistido inválido —
+  não apenas em falha de Registry/memória. `registry_sync_failed=False` e
+  `falcon_memory_sync_failed=False` significam somente que esses rótulos não
+  aparecem no motivo; não provam que todos os writers concluíram com sucesso.
+  O candidato local agora grava categorias de status de uma lista permitida,
+  sem copiar status arbitrário, ID ou texto de exceção. Essa melhoria não está
+  no Render e não explica retroativamente a trava existente. Não há prova para
+  apagá-la, criar ledgers vazios ou importar registros.
 - Os previews sanitizados de origem/Registry retornaram
   `PREVIEW_COMPLETE_NOT_MIGRATABLE`, sem matches fortes, com candidatos
   ambíguos/órfãos. Nenhuma importação ou escrita foi feita.
@@ -72,8 +76,8 @@ instalou dependências:
 | Broker PAPER disk guard | 47 passed |
 | PAPER source preview/capture | 46 / 21 passed |
 | Bootstrap Gunicorn/WSGI do candidato (inclui drain idempotente e limite temporal) | 24 passed |
-| Trava PAPER Falcon (persistência, corrupção, reinício, bloqueio de entradas) | 7 passed |
-| Reexecução offline de HTTP auth + projeção Falcon, sockets de rede bloqueados | 189 passed |
+| Trava PAPER Falcon (persistência, corrupção, reinício, bloqueio e categorias sanitizadas) | 11 passed |
+| Reexecução offline de HTTP auth + projeção Falcon após a melhoria local, sockets bloqueados | 193 passed |
 
 O parser oficial do Gunicorn carregou a configuração no WSL: bind em `0.0.0.0:10000`,
 um worker `gthread`, 16 threads, sem preload, `graceful_timeout=29` e access

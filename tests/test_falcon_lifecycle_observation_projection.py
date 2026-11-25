@@ -567,7 +567,48 @@ def test_in_memory_pending_persistence_marker_cannot_be_treated_as_synchronized(
     assert result["reconciliation_required"] is True
 
 
-def test_paper_persistence_latch_records_only_allowlisted_failure_components():
+@pytest.mark.parametrize(
+    (
+        "persistence_status",
+        "failure_components",
+        "status_category",
+        "expected_components",
+    ),
+    [
+        (
+            "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED",
+            [
+                "FALCON_MEMORY_SYNC_FAILED",
+                "UNTRUSTED_EXCEPTION_TEXT_WITH_SECRET",
+                "REGISTRY_SYNC_FAILED",
+            ],
+            "SYNC_UNCONFIRMED",
+            ["FALCON_MEMORY_SYNC_FAILED", "REGISTRY_SYNC_FAILED"],
+        ),
+        ("FALCON_ACCEPTED_SIGNAL_ID_REQUIRED", [], "ID_MISSING", []),
+        (
+            "FALCON_ACCEPTED_SIGNAL_IDENTITY_COLLISION",
+            [],
+            "IDENTITY_COLLISION",
+            [],
+        ),
+        (
+            "FALCON_PERSISTENCE_STATE_INVALID",
+            [],
+            "STATE_INVALID",
+            [],
+        ),
+        (
+            "UNTRUSTED_STATUS_WITH_SECRET",
+            [],
+            "UNCLASSIFIED",
+            [],
+        ),
+    ],
+)
+def test_paper_persistence_latch_records_only_allowlisted_failure_components(
+    persistence_status, failure_components, status_category, expected_components
+):
     health = {}
     latch_reasons = []
     process = _function(
@@ -583,12 +624,8 @@ def test_paper_persistence_latch_records_only_allowlisted_failure_components():
             ),
             "falcon_persist_accepted_signal": lambda _sig, _positions: {
                 "ok": False,
-                "status": "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED",
-                "failure_components": [
-                    "FALCON_MEMORY_SYNC_FAILED",
-                    "UNTRUSTED_EXCEPTION_TEXT_WITH_SECRET",
-                    "REGISTRY_SYNC_FAILED",
-                ],
+                "status": persistence_status,
+                "failure_components": failure_components,
                 "reconciliation_required": True,
             },
             "falcon_persist_paper_persistence_latch": lambda reason: (
@@ -614,16 +651,21 @@ def test_paper_persistence_latch_records_only_allowlisted_failure_components():
     )
 
     assert allowed is False
-    assert decision["persistence_failure_components"] == [
-        "FALCON_MEMORY_SYNC_FAILED",
-        "REGISTRY_SYNC_FAILED",
-    ]
-    assert latch_reasons == [
-        "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED:"
-        "FALCON_MEMORY_SYNC_FAILED+REGISTRY_SYNC_FAILED"
-    ]
+    if expected_components:
+        assert decision["persistence_failure_components"] == expected_components
+    else:
+        assert "persistence_failure_components" not in decision
+    expected_reason = (
+        "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED:STATUS_"
+        + status_category
+    )
+    if expected_components:
+        expected_reason += ":" + "+".join(expected_components)
+    assert latch_reasons == [expected_reason]
     assert "PAPER-SECRET-IDENTIFIER" not in latch_reasons[0]
     assert "UNTRUSTED_EXCEPTION_TEXT_WITH_SECRET" not in latch_reasons[0]
+    assert "UNTRUSTED_STATUS_WITH_SECRET" not in latch_reasons[0]
+    assert len(latch_reasons[0]) <= 120
     assert health["falcon_paper_persistence_reconciliation_required"] is True
 
 
