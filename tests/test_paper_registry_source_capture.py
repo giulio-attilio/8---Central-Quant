@@ -87,6 +87,34 @@ def test_capture_uses_one_mget_and_returns_only_sanitized_review_counts(tmp_path
     assert registry.read_bytes() == before
 
 
+def test_capture_emits_fixed_alias_conflict_field_counts_without_values(tmp_path):
+    registry = _registry(tmp_path / "trade_registry.json")
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    payload["open_trades"]["logical-open-key"]["execution_id"] = "private-conflicting-id"
+    registry.write_text(json.dumps(payload), encoding="utf-8")
+    redis = FakeRedis(values=_source_values(turtle={
+        "position-a": {
+            "bot": "TURTLE",
+            "symbol": "private-symbol-a",
+            "ticker": "private-symbol-b",
+        },
+    }))
+
+    report = capture_paper_registry_sources(redis_client=redis, registry_path=registry)
+    encoded = json.dumps(report, sort_keys=True)
+
+    assert report["identity_alias_conflict_field_counts"]["registry_open"] == {
+        "lifecycle_id": 1,
+    }
+    assert report["identity_alias_conflict_field_counts"]["source_by_bot"]["TURTLE"] == {
+        "symbol": 1,
+    }
+    for value in ("private-conflicting-id", "private-symbol-a", "private-symbol-b"):
+        assert value not in encoded
+    assert report["all_rows_ineligible_for_import"] is True
+    assert report["writes_performed"] is False
+
+
 def test_capture_omits_arbitrary_source_status_and_mode_values(tmp_path):
     registry = _registry(tmp_path / "trade_registry.json")
     private_status = "private-status-value-must-not-escape"

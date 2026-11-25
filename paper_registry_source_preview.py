@@ -228,18 +228,33 @@ def _missing_review_status(fields: set[str]) -> str:
     return "LOGICAL_ID_NOT_FOUND"
 
 
-def _identity_alias_conflict(row: Mapping[str, Any]) -> bool:
+def _identity_alias_conflict_fields(row: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return fixed identity groups with conflicting aliases, never values."""
     fields = {**_IDENTITY_ALIASES, **_COMPOSITE_ALIASES}
+    conflicts = []
     for field, aliases in fields.items():
         if field == "fill_id":
             continue
         values = _values(row, aliases)
         if field == "bot":
             if len({_canonical_bot_name(value) for value in values}) > 1:
-                return True
+                conflicts.append(field)
         elif len(values) > 1:
-            return True
-    return False
+            conflicts.append(field)
+    return tuple(sorted(conflicts))
+
+
+def _identity_alias_conflict(row: Mapping[str, Any]) -> bool:
+    return bool(_identity_alias_conflict_fields(row))
+
+
+def _identity_alias_conflict_counts(rows: list[Mapping[str, Any]]) -> dict[str, int]:
+    counts = Counter(
+        field
+        for row in rows
+        for field in _identity_alias_conflict_fields(row)
+    )
+    return {field: int(count) for field, count in sorted(counts.items())}
 
 
 def _mode_status(registry_row: Mapping[str, Any], source_row: Mapping[str, Any]) -> str:
@@ -486,6 +501,18 @@ def preview_paper_registry_sources(
     incomplete_bots = sorted(bot for bot, status in source_statuses.items() if status != "OK")
     source_complete = not incomplete_bots
     source_diagnostics = _source_diagnostics(sources, source_statuses)
+    registry_open_alias_conflicts = _identity_alias_conflict_counts(
+        [row for _, _, row in registry]
+    )
+    registry_closed_alias_conflicts = _identity_alias_conflict_counts(
+        [row for _, _, row in closed_registry]
+    )
+    source_alias_conflicts_by_bot = {
+        bot: _identity_alias_conflict_counts(
+            [row for _, source_bot, _, row in sources if source_bot == bot]
+        )
+        for bot in _EXPECTED_SOURCE_BOTS
+    }
 
     source_by_strong: dict[tuple[str, str, str], list[int]] = defaultdict(list)
     registry_by_strong: dict[tuple[str, str, str], list[int]] = defaultdict(list)
@@ -728,6 +755,11 @@ def preview_paper_registry_sources(
         "registry_closed_count": len(closed_registry),
         "source_position_count": len(sources),
         "source_diagnostics": source_diagnostics,
+        "identity_alias_conflict_field_counts": {
+            "registry_open": registry_open_alias_conflicts,
+            "registry_closed": registry_closed_alias_conflicts,
+            "source_by_bot": source_alias_conflicts_by_bot,
+        },
         "source_reconciliation_counts": source_reconciliation_counts,
         "source_snapshot_complete": source_complete,
         "source_incomplete_bots": incomplete_bots,

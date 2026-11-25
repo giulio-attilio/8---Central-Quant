@@ -716,6 +716,42 @@ def test_conflicting_aliases_do_not_produce_a_match():
     assert _row("IDENTITY_ALIAS_CONFLICT", registry, sources)["status"] == "IDENTITY_ALIAS_CONFLICT"
 
 
+def test_alias_conflict_diagnostics_report_only_fixed_field_group_counts():
+    private_values = ("private-open-a", "private-open-b", "private-btc", "private-eth")
+    registry = {
+        "open_trades": [{
+            "bot": "TURTLE",
+            "lifecycle_id": private_values[0],
+            "execution_id": private_values[1],
+        }],
+        "closed_trades": [{
+            "bot": "TURTLE",
+            "symbol": private_values[2],
+            "ticker": private_values[3],
+        }],
+    }
+    sources = _source_snapshot({
+        "TURTLE": {
+            "private-position-key": {
+                "bot": "TURTLE",
+                "symbol": private_values[2],
+                "ticker": private_values[3],
+            },
+        },
+    })
+
+    report = preview_paper_registry_sources(registry, sources)
+    diagnostics = report["identity_alias_conflict_field_counts"]
+    encoded = json.dumps(diagnostics, sort_keys=True)
+
+    assert diagnostics["registry_open"] == {"lifecycle_id": 1}
+    assert diagnostics["registry_closed"] == {"symbol": 1}
+    assert diagnostics["source_by_bot"]["TURTLE"] == {"symbol": 1}
+    assert all(value not in encoded for value in private_values)
+    assert "private-position-key" not in encoded
+    assert report["all_rows_ineligible_for_import"] is True
+
+
 def test_missing_bot_source_snapshot_is_rejected():
     with pytest.raises(ValueError, match="source_positions_by_bot_invalid"):
         preview_paper_registry_sources(_registry({"bot": "TURTLE"}), {})
