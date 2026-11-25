@@ -58,7 +58,7 @@ instalou dependências:
 | Registry V2 PAPER storage | 280 passed, 1 skipped |
 | Broker PAPER disk guard | 47 passed |
 | PAPER source preview/capture | 46 / 21 passed |
-| Bootstrap Gunicorn/WSGI do candidato | 22 passed |
+| Bootstrap Gunicorn/WSGI do candidato (inclui drain idempotente e limite temporal) | 24 passed |
 
 O parser oficial do Gunicorn carregou a configuração no WSL: bind em `0.0.0.0:10000`,
 um worker `gthread`, 16 threads, sem preload, `graceful_timeout=29` e access

@@ -113,6 +113,67 @@ def test_startup_hook_starts_runtime_in_background_and_disables_no_more_gates(mo
     assert central_main.RUNTIME_DRAIN.wait_for_shutdown_work(0.1)
 
 
+def test_shutdown_signal_requests_one_drain_monitor(monkeypatch):
+    config = _load_config()
+
+    class FakeDrain:
+        def __init__(self):
+            self.begin_calls = 0
+
+        def begin_draining(self):
+            self.begin_calls += 1
+
+        def wait_for_shutdown_work(self, timeout):
+            return True
+
+    state = FakeDrain()
+    monkeypatch.setattr(config, "_CENTRAL_MAIN", SimpleNamespace(RUNTIME_DRAIN=state))
+    monkeypatch.setattr(config, "_RUNTIME_START_THREAD", None)
+    monkeypatch.setattr(config, "_SHUTDOWN_REQUESTED_AT", None)
+    monkeypatch.setattr(config, "_DRAIN_MONITOR_THREAD", None)
+    monkeypatch.setattr(config, "_DRAIN_COMPLETE", threading.Event())
+
+    config._request_drain(config._CENTRAL_MAIN)
+    monitor = config._DRAIN_MONITOR_THREAD
+    config._request_drain(config._CENTRAL_MAIN)
+    monitor.join(1)
+
+    assert not monitor.is_alive()
+    assert state.begin_calls == 1
+    assert config._DRAIN_COMPLETE.is_set()
+
+
+def test_worker_exit_wait_is_capped_by_remaining_shared_deadline(monkeypatch):
+    config = _load_config()
+    now = [126.95]
+    requested_at = 100.0
+    waits = []
+
+    class FakeEvent:
+        def is_set(self):
+            return False
+
+        def wait(self, timeout):
+            waits.append(timeout)
+            now[0] += timeout
+            return False
+
+    monkeypatch.setattr(config, "_CENTRAL_MAIN", object())
+    monkeypatch.setattr(config, "_SHUTDOWN_REQUESTED_AT", requested_at)
+    monkeypatch.setattr(config, "_DRAIN_COMPLETE", FakeEvent())
+    monkeypatch.setattr(config, "_DRAIN_WINDOW_SECONDS", 27.0)
+    monkeypatch.setattr(
+        config, "time", SimpleNamespace(monotonic=lambda: now[0])
+    )
+
+    config.worker_exit(None, None)
+
+    deadline = requested_at + config._DRAIN_WINDOW_SECONDS
+    assert waits
+    assert max(waits) <= 0.1
+    assert now[0] == deadline
+
+
 def test_startup_gate_mismatch_fails_closed(monkeypatch):
     config = _load_config()
     central_wsgi = ModuleType("central_wsgi")
