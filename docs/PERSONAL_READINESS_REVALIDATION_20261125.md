@@ -5,7 +5,8 @@
 Revalidação local do checkout isolado `codex/prod-wsgi-20261125`, baseado no
 SHA Live `3502638ea3d364a21078b4d687f1353ec69bdd5e`. O worktree principal não
 foi alterado. Sem credenciais, secrets, payloads brutos, chamadas à corretora,
-escritas no Render/Upstash, ordens, commits, pushes ou deploys.
+escritas no Render/Upstash, ordens, pushes ou deploys. Os commits locais deste
+candidato preservam as alterações para revisão; não alteram a instância Live.
 
 ## Evidência de produção fornecida pelo operador
 
@@ -38,6 +39,10 @@ disco persistente de 4 GB em `/data`, auto-deploy desligado, `healthCheckPath`
 vazio e start command `python main.py`. Branch configurado:
 `codex/personal-readiness-20261103`. Ingress configurado para `0.0.0.0/0`; a
 proteção depende da autenticação da aplicação. Nenhum segredo foi consultado.
+Uma busca somente leitura por `FALCON` nos logs entre 2026-11-16 16:20 e 16:40
+UTC (em torno do `created_at` sanitizado da trava) não retornou linhas. Isso não
+determina a causa histórica; o intervalo não fornece evidência positiva do
+evento original.
 
 ## C3 e Registry
 
@@ -68,6 +73,7 @@ instalou dependências:
 | PAPER source preview/capture | 46 / 21 passed |
 | Bootstrap Gunicorn/WSGI do candidato (inclui drain idempotente e limite temporal) | 24 passed |
 | Trava PAPER Falcon (persistência, corrupção, reinício, bloqueio de entradas) | 7 passed |
+| Reexecução offline de HTTP auth + projeção Falcon, sockets de rede bloqueados | 189 passed |
 
 O parser oficial do Gunicorn carregou a configuração no WSL: bind em `0.0.0.0:10000`,
 um worker `gthread`, 16 threads, sem preload, `graceful_timeout=29` e access
