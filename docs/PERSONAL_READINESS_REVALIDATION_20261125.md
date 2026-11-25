@@ -1,0 +1,83 @@
+# Central Quant/Falcon — revalidação pessoal (2026-11-25)
+
+## Escopo e segurança
+
+Revalidação local do checkout isolado `codex/prod-wsgi-20261125`, baseado no
+SHA Live `3502638ea3d364a21078b4d687f1353ec69bdd5e`. O worktree principal não
+foi alterado. Sem credenciais, secrets, payloads brutos, chamadas à corretora,
+escritas no Render/Upstash, ordens, commits, pushes ou deploys.
+
+## Evidência de produção fornecida pelo operador
+
+- Render Shell: um processo `python`, EUID/EGID 1000 (`render`); chamada sem
+  autenticação a `/livestatus` retornou HTTP 401. Isso verifica apenas essa
+  rota, não toda a superfície HTTP.
+- `paper_integrated_health`: `data_mount_verified=True`, mas
+  `PAPER_STATE_FILES_MISSING`; ledgers/contagens PAPER não disponíveis.
+- Trava `falcon_paper_persistence_reconciliation.json`: presente, JSON/versão
+  válidos, categoria `accepted_signal_reconciliation`; os marcadores consultados
+  de falha de sincronização estavam falsos. Não há prova para apagar a trava,
+  criar ledgers vazios ou importar registros.
+- Os previews sanitizados de origem/Registry retornaram
+  `PREVIEW_COMPLETE_NOT_MIGRATABLE`, sem matches fortes, com candidatos
+  ambíguos/órfãos. Nenhuma importação ou escrita foi feita.
+
+## Revalidação somente leitura do Render
+
+Em 2026-11-25, `central-robos-bingx` (`srv-d8rtuv9o3t8c73ehav5g`) ainda estava
+Live no SHA `3502638ea3d364a21078b4d687f1353ec69bdd5e`; uma instância Standard,
+disco persistente de 4 GB em `/data`, auto-deploy desligado, `healthCheckPath`
+vazio e start command `python main.py`. Branch configurado:
+`codex/personal-readiness-20261103`. Ingress configurado para `0.0.0.0/0`; a
+proteção depende da autenticação da aplicação. Nenhum segredo foi consultado.
+
+## C3 e Registry
+
+Não há evidência concreta para signer/lease distribuído no caminho crítico da
+topologia pessoal de uma instância/processo. “19 writers” representa caminhos
+lógicos estáticos inventariados, não 19 processos/writers ativos ou simultâneos.
+Locks locais e os testes abaixo dão cobertura dentro do processo; escritores
+externos não observados continuam uma limitação. Preservar C3 dormente e
+fail-closed; os antigos contratos de anchors C3 não são evidência de prontidão
+para ativá-lo.
+
+## Validação offline desta rodada
+
+Executada sem rede pelo runner offline e com o ambiente Python preexistente; não
+instalou dependências:
+
+| Seleção | Resultado |
+|---|---:|
+| Ciclo pessoal (entry/fill/stop/disaster stop/close/reconciliação) | 893 passed |
+| Registry writers | 73 passed |
+| Regra estática de lock do Registry | 1 passed, 72 deselected |
+| C3 startup dormente | 24 passed, 3 subtests |
+| HTTP auth | 243 passed |
+| Guard `/data` em POSIX/WSL | 128 passed, 12 subtests |
+| PAPER main storage | 9 passed |
+| Registry V2 PAPER storage | 280 passed, 1 skipped |
+| Broker PAPER disk guard | 47 passed |
+| PAPER source preview/capture | 46 / 21 passed |
+| Bootstrap Gunicorn/WSGI do candidato | 22 passed |
+
+O parser oficial do Gunicorn carregou a configuração no WSL: bind em `0.0.0.0:10000`,
+um worker `gthread`, 16 threads, sem preload, `graceful_timeout=29` e access
+log desativado. `py_compile` e `git diff --check` passaram. Isso não executa a
+aplicação real nem ensaia o encerramento no Render.
+
+## Candidato local e bloqueios
+
+O candidato acrescenta `central_wsgi.py` e `gunicorn.conf.py`, para iniciar o
+runtime fora do import WSGI e limitar a topologia a um worker. A documentação
+oficial do Render recomenda Gunicorn para Flask. Porém, o serviço ainda tem
+`python main.py` no painel e não há `render.yaml`/`Procfile` no checkout; só
+publicar o SHA não troca o comando de inicialização. Seria necessária uma
+alteração manual do start command no Dashboard, seguida de deploy com
+interrupção devido ao disco persistente. O custo de build/uso não foi comprovado
+como zero; portanto nada foi enviado ou implantado.
+
+Prontidão contínua ainda não demonstrada: ledgers PAPER ausentes e reconciliação
+de origem/identidade sem correspondência forte; falta integração real de boot,
+persistência, entrada/fill/posição/stop/fechamento e observação pós-deploy.
+Manter `ENABLE_REAL_TRADING=false`, `BROKER_DRY_RUN=true`, `FALCON_MODE=PAPER`;
+não apagar a trava nem importar dados.
