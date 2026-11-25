@@ -65,7 +65,7 @@ instalou dependências:
 
 | Seleção | Resultado |
 |---|---:|
-| Ciclo pessoal (entry/fill/stop/disaster stop/close/reconciliação) | 893 passed |
+| Ciclo pessoal (entry/fill/stop/disaster stop/close/reconciliação), reexecutado após a melhoria da trava | 892 passed, 1 skipped |
 | Registry writers | 73 passed |
 | Regra estática de lock do Registry | 1 passed, 72 deselected |
 | C3 startup dormente | 24 passed, 3 subtests |
@@ -78,6 +78,12 @@ instalou dependências:
 | Bootstrap Gunicorn/WSGI do candidato (inclui drain idempotente e limite temporal) | 24 passed |
 | Trava PAPER Falcon (persistência, corrupção, reinício, bloqueio e categorias sanitizadas) | 11 passed |
 | Reexecução offline de HTTP auth + projeção Falcon após a melhoria local, sockets bloqueados | 193 passed |
+
+A suíte pessoal completa foi executada pelo runner offline com `ccxt 4.5.90`
+preexistente no workspace (sem instalação), sockets/rede, subprocessos e leitura
+de `.env` bloqueados e diretório de estado isolado em temporário. A primeira
+tentativa com o Python base não coletou três módulos por falta de `ccxt`; ela
+foi repetida com a cópia local existente e concluiu com os resultados acima.
 
 O parser oficial do Gunicorn carregou a configuração no WSL: bind em `0.0.0.0:10000`,
 um worker `gthread`, 16 threads, sem preload, `graceful_timeout=29` e access
