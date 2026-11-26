@@ -29,6 +29,8 @@ from paper_state_storage import (
     open_paper_binary,
     open_paper_text,
     paper_data_mount_verified,
+    paper_file_exists,
+    paper_file_stat,
     resolve_paper_data_dir,
     write_json_atomically,
 )
@@ -386,7 +388,7 @@ def _iter_new_timeline_events(offset, max_events):
     Retorna: events, new_offset, reached_eof
     """
     events = []
-    if not TIMELINE_FILE.exists():
+    if not paper_file_exists(TIMELINE_FILE):
         return events, offset, True
 
     new_offset = offset
@@ -415,6 +417,8 @@ def _iter_new_timeline_events(offset, max_events):
                     continue
 
         return events, new_offset, False
+    except OSError:
+        raise
     except Exception:
         return events, offset, True
 
@@ -443,13 +447,36 @@ def run_executive_policy_learning(context=None, commit=True, max_events=None):
         error = "TIMELINE_CURSOR_INVALID"
     max_events = int(max_events or MAX_EVENTS_PER_RUN)
 
+    def _storage_unavailable_result(source_size_bytes=None):
+        return {
+            "ok": False,
+            "module": "executive_policy_learning",
+            "version": VERSION,
+            "generated_at": _now(),
+            "commit": commit,
+            "timeline_file": str(TIMELINE_FILE),
+            "state_file": str(STATE_FILE),
+            "stats_file": str(STATS_FILE),
+            "events_read": 0,
+            "events_processed": 0,
+            "old_offset": offset,
+            "new_offset": offset,
+            "reached_eof": False,
+            "source_size_bytes": source_size_bytes,
+            "error": "TIMELINE_STORAGE_UNAVAILABLE",
+            "duration_ms": round((time.time() - started) * 1000, 2),
+            "summary": stats.get("summary") or {},
+        }
+
     try:
-        timeline_stat = TIMELINE_FILE.stat()
+        timeline_stat = paper_file_stat(TIMELINE_FILE)
         timeline_size = int(timeline_stat.st_size)
         timeline_identity = _timeline_file_identity_from_stat(timeline_stat)
     except FileNotFoundError:
         timeline_size = None
         timeline_identity = None
+    except OSError:
+        return _storage_unavailable_result()
 
     if error is None:
         if offset < 0:
@@ -518,13 +545,18 @@ def run_executive_policy_learning(context=None, commit=True, max_events=None):
         _append_log(result)
         return result
 
-    events, new_offset, reached_eof = _iter_new_timeline_events(offset, max_events)
+    try:
+        events, new_offset, reached_eof = _iter_new_timeline_events(offset, max_events)
+    except OSError:
+        return _storage_unavailable_result(timeline_size)
 
     try:
-        final_stat = TIMELINE_FILE.stat()
+        final_stat = paper_file_stat(TIMELINE_FILE)
         final_identity = _timeline_file_identity_from_stat(final_stat)
     except FileNotFoundError:
         final_identity = None
+    except OSError:
+        return _storage_unavailable_result(timeline_size)
     if timeline_identity != final_identity:
         error = "TIMELINE_SOURCE_CHANGED_DURING_READ"
         state["last_run_at"] = _now()
@@ -645,7 +677,7 @@ def get_executive_policy_learning_health():
         "TIMELINE_SOURCE_CHANGED_DURING_READ",
     }:
         status = "SOURCE_CHANGED"
-    elif not TIMELINE_FILE.exists():
+    elif not paper_file_exists(TIMELINE_FILE):
         status = "NO_TIMELINE"
     elif _safe_int(summary.get("policy_count")) == 0:
         status = "WAITING_DATA"
@@ -657,7 +689,7 @@ def get_executive_policy_learning_health():
         "version": VERSION,
         "status": status,
         "timeline_file": str(TIMELINE_FILE),
-        "timeline_exists": TIMELINE_FILE.exists(),
+        "timeline_exists": paper_file_exists(TIMELINE_FILE),
         "state_file": str(STATE_FILE),
         "stats_file": str(STATS_FILE),
         "timeline_offset": state.get("timeline_offset"),
@@ -784,7 +816,7 @@ def build_policy_history_report(code, limit=1):
 
 
 def read_executive_policy_learning_log(limit=20):
-    if not LOG_FILE.exists():
+    if not paper_file_exists(LOG_FILE):
         return {"ok": True, "items": [], "log_file": str(LOG_FILE)}
 
     try:
@@ -1056,7 +1088,7 @@ def _extract_trade_fields(decision):
 
 def _read_new_jsonl(path, offset, max_items):
     items = []
-    if not Path(path).exists():
+    if not paper_file_exists(Path(path)):
         return items, offset, True
 
     new_offset = offset
@@ -1085,6 +1117,8 @@ def _read_new_jsonl(path, offset, max_items):
                     continue
 
         return items, new_offset, False
+    except OSError:
+        raise
     except Exception:
         return items, offset, True
 
@@ -1094,7 +1128,7 @@ def _read_all_policy_events_light(limit=5000):
     Lê eventos da timeline de forma limitada para correlacionar com decisões.
     Não é usado em loop pesado; V2.1.8 trabalha com limite.
     """
-    if not TIMELINE_FILE.exists():
+    if not paper_file_exists(TIMELINE_FILE):
         return []
 
     events = []
@@ -1131,6 +1165,8 @@ def _read_all_policy_events_light(limit=5000):
                             })
                 except Exception:
                     continue
+    except OSError:
+        raise
     except Exception:
         return []
 
@@ -1594,9 +1630,9 @@ def get_executive_policy_learning_v2_health():
     summary = effect.get("summary") or {}
 
     status = "OK"
-    if not DECISION_LOG_FILE.exists():
+    if not paper_file_exists(DECISION_LOG_FILE):
         status = "NO_DECISION_LOG"
-    elif not TIMELINE_FILE.exists():
+    elif not paper_file_exists(TIMELINE_FILE):
         status = "NO_TIMELINE"
     elif _safe_int(summary.get("policy_count")) == 0:
         status = "WAITING_MATCHES"
@@ -1608,9 +1644,9 @@ def get_executive_policy_learning_v2_health():
         "version": VERSION,
         "status": status,
         "decision_log_file": str(DECISION_LOG_FILE),
-        "decision_log_exists": DECISION_LOG_FILE.exists(),
+        "decision_log_exists": paper_file_exists(DECISION_LOG_FILE),
         "timeline_file": str(TIMELINE_FILE),
-        "timeline_exists": TIMELINE_FILE.exists(),
+        "timeline_exists": paper_file_exists(TIMELINE_FILE),
         "state_file": str(V2_STATE_FILE),
         "effect_file": str(V2_EFFECT_FILE),
         "decision_log_offset": state.get("decision_log_offset"),
@@ -2154,7 +2190,7 @@ def _read_all_policy_events_light(limit=5000):
     V2.1.8: lê eventos reais da timeline para correlação com Decision Log.
     Seeds técnicos são ignorados para não contaminar readiness real.
     """
-    if not TIMELINE_FILE.exists():
+    if not paper_file_exists(TIMELINE_FILE):
         return []
 
     events = []
@@ -2195,6 +2231,8 @@ def _read_all_policy_events_light(limit=5000):
                         })
                 except Exception:
                     continue
+    except OSError:
+        raise
     except Exception:
         return []
 
@@ -2573,9 +2611,9 @@ def get_executive_policy_learning_v2_health():
     summary = effect.get("summary") or {}
 
     status = "OK"
-    if not DECISION_LOG_FILE.exists():
+    if not paper_file_exists(DECISION_LOG_FILE):
         status = "NO_DECISION_LOG"
-    elif not TIMELINE_FILE.exists():
+    elif not paper_file_exists(TIMELINE_FILE):
         status = "NO_TIMELINE"
     elif _safe_int(summary.get("policy_count")) == 0:
         status = "WAITING_MATCHES"
@@ -2589,9 +2627,9 @@ def get_executive_policy_learning_v2_health():
         "version": VERSION,
         "status": status,
         "decision_log_file": str(DECISION_LOG_FILE),
-        "decision_log_exists": DECISION_LOG_FILE.exists(),
+        "decision_log_exists": paper_file_exists(DECISION_LOG_FILE),
         "timeline_file": str(TIMELINE_FILE),
-        "timeline_exists": TIMELINE_FILE.exists(),
+        "timeline_exists": paper_file_exists(TIMELINE_FILE),
         "state_file": str(V2_STATE_FILE),
         "effect_file": str(V2_EFFECT_FILE),
         "decision_log_offset": state.get("decision_log_offset"),
@@ -2798,10 +2836,12 @@ VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.1.8"
 def _jsonl_line_count(path):
     try:
         path = Path(path)
-        if not path.exists():
+        if not paper_file_exists(path):
             return 0
         with open_paper_text(path, "r", encoding="utf-8") as f:
             return sum(1 for line in f if line.strip())
+    except OSError:
+        raise
     except Exception:
         return 0
 
@@ -2875,8 +2915,16 @@ def _resolve_decision_log_file():
     candidates = _decision_log_candidate_paths()
     scored = []
     for path in candidates:
+        if os.environ.get("RENDER", "").strip().lower() == "true":
+            try:
+                Path(os.path.abspath(os.fspath(path))).relative_to(
+                    Path(os.path.abspath(os.fspath(DATA_DIR)))
+                )
+            except ValueError:
+                # Render must never inspect ephemeral project paths as fallback state.
+                continue
         count = _jsonl_line_count(path)
-        exists = Path(path).exists()
+        exists = paper_file_exists(Path(path))
         scored.append({
             "path": str(path),
             "exists": bool(exists),
@@ -3046,9 +3094,9 @@ def get_executive_policy_learning_v2_health():
     decision_log_path = _resolve_decision_log_file()
 
     status = "OK"
-    if not decision_log_path.exists():
+    if not paper_file_exists(decision_log_path):
         status = "NO_DECISION_LOG"
-    elif not TIMELINE_FILE.exists():
+    elif not paper_file_exists(TIMELINE_FILE):
         status = "NO_TIMELINE"
     elif _safe_int(summary.get("policy_count")) == 0:
         status = "WAITING_MATCHES"
@@ -3063,9 +3111,9 @@ def get_executive_policy_learning_v2_health():
         "status": status,
         "decision_log_file": str(decision_log_path),
         "decision_log_candidates": getattr(_resolve_decision_log_file, "last_candidates", []),
-        "decision_log_exists": decision_log_path.exists(),
+        "decision_log_exists": paper_file_exists(decision_log_path),
         "timeline_file": str(TIMELINE_FILE),
-        "timeline_exists": TIMELINE_FILE.exists(),
+        "timeline_exists": paper_file_exists(TIMELINE_FILE),
         "state_file": str(V2_STATE_FILE),
         "effect_file": str(V2_EFFECT_FILE),
         "decision_log_offset": state.get("decision_log_offset"),

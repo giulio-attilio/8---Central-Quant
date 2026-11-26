@@ -103,6 +103,8 @@ def test_trade_journal_and_learning_modules_route_io_through_shared_storage():
             "resolve_paper_data_dir",
             "ensure_paper_data_dir",
             "paper_data_mount_verified",
+            "paper_file_exists",
+            "paper_file_stat",
             "open_paper_text",
             "write_json_atomically",
         },
@@ -135,6 +137,10 @@ def test_trade_journal_and_learning_modules_route_io_through_shared_storage():
                     and func.attr in {"open", "replace", "remove", "unlink", "makedirs"}
                 ):
                     raise AssertionError(f"unguarded os I/O in {module_name}:{node.lineno}")
+            if module_name == "executive_policy_learning" and isinstance(func, ast.Attribute):
+                assert func.attr not in {"exists", "stat", "lstat", "is_file", "is_dir"}, (
+                    f"unguarded PAPER metadata access in {module_name}:{node.lineno}"
+                )
 
 
 @pytest.mark.parametrize(

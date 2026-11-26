@@ -1,9 +1,11 @@
 import json
 import os
+from pathlib import Path
 
 import pytest
 
 import executive_policy_learning as learning
+import paper_state_storage
 
 
 @pytest.mark.parametrize(
@@ -70,6 +72,140 @@ def test_missing_timeline_at_zero_cursor_remains_waiting_not_error(tmp_path, mon
     assert result["ok"] is True
     assert result["events_processed"] == 0
     assert result["new_offset"] == 0
+
+
+@pytest.mark.parametrize("guard_name", ["paper_file_stat", "paper_file_exists"])
+def test_timeline_storage_guard_failure_does_not_advance_cursor_or_stats(
+    tmp_path, monkeypatch, guard_name
+):
+    timeline = tmp_path / "timeline.jsonl"
+    timeline.write_bytes(b'{"code":"MUST_NOT_PROCESS"}\n')
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps({"timeline_offset": 0, "events_processed": 3}),
+        encoding="utf-8",
+    )
+    state_before = state_path.read_bytes()
+    stats_path = tmp_path / "stats.json"
+    stats_before = json.dumps(
+        {"policies": {"KEEP": {"events": 3}}, "summary": {"policy_count": 1}},
+        sort_keys=True,
+    ).encode("utf-8")
+    stats_path.write_bytes(stats_before)
+    monkeypatch.setattr(learning, "TIMELINE_FILE", timeline)
+    monkeypatch.setattr(learning, "STATE_FILE", state_path)
+    monkeypatch.setattr(learning, "STATS_FILE", stats_path)
+    monkeypatch.setattr(learning, "LOG_FILE", tmp_path / "learning.jsonl")
+
+    def reject(_path):
+        raise OSError("PAPER_SYMLINK_REJECTED")
+
+    monkeypatch.setattr(learning, guard_name, reject)
+
+    result = learning.run_executive_policy_learning(commit=True)
+
+    assert result["ok"] is False
+    assert result["error"] == "TIMELINE_STORAGE_UNAVAILABLE"
+    assert result["old_offset"] == result["new_offset"] == 0
+    assert result["events_processed"] == 0
+    assert stats_path.read_bytes() == stats_before
+    assert state_path.read_bytes() == state_before
+
+
+def test_v2_reader_does_not_convert_guard_error_to_empty_source(
+    tmp_path, monkeypatch
+):
+    def reject(_path):
+        raise OSError("PAPER_SYMLINK_REJECTED")
+
+    monkeypatch.setattr(learning, "paper_file_exists", reject)
+
+    with pytest.raises(OSError, match="PAPER_SYMLINK_REJECTED"):
+        learning._read_new_jsonl(tmp_path / "decision.jsonl", 0, 10)
+
+
+def test_render_decision_log_resolver_skips_ephemeral_project_candidates(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "data"
+    root.mkdir()
+    persistent = root / "decision_log.jsonl"
+    ephemeral = tmp_path / "project" / "data" / "decision_log.jsonl"
+    monkeypatch.setenv("RENDER", "true")
+    monkeypatch.setattr(learning, "DATA_DIR", root)
+    monkeypatch.setattr(
+        learning,
+        "_decision_log_candidate_paths",
+        lambda: [ephemeral, persistent],
+    )
+    checked = []
+    monkeypatch.setattr(
+        learning,
+        "_jsonl_line_count",
+        lambda path: checked.append(Path(path)) or 2,
+    )
+    monkeypatch.setattr(
+        learning,
+        "paper_file_exists",
+        lambda path: checked.append(Path(path)) or True,
+    )
+
+    resolved = learning._resolve_decision_log_file()
+
+    assert resolved == persistent
+    assert checked == [persistent, persistent]
+    assert learning._resolve_decision_log_file.last_candidates == [
+        {"path": str(persistent), "exists": True, "line_count": 2}
+    ]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX dir_fd/O_NOFOLLOW")
+def test_timeline_symlink_escape_is_rejected_before_learning_state_changes(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "data"
+    root.mkdir()
+    outside = tmp_path / "outside.jsonl"
+    outside.write_bytes(b'{"code":"MUST_NOT_PROCESS"}\n')
+    timeline = root / "timeline.jsonl"
+    timeline.symlink_to(outside)
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"timeline_offset": 0}), encoding="utf-8")
+    stats_path = tmp_path / "stats.json"
+    stats_before = json.dumps(
+        {"policies": {"KEEP": {"events": 2}}, "summary": {"policy_count": 1}},
+        sort_keys=True,
+    ).encode("utf-8")
+    stats_path.write_bytes(stats_before)
+
+    monkeypatch.setattr(learning, "TIMELINE_FILE", timeline)
+    monkeypatch.setattr(learning, "STATE_FILE", state_path)
+    monkeypatch.setattr(learning, "STATS_FILE", stats_path)
+    monkeypatch.setattr(learning, "LOG_FILE", tmp_path / "learning.jsonl")
+    monkeypatch.setattr(
+        learning,
+        "paper_file_exists",
+        lambda path: paper_state_storage.paper_file_exists(
+            path, data_root=root, require_mount=False
+        ),
+    )
+    monkeypatch.setattr(
+        learning,
+        "paper_file_stat",
+        lambda path: paper_state_storage.paper_file_stat(
+            path, data_root=root, require_mount=False
+        ),
+    )
+
+    result = learning.run_executive_policy_learning(commit=True)
+
+    assert result["ok"] is False
+    assert result["error"] == "TIMELINE_STORAGE_UNAVAILABLE"
+    assert result["new_offset"] == 0
+    assert result["events_processed"] == 0
+    assert stats_path.read_bytes() == stats_before
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["timeline_offset"] == 0
 
 
 def test_legacy_nonzero_cursor_without_source_identity_fails_closed(tmp_path, monkeypatch):
