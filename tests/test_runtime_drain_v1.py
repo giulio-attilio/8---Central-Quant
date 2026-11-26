@@ -308,6 +308,94 @@ def test_live_flow_lease_covers_post_broker_persistence_until_return():
     assert state.wait_for_live_entries(0)
 
 
+def test_live_entry_admission_serializes_snapshot_to_send_across_threads():
+    state = RuntimeDrainState()
+    positions = []
+    first_snapshot_taken = threading.Event()
+    release_first = threading.Event()
+    second_gate_checked = threading.Event()
+    second_waiting_for_admission = threading.Event()
+    results = []
+
+    class ObservedCondition(threading.Condition):
+        def wait(self, timeout=None):
+            if threading.current_thread().name == "second-entry":
+                second_waiting_for_admission.set()
+            return super().wait(timeout)
+
+    state._condition = ObservedCondition()
+
+    def enabled():
+        if threading.current_thread().name == "second-entry":
+            second_gate_checked.set()
+        return True
+
+    @guard_live_flow(
+        state,
+        live_flow_enabled=lambda *_args, **_kwargs: enabled(),
+        blocked_result=lambda _args, _kwargs: {"status": "ENTRY_BLOCKED_RUNTIME_DRAIN"},
+    )
+    def submit(name):
+        # Models the position limit snapshot and the later order-send gap.
+        allowed = len(positions) < 1
+        if allowed:
+            if name == "first":
+                first_snapshot_taken.set()
+                assert release_first.wait(2)
+            positions.append(name)
+        return {"allowed": allowed}
+
+    first = threading.Thread(
+        name="first-entry", target=lambda: results.append(("first", submit("first")))
+    )
+    second = threading.Thread(
+        name="second-entry", target=lambda: results.append(("second", submit("second")))
+    )
+    first.start()
+    assert first_snapshot_taken.wait(1)
+    second.start()
+    assert second_gate_checked.wait(1)
+    assert second_waiting_for_admission.wait(1)
+    release_first.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert sorted(results) == [
+        ("first", {"allowed": True}),
+        ("second", {"allowed": False}),
+    ]
+    assert positions == ["first"]
+    assert state.active_live_entries() == 0
+
+
+def test_nested_live_entry_wrappers_are_reentrant_and_drain_waits_for_outer_flow():
+    state = RuntimeDrainState()
+    observations = []
+
+    @guard_new_live_entries(state, live_send_enabled=lambda: True)
+    def broker_boundary(*_args, **_kwargs):
+        observations.append(state.active_live_entries())
+        state.begin_draining()
+        return {"sent": True}
+
+    @guard_live_flow(
+        state,
+        live_flow_enabled=lambda *_args, **_kwargs: True,
+        blocked_result=lambda _args, _kwargs: {"status": "ENTRY_BLOCKED_RUNTIME_DRAIN"},
+    )
+    def complete_flow():
+        result = broker_boundary("BTC-USDT", "buy")
+        observations.append(state.active_live_entries())
+        return result
+
+    assert complete_flow() == {"sent": True}
+    assert observations == [2, 1]
+    assert state.active_live_entries() == 0
+    assert state.wait_for_shutdown_work(0)
+
+
 def test_live_flow_guard_leaves_paper_and_reduce_only_flows_unchanged():
     state = RuntimeDrainState()
     state.begin_draining()

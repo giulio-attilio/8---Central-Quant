@@ -14,28 +14,50 @@ import time
 
 
 class RuntimeDrainState:
-    """Atomically stop admission of new live entries and track in-flight ones."""
+    """Serialize live-entry admission and track work for graceful shutdown."""
 
     def __init__(self):
         self._condition = threading.Condition()
         self._draining = False
         self._active_entries = 0
+        self._live_entry_owner = None
+        self._live_entry_depth = 0
         self._active_management_cycles = 0
         self._management_local = threading.local()
 
     def try_enter_live_entry(self) -> bool:
         with self._condition:
+            owner = threading.get_ident()
             if self._draining:
                 return False
+            if self._live_entry_owner == owner:
+                # Nested wrappers on the same synchronous entry flow are
+                # reentrant while the runtime is accepting new entry work.
+                self._live_entry_depth += 1
+                self._active_entries += 1
+                return True
+            while self._live_entry_owner is not None and not self._draining:
+                self._condition.wait()
+            if self._draining:
+                return False
+            self._live_entry_owner = owner
+            self._live_entry_depth = 1
             self._active_entries += 1
             return True
 
     def leave_live_entry(self) -> None:
         with self._condition:
-            if self._active_entries <= 0:
+            owner = threading.get_ident()
+            if (
+                self._active_entries <= 0
+                or self._live_entry_owner != owner
+                or self._live_entry_depth <= 0
+            ):
                 raise RuntimeError("runtime drain entry count underflow")
             self._active_entries -= 1
-            if self._active_entries == 0:
+            self._live_entry_depth -= 1
+            if self._live_entry_depth == 0:
+                self._live_entry_owner = None
                 self._condition.notify_all()
 
     def begin_draining(self) -> bool:
