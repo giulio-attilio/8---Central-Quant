@@ -1,5 +1,57 @@
 # Avaliação da necessidade de C3 distribuído — uso pessoal (2026-11-10)
 
+## Revalidação atual — 2026-11-26 10:03 UTC
+
+Render MCP confirmou somente leitura que `central-robos-bingx` continua com
+uma instância Standard, disco persistente `/data` de 4 GB, branch
+`codex/prod-wsgi-20261125`, Auto-Deploy Off e deploy Live no SHA
+`455c94a56fe616a963a4ef1ce95a057c784071de`. O comando efetivo usa
+`gunicorn.conf.py`; esse arquivo não difere entre o SHA Live e o HEAD local
+`9f6c7913c86fc8698137e17a6c40c7cb26e4d8d4`. A configuração versionada fixa um
+worker `gthread` com 16 threads; portanto há concorrência intraprocesso, mas a
+topologia observada não apresenta segundo worker, instância ou serviço escritor.
+
+O inventário AST local mais recente contou **19 callsites diretos de
+`save_registry`**: 9 em `trade_registry.py` e 10 em `main.py`; as APIs indiretas
+de Registry são cobertas pelo lock local/RLock nos caminhos revisados. Isso
+confirma 19 callsites, não 19 writers ativos simultaneamente nem ausência de
+qualquer writer externo/manual. A suíte `--registry-writers` e o gate de startup
+C3 dormente passaram em fixtures offline. A instalação C3 segue default-off;
+testes de âncoras fixas ainda não sustentam sua ativação.
+
+Há uma corrida independente na admissão de ordens: duas identidades LIVE
+distintas passaram simultaneamente pelo guard sintético com limite de uma
+posição. Isso exige uma autoridade de reserva de capacidade que abranja todos
+os senders antes de qualquer futura admissão LIVE, mas **não** demonstra que um
+signer/lock distribuído C3 seja necessário. LIVE permanece desabilitado; não
+alterar controles nem emitir ordens. A política é manter o C3 preservado e
+dormente até surgir evidência de múltiplas instâncias/processos/serviços
+escritores ou backend compartilhado; este retrato não certifica prontidão de
+trading.
+
+## Atualização de verificação — 2026-11-26 10:12 UTC
+
+Render MCP, somente leitura, confirmou novamente o mesmo deploy Live
+`dep-dc3odps9v7es73cpao00`/SHA `455c94a56fe616a963a4ef1ce95a057c784071de`,
+`autoDeploy=no`, gatilho `off` e `healthCheckPath=/healthz`. A rota HTTP é uma
+probe de saúde; visitá-la não dispara build nem deploy. Nenhum deploy foi
+iniciado nesta verificação.
+
+No HEAD local `9f6c7913c86fc8698137e17a6c40c7cb26e4d8d4`, repeti offline uma
+barreira de duas threads ao redor do snapshot vazio e extraí por AST somente
+`broker_real_pilot_guard_v1_validate`: **2/2** chamadas simultâneas foram
+permitidas com limite sintético de uma posição; não foi carregado exchange nem
+chamado `create_order`. A inspeção do código confirma que o guard consulta
+posições, não ordens abertas; `managed_open_orders_snapshot(symbol)` é limitado
+a um símbolo e não é usado pela admissão. `gunicorn.conf.py` mantém um worker e
+16 threads; o lock encontrado em `broker.py` protege tokens de execução, não a
+admissão até a ordem. A reserva de `clientOrderID` evita reutilizar IDs, mas
+não é uma reserva de capacidade por conta. Portanto, um simples lock em torno
+do snapshot não fecha o ciclo de ordem pendente, ACK/timeout, reinício e
+reconciliação. Não implementei uma trava parcial. A admissão LIVE continua
+bloqueada; C3 distribuído continua dormente porque não há evidência de múltiplos
+workers/instâncias que o justifique.
+
 ## Decisão
 
 As evidências atuais **não justificam ativar nem ampliar o C3 distribuído no
@@ -558,3 +610,61 @@ Não repetir ainda o capture em Live: ele falha em `SOURCE_BOT_KEY_CONFLICT` ant
 - A saída do operador no Render Shell de 2026-11-24 informou um processo `python` com EUID 1000 e 45 threads. É evidência pontual e datada, não monitoramento nem prova de ausência de writers externos em todos os momentos.
 - O inventário local permanece em caminhos lógicos: `trade_registry.py` protege os writers compartilhados por `RLock`; os 11 callsites de `main.py` usam esse lock, enquanto `flock` coordena loops/processos que optam por esses locks. Os contextos C3 continuam default-off e não constituem proteção distribuída ativa.
 - Nenhuma evidência nova de segundo processo, serviço, operador com escrita ou backend Registry compartilhado apareceu nesta revalidação. Portanto, manter C3 preservado e dormente continua proporcional; reavaliar primeiro lock local entre processos se a topologia mudar. Os testes C3 registrados acima são offline e não validam processos externos ou contenção física em produção.
+
+## Evidência posterior do operador — 2026-11-25
+
+- Captura de tela fornecida pelo operador mostra o deploy `11bd1ec` como Live, acionado manualmente, após a configuração do start command para `GUNICORN_CMD_ARGS='' gunicorn -c gunicorn.conf.py central_wsgi:app`. Esta é evidência visual do Dashboard, não uma consulta independente ao Render MCP. Ela substitui, para o estado atual reportado, as referências anteriores a `3502638` e `python main.py`; o disco `/data` continua fora do alcance de rollback de código.
+- Saída fornecida pelo operador no Render Shell reportou `EUID=1000`, um processo Python com `45` threads e controles seguros (`ENABLE_REAL_TRADING=false`, `BROKER_DRY_RUN=true`, `FALCON_MODE=paper`, `CENTRAL_REAL_EXECUTION_ENABLED=false`, `CENTRAL_REAL_PILOT_ENABLED=false`). Na mesma janela, `paper_integrated_health` continuou em `PAPER_STATE_FILES_MISSING`, com contagens `None`. Isso não comprova ausência de ordens na BingX nem prontidão PAPER.
+- Revalidação offline no checkout `11bd1ec855e694e996a59cf90ccc3ca1825906de`, com `ccxt==4.5.88` apenas em diretório temporário e runner que bloqueia rede, subprocessos e `.env`: ciclo de execução pessoal `408 passed`; autenticação HTTP pessoal `243 passed`; guardas PAPER de disco `115 passed, 13 skipped, 1 deselected, 12 subtests`; writers do Registry `73 passed`; lock audit `1 passed, 72 deselected`; startup C3 dormente `21 passed` e composição root-head `3 passed, 3 subtests`. A seleção combinada do runner C3 encerrou com código `-1` sem resumo; os módulos C3 separados passaram. Isso não valida processos externos ou contenção física em produção.
+- A configuração e os testes continuam sustentando C3 distribuído dormente para a topologia pessoal de uma instância/processo principal; não demonstram exclusividade de writers fora do serviço nem justificam ativação. O ledger PAPER ausente e o latch de reconciliação de sinal aceito permanecem bloqueios independentes. Não importar nem limpar registros sem identidade/proveniência comprovada; nenhuma alteração em `/data`, configuração do serviço, Upstash ou BingX foi feita nesta rodada.
+- Inspeção somente leitura do commit Live histórico reportado `9436167fe1944da0017252630cb5ac2cbd3eb9aa` confirma que `falcon_persist_paper_persistence_latch` já gravava apenas o motivo genérico `FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED`; o chamador não persistia o status detalhado da falha de Registry/memória. Portanto, o `created_at` reportado como `16/11/2026 13:30` é compatível com código que já existia no deploy de 15/11, mas o latch sozinho não identifica a causa concreta. Não o limpar nem reconstruir ledgers com base nessa inferência.
+- Render MCP, leitura atual de 2026-11-25: o serviço `central-robos-bingx` está `live` no commit `11bd1ec855e694e996a59cf90ccc3ca1825906de`, exatamente o HEAD local validado; branch `codex/prod-wsgi-20261125`, auto-deploy off, uma instância Standard, disco persistente de 4 GB em `/data` e start command `GUNICORN_CMD_ARGS='' gunicorn -c gunicorn.conf.py central_wsgi:app`. O `healthCheckPath` segue vazio e a allowlist pública é `0.0.0.0/0`; portanto, o deploy/metadata não provam a autenticação em runtime. Não fiz GET externo, leitura de logs de aplicação, alteração nem deploy nesta rodada. O operador informou que não há posições abertas; ordens não foram revalidadas por esta consulta.
+- Após essa release, o operador executou no Render Shell um GET sem credenciais a `127.0.0.1:${PORT:-10000}/livestatus`; o processo atual retornou HTTP `401`. Isso confirma a barreira anônima nessa rota local, sem validar login válido, CORS/origem externa ou todas as rotas individualmente; os hooks globais e 243 testes offline complementam, mas não substituem, essa evidência.
+- Reauditoria local do inventário C3 confirmou 19 superfícies lógicas, conforme as funções atualmente existentes no contrato e nos módulos: 8 em `trade_registry.py` e 11 em `main.py`. Bots convergem para esses writers centrais; não são 19 processos nem 19 chamadas `save_registry`. No HEAD `11bd1ec...`, `python -I tests/run_falcon_pilot_minimal_offline.py --registry-writers` passou 73 testes em 363,74 s e `--registry-lock-audit` passou 1 teste (72 fora do filtro) em 158,15 s. O runner bloqueou sockets/rede, subprocessos e leitura de `.env`; isso valida código local sob fixtures, não coordenação de writers externos em produção. Mantém-se a conclusão: C3 distribuído permanece dormente sem evidência concreta de segundo escritor/processo; `RLock` é process-local e a prova depende da topologia atual de uma instância/worker.
+- Reauditoria de perímetro HTTP: `central_wsgi.py` expõe somente `main.app`; não registra blueprints das apps Flask em `bots/`. Os `app.run()` dos sete bots aparecem sob seus guardas `if __name__ == "__main__"`, portanto não iniciam ouvintes quando os módulos são importados pelo runtime central. Os três hooks `app.before_request` de `main.py` protegem autenticação, intenção mutável por GET e readiness de runtime para as rotas dessa app; `/healthz` é a exceção de liveness sem query, mas o Render está sem `healthCheckPath`. O operador confirmou `401` anônimo em `/livestatus` no processo atual. A seleção `--personal-http-auth` repetida no HEAD `11bd1ec...` passou `243` testes em `232,31 s`, com o runner bloqueando rede, subprocessos e `.env`. Não testei login válido nem uma requisição autenticada em produção.
+- Revisão do estado PAPER: `paper_integrated_health()` não inicializa estado ausente; com o mount verificado e um ou ambos os ledgers ausentes, retorna `PAPER_STATE_FILES_MISSING` e contagens `None`. A suíte contém testes separados para arquivo ausente versus `[]`/`{}` e para bloquear execução sem inicializar/logar estado. Os arquivos vazios criados em fixtures são apenas estado sintético de teste; não são procedimento operacional para `/data`. Enquanto a captura de origem atual e a reconciliação não autorizarem um novo ledger sem perder estado de posições, o executor deve permanecer fail-closed.
+- A seleção offline do capture atual, `python -I tests/run_falcon_pilot_minimal_offline.py --paper-registry-source-capture`, passou `21` testes em `0,47 s`. O CLI solicita explicitamente uma única MGET, aceita token Read-Only via prompt sem eco e declara `writes_performed=false`/`all_rows_ineligible_for_import=true`; esta rodada não consultou Upstash. Uma nova captura continua dependente de autorização de custo atualizada, porque a autorização anterior era para uma única MGET e o uso/banda atuais não foram verificados.
+
+## Reauditoria local de C3 — 2026-11-26 04:13 UTC
+
+Render MCP somente leitura confirmou `central-robos-bingx` com uma instância Standard, branch `codex/prod-wsgi-20261125`, Live no commit `455c94a56fe616a963a4ef1ce95a057c784071de`, start command `GUNICORN_CMD_ARGS='' gunicorn -c gunicorn.conf.py central_wsgi:app` e auto-deploy desligado. A configuração local que esse start command carrega define `workers=1`, `worker_class='gthread'`, `threads=16` e `preload_app=False`; o startup rejeita configuração com workers diferentes de 1. Em `main.py`, o binding C3 de manutenção permanece `None` por padrão e o coordenador de writers é construído com `enabled=False`. Isso é evidência para uma topologia central de um processo/worker com concorrência entre threads; não enumera Shells, processos externos ou outros serviços que possam escrever.
+
+No HEAD local `11558273449a8d1c5beae67b106f69c6475d9f04`, as seleções já registradas `--registry-writers` (73 testes), `--registry-lock-audit` (1 teste; 72 fora do filtro) e `--c3-dormant-startup` (24 testes e 3 subtestes) passaram offline. Reexecutei `tests/test_c3_main_writer_source_anchors_offline.py` sob Python isolado, sockets/HTTP bloqueados, leitura de `.env` negada e estado em diretório temporário: **3 falharam**. A comparação AST-only confirma 19/19 spans de função divergentes e `coordinator_scope_verified=False` em 11/11 writers de `main.py`, porque o contrato tenta localizar os blocos por linhas antigas; o teste de controle negativo que esperava `COORDINATOR_SCOPE_DRIFT_DENIED` também para antes com `FUNCTION_LINE_SHIFT_DENIED`. Isso não comprova por si só que os writers ativos escapem ao lock local, mas deixa a prova de âncoras C3 inválida neste HEAD e impede qualquer promoção/preflight de ativação baseado nela. Não atualizei âncoras nem alterei o caminho C3.
+
+Decisão mantida: não há evidência concreta de um segundo processo/worker, instância, serviço ou conta escrevendo o mesmo Registry; os 19 writers são superfícies de código, não processos concorrentes. O `RLock` local continua necessário para threads e C3 distribuído permanece preservado e dormente. Se surgir evidência de writer externo, reabrir a avaliação; antes de qualquer ativação será necessário corrigir a divergência do contrato de âncoras e concluir todos os gates de backup, autoridade, contenção, interlocks e preflight. Nenhum acesso a `/data`, Upstash, secrets ou BingX ocorreu nesta reauditoria.
+
+### Complemento: AST sem âncoras numéricas fixas
+
+Como a suíte de âncoras falhou devido a spans obsoletos, fiz uma checagem AST somente leitura que localiza os contextos por estrutura e ID, sem executar `main.py`: os 11/11 writers previstos em `main.py` contêm exatamente um bloco com o contexto C3 correspondente seguido do `registry_lock`. `_trpsf_v1_registry_lock()` retorna o mesmo objeto `central_trade_registry._lock`, definido como `threading.RLock()` em `trade_registry.py`. Nos writers simples, as chamadas `save_registry` ficam dentro desse bloco. Restore e bootstrap fazem a escrita em uma chamada recursiva `_lock_held=True`; a chamada recursiva é feita pelo próprio writer enquanto o bloco externo C3 + `registry_lock` ainda está ativo. As demais reentradas `_lock_held=True` encontradas em `main.py` (`registry_persistence_v1_snapshot` e `_trpsf_v1_patched_save_registry`) também são autochamadas sob o `registry_lock`; não encontrei outro callsite desse marcador nesse arquivo.
+
+O mesmo inventário encontrou quatro funções de orquestração fora das 11 funções canônicas — `trade_registry_sync_v1_register_candidate`, `sync_trade_registry_from_open_positions`, `trade_registry_reset_route` e `_fcor_v1_build_payload` — que chamam, respectivamente, as APIs `register_open_trade`, `reset_trade_registry` ou `close_trade`; são callsites adicionais, não gravações diretas em arquivo. Essas APIs pertencem à camada `trade_registry.py`, cuja suíte `--registry-writers` cobre o lock local. A checagem AST não é análise formal de alias/reflection nem inventário de processos externos. Com a instância única/um worker observados e os caminhos locais cobertos, ainda não há necessidade demonstrada de signer ou lock distribuído; os anchors fixos permanecem uma falha real de teste/preflight, não motivo para habilitar C3.
+
+## Reauditoria do caminho de admissão de ordens — 2026-11-26 05:53 UTC
+
+Checkout inspecionado: branch `codex/prod-wsgi-20261125`, HEAD `11558273449a8d1c5beae67b106f69c6475d9f04`, dois commits locais à frente de `origin` e duas alterações locais preexistentes em relatórios; não alterei código, branch, remoto ou serviço. `gunicorn.conf.py` configura um worker `gthread` com 16 threads e rejeita `workers != 1`; `main.py` e `bots/falcon.py` iniciam threads de runtime. Isso demonstra concorrência possível dentro do processo, não a existência de um segundo writer/worker distribuído.
+
+No fluxo Falcon, `bots/falcon.py:central_can_open_trade` consulta `/can_open_trade`; o Risk Manager em `main.py:can_open_trade_decision` sincroniza e lê snapshots de exposição, mas não reserva capacidade. O runner Falcon então chama o Execution Engine. `execution_engine.py` persiste a tentativa `clientOrderID` e o estado `ENGINE_BROKER_CALL_PENDING` antes de `broker.place_market_order`, o que protege replay/identidade da mesma tentativa; não reserva um slot de exposição para sinais com identidades diferentes. O teste concorrente existente em `tests/test_execution_engine_predator_account_identity_v1.py` concorre duas chamadas da mesma identidade e espera um único envio; não cobre dois sinais distintos disputando o último slot de risco. O guard final do broker também lê posições abertas, mas não inclui ordens de entrada ainda não preenchidas nem serializa a leitura com o envio.
+
+Existe outro caminho no mesmo código: `bots/predator.py` passa por precheck central/local, reserva identidade da tentativa e chama diretamente `bingx_broker.place_market_order`. Os scanners de Falcon e os demais loops de runtime são threads, então não se pode tratar as verificações como globalmente sequenciais. O teste offline `--can-open-risk` passou **10 testes** (67 deselecionados) e valida o Risk Manager/snapshots, não a atomicidade da admissão até o broker. `--c3-dormant-startup` passou **24 testes e 3 subtestes**, mantendo C3 default-off. Ambos foram executados pelo runner que nega sockets/rede, subprocessos e acesso a `.env` antes de importar pytest.
+
+Conclusão separada: a concorrência de admissão revela um gap de segurança para qualquer futura execução LIVE, mas não prova necessidade de signer ou coordenador C3 distribuído. Sob o modelo configurado de um worker, a alternativa proporcional é uma autoridade de admissão local ao serviço, com serialização compartilhada por todos os senders e reserva durável por conta/capacidade; a reserva precisa considerar posições **e ordens abertas**, e ficar bloqueante diante de resultado de envio desconhecido até reconciliação. Um `RLock` isolado ou o ledger de `clientOrderID` existente não basta. Não implementei a mudança porque faltam especificação/testes para o ciclo reserva → ack/fill/rejeição/timeout → reconciliação/restart e integração de todos os caminhos de envio; uma trava parcial poderia aparentar segurança sem a fornecer. Mantêm-se LIVE desligado, C3 distribuído dormente e a prontidão de ordens bloqueada. A topologia atual do Render e o estado da conta não foram consultados nesta rodada.
+
+## Fechamento da revalidação de âncoras — 2026-11-26 05:58 UTC
+
+No mesmo HEAD, `python -I tests/run_falcon_pilot_minimal_offline.py --trading-mode-defaults` passou **9 testes**; a seleção bloqueia sockets/rede, subprocessos e leitura de `.env`. A tentativa anterior de ajustar o teste de âncoras foi interrompida antes de qualquer edição. Inspeção mostrou que os spans e linhas de aquisição/escrita estão também no contrato canônico e na cadeia de hashes, não só no teste. Alterar apenas o teste mascararia `FUNCTION_LINE_SHIFT_DENIED`; rebaselinar o contrato exigiria rever upstream placement, precondições e recibos. Como C3 distribuído não é necessário para a topologia provada, preservei o contrato/harness sem mudanças. Eles continuam bloqueando qualquer evidência de ativação; o AST independente documentado acima serve apenas para auditar o escopo atual, não para autorizar C3.
+
+## Reprodução adicional da admissão concorrente — 2026-11-26
+
+No HEAD `11558273449a8d1c5beae67b106f69c6475d9f04`, extraí por AST somente `broker_real_pilot_guard_v1_validate` e executei duas chamadas simultâneas com bots/identidades distintos (`FALCON` e `PREDATOR`), limite sintético de uma posição e um snapshot vazio compartilhado. As duas leituras foram concorrentes e ambas retornaram `BROKER_REAL_PILOT_GUARD_ALLOWED` (`allowed_results=2`); a reprodução não chamou `create_order`, não abriu rede e não alterou dados. Isso demonstra que o guard é uma decisão baseada em snapshot, não uma reserva/serialização de capacidade. É uma reprodução offline da função, não uma ordem simulada de ponta a ponta nem evidência de execução em produção.
+
+A seleção existente `--personal-lifecycle-completeness` passou 892 testes e 1 foi ignorado no Python do venv offline preexistente. Ela cobre entrada/fill/stops, cancelamento, fechamento e reconciliação sintética, mas não cobre dois sinais de identidade distinta disputando o último slot nem reserva de ordens abertas/resultado desconhecido como capacidade agregada. O gap segue bloqueante para qualquer uso LIVE; não altera a decisão de manter os controles LIVE desligados. Uma solução segura requer autoridade de admissão de conta que serialize os senders, considere posições e ordens pendentes, mantenha reserva durável e bloqueie resultados desconhecidos até reconciliação após restart. Nenhum código de execução, configuração, Render, `/data`, Upstash ou BingX foi alterado.
+
+## Revalidação de C3 e runtime — 2026-11-26 13:43 UTC
+
+Render MCP, somente leitura, confirmou o serviço `central-robos-bingx` (`srv-d8rtuv9o3t8c73ehav5g`) no workspace Central Quant: uma instância Standard, disco persistente de 4 GB em `/data`, branch `codex/prod-wsgi-20261125`, `autoDeploy=no`, `healthCheckPath=/healthz` e start command `GUNICORN_CMD_ARGS='' gunicorn -c gunicorn.conf.py central_wsgi:app`. O deploy manual `dep-dc42dolg1s2s73d4b8v0` está `live` no SHA `9f6c7913c86fc8698137e17a6c40c7cb26e4d8d4`, igual ao HEAD local. `gunicorn.conf.py` mantém um worker `gthread`; há concorrência intraprocesso entre threads, mas os metadados atuais não mostram segundo worker, instância ou serviço.
+
+Após o deploy, os logs de request registraram 14 GETs de `/healthz`, todos HTTP 200, entre 12:35 e 13:40 UTC; não encontrei logs `error` da aplicação entre 12:33:55 e 13:43:25 UTC. Não houve chamada observada a `/livestatus` nesse intervalo. Isso demonstra liveness HTTP, não autenticação válida, readiness PAPER, ausência de escritores externos, nem estado da BingX ou dos ledgers.
+
+No checkout atual, com rede/subprocessos e leitura de `.env` bloqueados pelo runner offline, passaram `--registry-writers` (**73**), `--registry-lock-audit` (**1**, 72 fora do filtro) e `--c3-dormant-startup` (**24** e 3 subtestes). A decisão permanece: não há evidência concreta atual de segundo escritor/processo que justifique C3 distribuído no caminho crítico. As 19 superfícies lógicas de writer não equivalem a 19 processos. C3 permanece preservado e dormente; os testes validam fixtures locais, não contenção de Shell ou escritores externos em produção. As divergências históricas do contrato de âncoras continuam impedindo qualquer preflight de ativação.
+
+O worktree está sujo em sete arquivos, incluindo este relatório; nada foi commitado, enviado ou publicado nesta verificação. Não li `/data`, Upstash, segredos ou estado de conta. A evidência anterior fornecida pelo operador ainda indicava `PAPER_STATE_FILES_MISSING`, mas o health PAPER não foi reconsultado no Shell após o deploy `9f6c791`. Mantêm-se LIVE desligado e o bloqueio de prontidão.

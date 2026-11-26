@@ -805,6 +805,7 @@ def test_paper_persistence_latch_survives_fresh_runtime_and_fails_closed_on_corr
     def runtime(health):
         namespace = {
             "HEALTH": health,
+            "PAPER_STATE_LOCK": paper_state_storage.PAPER_STATE_LOCK,
             "FALCON_PAPER_PERSISTENCE_LATCH_VERSION": (
                 "FALCON_PAPER_PERSISTENCE_LATCH_V1"
             ),

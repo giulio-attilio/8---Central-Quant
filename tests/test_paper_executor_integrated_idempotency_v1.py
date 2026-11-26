@@ -96,6 +96,40 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertEqual(health["open_positions"], 0)
         self.assertTrue(health["state_files_valid"])
 
+    def test_health_exposes_effective_admission_limit_and_falcon_latch(self):
+        self._initialize_state()
+        latch_file = self.root / "falcon_paper_persistence_reconciliation.json"
+        latch_file.write_text(
+            json.dumps(
+                {
+                    "version": "FALCON_PAPER_PERSISTENCE_LATCH_V1",
+                    "reconciliation_required": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch.dict(
+            paper_executor.os.environ,
+            {"CENTRAL_PAPER_MAX_OPEN_POSITIONS": "4"},
+            clear=False,
+        ), mock.patch.object(
+            paper_executor,
+            "FALCON_PAPER_RECONCILIATION_LATCH_FILE",
+            latch_file,
+        ):
+            health = paper_executor.paper_integrated_health()
+
+        self.assertFalse(health["ok"])
+        self.assertFalse(health["admission_ready"])
+        self.assertEqual(
+            health["admission_status"], "FALCON_PAPER_RECONCILIATION_REQUIRED"
+        )
+        self.assertEqual(health["max_open_positions"], 4)
+        self.assertTrue(health["position_limit_config_valid"])
+        self.assertTrue(health["falcon_reconciliation_required"])
+        self.assertEqual(health["state_files_status"], "PAPER_STATE_FILES_PRESENT")
+
     def test_health_does_not_report_zero_for_corrupt_or_unidentified_state(self):
         self.positions_file.write_text("{invalid", encoding="utf-8")
         self.seen_file.write_text("{}", encoding="utf-8")
@@ -213,6 +247,167 @@ class PaperExecutorIntegratedIdempotencyTest(unittest.TestCase):
         self.assertEqual(position["mode"], "PAPER")
         self.assertFalse(position["exchange_executor_called"])
         self.assertIsNone(position["real_exchange_order_id"])
+
+    def test_integrated_paper_executor_enforces_aggregate_open_position_cap(self):
+        self._initialize_state()
+        with mock.patch.dict(
+            paper_executor.os.environ,
+            {"CENTRAL_PAPER_MAX_OPEN_POSITIONS": "1"},
+            clear=False,
+        ):
+            first = paper_executor.execute_paper_from_engine(
+                {"plan": self._plan("paper-cap-first")}
+            )
+            second = paper_executor.execute_paper_from_engine(
+                {"plan": self._plan("paper-cap-second")}
+            )
+
+        self.assertTrue(first["ok"])
+        self.assertFalse(second["ok"])
+        self.assertEqual(
+            second["payload"]["status"], "PAPER_MAX_OPEN_POSITIONS_REACHED"
+        )
+        self.assertEqual(second["payload"]["open_positions"], 1)
+        self.assertEqual(second["payload"]["max_open_positions"], 1)
+        self.assertEqual(len(self._positions()), 1)
+        self.assertEqual(self._positions()[0]["idempotency_key"], "paper-cap-first")
+        self.assertFalse(second["payload"]["exchange_executor_called"])
+
+    def test_invalid_paper_position_cap_fails_closed_without_state_write(self):
+        self._initialize_state()
+        with mock.patch.dict(
+            paper_executor.os.environ,
+            {"CENTRAL_PAPER_MAX_OPEN_POSITIONS": "-1"},
+            clear=False,
+        ):
+            result = paper_executor.execute_paper_from_engine(
+                {"plan": self._plan("paper-invalid-cap")}
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["payload"]["status"], "PAPER_POSITION_LIMIT_CONFIG_INVALID"
+        )
+        self.assertEqual(self._positions(), [])
+        self.assertEqual(json.loads(self.seen_file.read_text(encoding="utf-8")), {})
+
+    def test_falcon_reconciliation_latch_blocks_integrated_entry(self):
+        self._initialize_state()
+        latch_file = self.root / "falcon_paper_persistence_reconciliation.json"
+        latch_file.write_text(
+            json.dumps(
+                {
+                    "version": "FALCON_PAPER_PERSISTENCE_LATCH_V1",
+                    "reconciliation_required": True,
+                    "reason": "FALCON_ACCEPTED_SIGNAL_RECONCILIATION_REQUIRED",
+                }
+            ),
+            encoding="utf-8",
+        )
+        plan = self._plan("paper-falcon-latched")
+        plan["payload"]["bot"] = "FALCON"
+        original_gate = paper_executor._falcon_paper_reconciliation_gate
+
+        def assert_gate_runs_inside_shared_lock():
+            self.assertTrue(paper_state_storage.PAPER_STATE_LOCK._is_owned())
+            return original_gate()
+
+        with mock.patch.object(
+            paper_executor,
+            "FALCON_PAPER_RECONCILIATION_LATCH_FILE",
+            latch_file,
+        ), mock.patch.object(
+            paper_executor,
+            "_falcon_paper_reconciliation_gate",
+            side_effect=assert_gate_runs_inside_shared_lock,
+        ):
+            result = paper_executor.execute_paper_from_engine({"plan": plan})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["payload"]["status"], "FALCON_PAPER_RECONCILIATION_REQUIRED"
+        )
+        self.assertEqual(self._positions(), [])
+        self.assertEqual(json.loads(self.seen_file.read_text(encoding="utf-8")), {})
+        self.assertFalse(self.log_file.exists())
+
+    def test_falcon_integrated_entry_is_allowed_when_latch_is_absent(self):
+        self._initialize_state()
+        latch_file = self.root / "falcon_paper_persistence_reconciliation.json"
+        plan = self._plan("paper-falcon-no-latch")
+        plan["payload"]["bot"] = "FALCON"
+
+        with mock.patch.object(
+            paper_executor,
+            "FALCON_PAPER_RECONCILIATION_LATCH_FILE",
+            latch_file,
+        ):
+            result = paper_executor.execute_paper_from_engine({"plan": plan})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["payload"]["status"], "PAPER_OPENED")
+        self.assertEqual(len(self._positions()), 1)
+
+    def test_falcon_in_memory_reconciliation_latch_blocks_integrated_entry(self):
+        self._initialize_state()
+        latch_file = self.root / "falcon_paper_persistence_reconciliation.json"
+        plan = self._plan("paper-falcon-in-memory-latch")
+        plan["payload"]["bot"] = "FALCON"
+        falcon_module = mock.Mock()
+        falcon_module.HEALTH = {
+            "falcon_paper_persistence_reconciliation_required": True
+        }
+        runtime_main = mock.Mock()
+        runtime_main.LOADED_BOTS = {"FALCON": falcon_module}
+
+        with mock.patch.object(
+            paper_executor,
+            "FALCON_PAPER_RECONCILIATION_LATCH_FILE",
+            latch_file,
+        ), mock.patch.dict(sys.modules, {"main": runtime_main}):
+            result = paper_executor.execute_paper_from_engine({"plan": plan})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["payload"]["status"],
+            "FALCON_PAPER_RECONCILIATION_REQUIRED_IN_MEMORY",
+        )
+        self.assertEqual(self._positions(), [])
+        self.assertEqual(json.loads(self.seen_file.read_text(encoding="utf-8")), {})
+
+    def test_invalid_falcon_reconciliation_latch_fails_closed(self):
+        self._initialize_state()
+        latch_file = self.root / "falcon_paper_persistence_reconciliation.json"
+        latch_file.write_text("{}", encoding="utf-8")
+        plan = self._plan("paper-falcon-invalid-latch")
+        plan["payload"]["bot"] = "FALCON"
+
+        with mock.patch.object(
+            paper_executor,
+            "FALCON_PAPER_RECONCILIATION_LATCH_FILE",
+            latch_file,
+        ):
+            result = paper_executor.execute_paper_from_engine({"plan": plan})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["payload"]["status"],
+            "FALCON_PAPER_RECONCILIATION_LATCH_INVALID",
+        )
+        self.assertEqual(self._positions(), [])
+        self.assertEqual(json.loads(self.seen_file.read_text(encoding="utf-8")), {})
+
+    def test_missing_zero_or_negative_quantity_is_rejected(self):
+        for value in (None, 0, -1):
+            with self.subTest(requested_qty=value):
+                plan = self._plan(f"paper-invalid-qty-{value}")
+                plan["requested_qty"] = value
+                validation = paper_executor.validate_paper_plan(plan)
+
+                self.assertFalse(validation["ok"])
+                self.assertIn(
+                    "requested_qty ausente ou não positivo", validation["errors"]
+                )
 
     def test_missing_seen_cache_blocks_new_key_but_recovers_existing_key(self):
         position = {

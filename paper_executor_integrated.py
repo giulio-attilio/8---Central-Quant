@@ -16,6 +16,7 @@
 import os
 import json
 import shutil
+import sys
 import time
 import hashlib
 import math
@@ -66,11 +67,91 @@ _ensure_paper_data_dir()
 PAPER_POSITIONS_FILE = DATA_DIR / "paper_integrated_positions.json"
 PAPER_LOG_FILE = DATA_DIR / "paper_integrated_executor_log.jsonl"
 PAPER_SEEN_FILE = DATA_DIR / "paper_integrated_seen.json"
+FALCON_PAPER_RECONCILIATION_LATCH_FILE = (
+    DATA_DIR / "falcon_paper_persistence_reconciliation.json"
+)
+FALCON_PAPER_RECONCILIATION_LATCH_VERSION = (
+    "FALCON_PAPER_PERSISTENCE_LATCH_V1"
+)
 
 PAPER_EXECUTION_ENABLED = os.getenv("CENTRAL_PAPER_EXECUTION_ENABLED", "false").lower() == "true"
 REAL_EXECUTION_ENABLED = os.getenv("CENTRAL_REAL_EXECUTION_ENABLED", "false").lower() == "true"
 PAPER_MIN_FREE_DISK_BYTES = 256 * 1024 * 1024
+PAPER_MAX_OPEN_POSITIONS_DEFAULT = 10
 _PAPER_EXECUTION_LOCK = PAPER_STATE_LOCK
+
+
+def _paper_max_open_positions() -> Optional[int]:
+    """Return the finite PAPER admission cap, or None for invalid configuration.
+
+    The integrated executor is reachable independently of Falcon's legacy
+    scanner.  Reuse its established limit by default, while allowing a single
+    explicit Central override.  Zero is a valid kill setting; negatives and
+    malformed values fail closed.
+    """
+    configured = os.getenv("CENTRAL_PAPER_MAX_OPEN_POSITIONS")
+    if configured is None or not configured.strip():
+        configured = os.getenv(
+            "FALCON_MAX_OPEN_POSITIONS", str(PAPER_MAX_OPEN_POSITIONS_DEFAULT)
+        )
+    try:
+        value = int(configured)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _falcon_paper_reconciliation_gate() -> Dict[str, Any]:
+    """Fail closed for Falcon while its accepted-signal latch needs review."""
+    runtime_main = sys.modules.get("main")
+    loaded_bots = getattr(runtime_main, "LOADED_BOTS", None)
+    falcon_module = (
+        loaded_bots.get("FALCON") if isinstance(loaded_bots, dict) else None
+    )
+    falcon_health = getattr(falcon_module, "HEALTH", None)
+    if (
+        isinstance(falcon_health, dict)
+        and falcon_health.get("falcon_paper_persistence_reconciliation_required")
+        is True
+    ):
+        return {
+            "blocked": True,
+            "status": "FALCON_PAPER_RECONCILIATION_REQUIRED_IN_MEMORY",
+        }
+
+    path = FALCON_PAPER_RECONCILIATION_LATCH_FILE
+    if not _paper_file_access_verified(path):
+        return {"blocked": True, "status": "PAPER_DATA_MOUNT_NOT_VERIFIED"}
+    try:
+        if not paper_file_exists(path):
+            return {"blocked": False, "status": "NO_RECONCILIATION_LATCH"}
+    except Exception as exc:
+        return {
+            "blocked": True,
+            "status": "FALCON_PAPER_RECONCILIATION_LATCH_READ_FAILED",
+            "error_type": type(exc).__name__,
+        }
+
+    try:
+        payload = json.loads(
+            read_paper_text(path, encoding="utf-8", max_bytes=16384)
+        )
+    except Exception as exc:
+        return {
+            "blocked": True,
+            "status": "FALCON_PAPER_RECONCILIATION_LATCH_READ_FAILED",
+            "error_type": type(exc).__name__,
+        }
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != FALCON_PAPER_RECONCILIATION_LATCH_VERSION
+        or payload.get("reconciliation_required") is not True
+    ):
+        return {
+            "blocked": True,
+            "status": "FALCON_PAPER_RECONCILIATION_LATCH_INVALID",
+        }
+    return {"blocked": True, "status": "FALCON_PAPER_RECONCILIATION_REQUIRED"}
 
 
 def _paper_persistence_guard() -> Dict[str, Any]:
@@ -261,7 +342,7 @@ def validate_paper_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     sl = _safe_float(payload.get("sl"))
     tp50 = _safe_float(payload.get("tp50"))
     risk_pct = _safe_float(payload.get("risk_pct"))
-    requested_qty = _safe_float(plan.get("requested_qty"), 0.0)
+    requested_qty = _safe_float(plan.get("requested_qty"))
     capital_allocated = _safe_float(plan.get("capital_allocated"))
 
     if not isinstance(idempotency_key, str) or not idempotency_key:
@@ -280,8 +361,8 @@ def validate_paper_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
         warnings.append("bot ausente")
     if not setup:
         warnings.append("setup ausente")
-    if requested_qty in [None, 0]:
-        warnings.append("requested_qty ausente ou zero")
+    if requested_qty is None or requested_qty <= 0:
+        errors.append("requested_qty ausente ou não positivo")
 
     if side == "LONG" and entry and sl and sl >= entry:
         errors.append("SL de LONG deve ficar abaixo da entrada")
@@ -318,6 +399,7 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
     plan = _extract_plan(engine_payload)
     validation = validate_paper_plan(plan)
     normalized = validation["normalized"]
+    max_open_positions = _paper_max_open_positions()
 
     if not PAPER_EXECUTION_ENABLED:
         result = {
@@ -360,6 +442,20 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
             "idempotency_key": normalized["idempotency_key"],
             "persistence": persistence,
             "errors": ["PAPER_PERSISTENT_DISK_BELOW_MINIMUM_OR_UNAVAILABLE"],
+            "warnings": validation["warnings"],
+            "exchange_executor_called": False,
+            "paper_executor_called": True,
+        }
+        return {"ok": False, "payload": result}
+
+    if max_open_positions is None:
+        result = {
+            "ok": False,
+            "status": "PAPER_POSITION_LIMIT_CONFIG_INVALID",
+            "reason": "limite de posições PAPER inválido; execução bloqueada",
+            "version": VERSION,
+            "generated_at": _now_br(),
+            "errors": ["CENTRAL_PAPER_MAX_OPEN_POSITIONS_INVALID"],
             "warnings": validation["warnings"],
             "exchange_executor_called": False,
             "paper_executor_called": True,
@@ -409,6 +505,26 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     with _PAPER_EXECUTION_LOCK:
+        if str(normalized.get("bot") or "").upper().strip() == "FALCON":
+            reconciliation_gate = _falcon_paper_reconciliation_gate()
+            if reconciliation_gate.get("blocked") is True:
+                result = {
+                    "ok": False,
+                    "status": reconciliation_gate.get("status")
+                    or "FALCON_PAPER_RECONCILIATION_REQUIRED",
+                    "reason": "reconciliação PAPER do Falcon pendente; nova entrada bloqueada",
+                    "version": VERSION,
+                    "generated_at": _now_br(),
+                    "errors": [
+                        reconciliation_gate.get("status")
+                        or "FALCON_PAPER_RECONCILIATION_REQUIRED"
+                    ],
+                    "warnings": validation["warnings"],
+                    "exchange_executor_called": False,
+                    "paper_executor_called": True,
+                }
+                return {"ok": False, "payload": result}
+
         if not (
             _paper_file_access_verified(PAPER_POSITIONS_FILE)
             and _paper_file_access_verified(PAPER_SEEN_FILE)
@@ -513,6 +629,32 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
                 pass
             return {"ok": False, "payload": result}
 
+        open_position_count = sum(
+            1
+            for item in positions
+            if isinstance(item, dict) and item.get("status") == "OPEN"
+        )
+        if open_position_count >= max_open_positions:
+            result = {
+                "ok": False,
+                "status": "PAPER_MAX_OPEN_POSITIONS_REACHED",
+                "reason": "limite agregado de posições PAPER atingido",
+                "version": VERSION,
+                "generated_at": _now_br(),
+                "idempotency_key": idem,
+                "open_positions": open_position_count,
+                "max_open_positions": max_open_positions,
+                "errors": ["PAPER_MAX_OPEN_POSITIONS_REACHED"],
+                "warnings": validation["warnings"],
+                "exchange_executor_called": False,
+                "paper_executor_called": True,
+            }
+            try:
+                _append_jsonl(PAPER_LOG_FILE, {"event": result["status"], "payload": result})
+            except Exception:
+                pass
+            return {"ok": False, "payload": result}
+
         if not seen_file_present:
             result = {
                 "ok": False,
@@ -606,6 +748,9 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def paper_integrated_health() -> Dict[str, Any]:
+    max_open_positions = _paper_max_open_positions()
+    with _PAPER_EXECUTION_LOCK:
+        falcon_reconciliation = _falcon_paper_reconciliation_gate()
     positions_path_verified = _paper_file_access_verified(PAPER_POSITIONS_FILE)
     seen_path_verified = _paper_file_access_verified(PAPER_SEEN_FILE)
     # Presence is informational; content is read only after both path guards pass.
@@ -655,14 +800,42 @@ def paper_integrated_health() -> Dict[str, Any]:
     else:
         total_count = open_count = closed_count = pending_outcome_count = seen_count = None
 
+    admission_ready = bool(
+        not PAPER_EXECUTION_ENABLED
+        or (
+            mount_verified
+            and state_files_valid
+            and max_open_positions is not None
+            and falcon_reconciliation.get("blocked") is not True
+        )
+    )
+    if not PAPER_EXECUTION_ENABLED:
+        admission_status = "PAPER_EXECUTOR_DISABLED"
+    elif not state_files_valid or not mount_verified:
+        admission_status = state_files_status
+    elif max_open_positions is None:
+        admission_status = "PAPER_POSITION_LIMIT_CONFIG_INVALID"
+    elif falcon_reconciliation.get("blocked") is True:
+        admission_status = falcon_reconciliation.get("status")
+    else:
+        admission_status = "PAPER_ADMISSION_READY"
+
     return {
-        "ok": bool(not PAPER_EXECUTION_ENABLED or (mount_verified and state_files_valid)),
+        "ok": admission_ready,
         "module": "paper_executor_integrated",
         "loaded": True,
         "version": VERSION,
         "generated_at": _now_br(),
         "paper_execution_enabled": PAPER_EXECUTION_ENABLED,
         "real_execution_enabled": REAL_EXECUTION_ENABLED,
+        "admission_ready": admission_ready,
+        "admission_status": admission_status,
+        "max_open_positions": max_open_positions,
+        "position_limit_config_valid": max_open_positions is not None,
+        "falcon_reconciliation_required": (
+            falcon_reconciliation.get("blocked") is True
+        ),
+        "falcon_reconciliation_status": falcon_reconciliation.get("status"),
         "state_files_present": state_files_present,
         "state_files_valid": state_files_valid,
         "state_files_status": state_files_status,

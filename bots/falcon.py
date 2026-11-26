@@ -40,6 +40,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from paper_state_storage import (
+    PAPER_STATE_LOCK,
     paper_data_mount_verified,
     read_paper_text,
     write_json_atomically,
@@ -1152,19 +1153,20 @@ def falcon_persist_paper_persistence_latch(reason):
         HEALTH["falcon_paper_persistence_latch_status"] = "DATA_MOUNT_UNVERIFIED_FAIL_CLOSED"
         return {"ok": False, "status": "PAPER_PERSISTENCE_LATCH_MOUNT_UNVERIFIED"}
     try:
-        persisted = write_json_atomically(
-            path,
-            {
-                "version": FALCON_PAPER_PERSISTENCE_LATCH_VERSION,
-                "reconciliation_required": True,
-                "reason": str(reason or "PERSISTENCE_FAILURE")[:120],
-                "created_at": data_hora_sp_str(),
-            },
-        )
-        if persisted is not True:
-            raise OSError("PAPER_PERSISTENCE_LATCH_ATOMIC_WRITE_FAILED")
-        HEALTH["falcon_paper_persistence_reconciliation_required"] = True
-        HEALTH["falcon_paper_persistence_latch_status"] = "PERSISTED"
+        with PAPER_STATE_LOCK:
+            persisted = write_json_atomically(
+                path,
+                {
+                    "version": FALCON_PAPER_PERSISTENCE_LATCH_VERSION,
+                    "reconciliation_required": True,
+                    "reason": str(reason or "PERSISTENCE_FAILURE")[:120],
+                    "created_at": data_hora_sp_str(),
+                },
+            )
+            if persisted is not True:
+                raise OSError("PAPER_PERSISTENCE_LATCH_ATOMIC_WRITE_FAILED")
+            HEALTH["falcon_paper_persistence_reconciliation_required"] = True
+            HEALTH["falcon_paper_persistence_latch_status"] = "PERSISTED"
         return {"ok": True, "status": "PAPER_PERSISTENCE_LATCH_PERSISTED"}
     except Exception as exc:
         HEALTH["falcon_paper_persistence_reconciliation_required"] = True
