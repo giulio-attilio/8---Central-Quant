@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import math
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "main.py"
+BROKER_SOURCE = ROOT / "broker.py"
 
 
 def _load_functions(names: set[str], namespace: dict):
@@ -22,6 +24,31 @@ def _load_functions(names: set[str], namespace: dict):
     ast.fix_missing_locations(module)
     exec(compile(module, str(SOURCE), "exec"), namespace)
     return namespace
+
+
+def _load_broker_risk_counter(raw):
+    class Exchange:
+        def fetch_positions(self, *_args):
+            if isinstance(raw, Exception):
+                raise raw
+            return raw
+
+    namespace = {
+        "exchange": lambda: Exchange(),
+        "normalize_symbol": lambda value: str(value or ""),
+        "math": math,
+    }
+    tree = ast.parse(BROKER_SOURCE.read_text(encoding="utf-8"))
+    names = {"get_positions", "_broker_rpg_v1_open_positions_count"}
+    nodes = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    assert {node.name for node in nodes} == names
+    module = ast.Module(body=nodes, type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, str(BROKER_SOURCE), "exec"), namespace)
+    return namespace["_broker_rpg_v1_open_positions_count"]
 
 
 def _load_broker_positions(*, raw):
@@ -371,3 +398,56 @@ def test_strict_broker_position_read_rejects_malformed_exchange_quantity():
 
     assert positions == []
     assert error == "broker positions quantity invalid"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        {"unexpected": "payload"},
+        ["not-a-position"],
+        [{"symbol": "BTCUSDT"}],
+        [{"symbol": "BTCUSDT", "contracts": "unknown"}],
+        [{"symbol": "BTCUSDT", "contracts": float("nan")}],
+        [{"symbol": "BTCUSDT", "contracts": float("inf")}],
+        [{"symbol": "BTCUSDT", "contracts": True}],
+    ],
+)
+def test_broker_risk_position_count_fails_closed_on_malformed_snapshot(raw):
+    result = _load_broker_risk_counter(raw)()
+
+    assert result["ok"] is False
+    assert result["count"] is None
+    assert result["positions_checked"] is False
+
+
+def test_broker_risk_position_count_accepts_explicit_empty_snapshot_as_flat():
+    result = _load_broker_risk_counter([])()
+
+    assert result["ok"] is True
+    assert result["count"] == 0
+    assert result["positions_checked"] is True
+
+
+def test_broker_risk_position_count_sanitizes_broker_exception_text():
+    result = _load_broker_risk_counter(ValueError("sensitive raw response"))()
+
+    assert result["ok"] is False
+    assert result["count"] is None
+    assert result["error"] == "broker positions response invalid"
+    assert "sensitive raw response" not in repr(result)
+
+
+def test_broker_risk_position_count_counts_nonzero_position_and_ignores_contract_size():
+    count = _load_broker_risk_counter(
+        [
+            {"symbol": "BTCUSDT", "contracts": 0, "contractSize": 5},
+            {"symbol": "ETHUSDT", "info": {"positionAmt": "-2"}},
+        ]
+    )
+
+    result = count()
+
+    assert result["ok"] is True
+    assert result["count"] == 1
+    assert result["positions_checked"] is True

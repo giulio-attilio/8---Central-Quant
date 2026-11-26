@@ -1565,7 +1565,7 @@ def get_balance():
     }
 
 
-def get_positions(symbols=None):
+def get_positions(symbols=None, *, strict=False):
     ex = exchange()
     markets = None
     if symbols:
@@ -1574,6 +1574,12 @@ def get_positions(symbols=None):
         positions = ex.fetch_positions(markets)
     except TypeError:
         positions = ex.fetch_positions()
+    if strict:
+        if not isinstance(positions, (list, tuple)):
+            raise ValueError("broker positions response invalid")
+        if any(not isinstance(position, dict) for position in positions):
+            raise ValueError("broker positions row invalid")
+        return list(positions)
     return positions or []
 
 
@@ -2904,27 +2910,81 @@ def _broker_rpg_v1_norm_side(value):
 
 def _broker_rpg_v1_open_positions_count():
     try:
-        positions = get_positions() or []
+        positions = get_positions(strict=True)
     except Exception as exc:
-        return {"ok": False, "count": None, "error": str(exc), "positions_checked": False}
+        error = (
+            "broker positions response invalid"
+            if isinstance(exc, ValueError)
+            else "broker positions read failed"
+        )
+        return {"ok": False, "count": None, "error": error, "positions_checked": False}
+    if not isinstance(positions, (list, tuple)):
+        return {
+            "ok": False,
+            "count": None,
+            "error": "broker positions response invalid",
+            "positions_checked": False,
+        }
     open_items = []
     for p in positions:
         if not isinstance(p, dict):
-            continue
-        info = p.get("info") if isinstance(p.get("info"), dict) else {}
+            return {
+                "ok": False,
+                "count": None,
+                "error": "broker positions row invalid",
+                "positions_checked": False,
+            }
+        raw_info = p.get("info")
+        if raw_info is not None and not isinstance(raw_info, dict):
+            return {
+                "ok": False,
+                "count": None,
+                "error": "broker positions info invalid",
+                "positions_checked": False,
+            }
+        info = raw_info if isinstance(raw_info, dict) else {}
         candidates = [
-            p.get("contracts"), p.get("contractSize"), p.get("positionAmt"), p.get("notional"), p.get("positionValue"),
-            info.get("positionAmt"), info.get("positionValue"), info.get("availableAmt"), info.get("size"),
+            p.get("contracts"), p.get("amount"), p.get("positionAmt"),
+            p.get("positionAmount"), p.get("positionQty"), p.get("notional"),
+            p.get("positionValue"), info.get("positionAmt"),
+            info.get("positionValue"), info.get("availableAmt"), info.get("size"),
         ]
-        found = False
+        quantities = []
         for value in candidates:
-            try:
-                if value is not None and abs(float(value)) > 0:
-                    found = True
-                    break
-            except Exception:
+            if value is None or (isinstance(value, str) and not value.strip()):
                 continue
-        if found:
+            if isinstance(value, bool):
+                return {
+                    "ok": False,
+                    "count": None,
+                    "error": "broker positions quantity invalid",
+                    "positions_checked": False,
+                }
+            try:
+                quantity = float(value)
+            except Exception:
+                return {
+                    "ok": False,
+                    "count": None,
+                    "error": "broker positions quantity invalid",
+                    "positions_checked": False,
+                }
+            if not math.isfinite(quantity):
+                return {
+                    "ok": False,
+                    "count": None,
+                    "error": "broker positions quantity invalid",
+                    "positions_checked": False,
+                }
+            quantities.append(abs(quantity))
+        if not quantities:
+            return {
+                "ok": False,
+                "count": None,
+                "error": "broker positions quantity missing",
+                "positions_checked": False,
+            }
+        if any(quantity > 0 for quantity in quantities):
             open_items.append({
                 "symbol": p.get("symbol") or info.get("symbol"),
                 "side": p.get("side") or info.get("positionSide"),
