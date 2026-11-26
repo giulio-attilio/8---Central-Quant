@@ -316,6 +316,28 @@ def test_fetch_order_trades_fallback_does_not_verify_fill_window(monkeypatch):
     assert result["attempts"][0]["ok"] is False
 
 
+def test_fetch_order_trades_malformed_ccxt_fallback_is_not_reported_valid(monkeypatch):
+    class FakeExchange:
+        def fetch_my_trades(self, *_args):
+            return {"unexpected": "mapping instead of trade list"}
+
+        def swapV2PrivateGetTradeFillHistory(self, _params):
+            raise RuntimeError("synthetic fill history failure")
+
+    monkeypatch.setattr(broker, "exchange", lambda: FakeExchange())
+    monkeypatch.setattr(broker.time, "time", lambda: 2_000_000_000)
+
+    result = broker.fetch_order_trades(
+        "BTCUSDT", order_id="OPEN-ORDER", since=1_999_999_000
+    )
+
+    assert result["ok"] is False
+    assert result["fallback_ok"] is False
+    assert result["fill_window_read_ok"] is False
+    assert result["all_trades"] == []
+    assert result["attempts"][0]["error"] == "synthetic fill history failure"
+
+
 def test_fetch_order_trades_rejects_success_code_with_malformed_data(monkeypatch):
     class FakeExchange:
         def swapV2PrivateGetTradeFillHistory(self, _params):
