@@ -796,3 +796,7 @@ Revalidei no worktree atual (`codex/prod-wsgi-20261125`, HEAD `9f6c7913c86fc8698
 - `--personal-execution-safety`: **413 passed** em 619,74 s.
 
 Essas suítes cobrem cenários sintéticos de lifecycle, preflight, entrada/fill, stops protetores, posição, fechamento e reconciliação; não enviam ordens, não leem dados de produção e não provam integração ou execução real na BingX. Os resultados são do worktree sujo e não do deploy Live: os sete arquivos modificados permanecem sem commit/push/deploy. Não houve alteração em `/data`, Upstash, configuração, controles de trading ou serviço Render; health PAPER pós-deploy continua dependente de uma leitura sanitizada manual no Shell.
+
+## Preservação local do hardening PAPER — 2026-11-26
+
+Depois das verificações registradas acima, as sete alterações validadas foram preservadas no commit local `5546bc7a4936ac558b30a0e85b56b23abca639ac` na branch `codex/prod-wsgi-20261125`. A branch remota e o Render continuavam em `9f6c7913c86fc8698137e17a6c40c7cb26e4d8d4` na leitura de 2026-11-26; portanto este hardening segue **não publicado**. O commit pode ser revertido sem reescrever histórico (`git revert 5546bc7a4936ac558b30a0e85b56b23abca639ac`). Não houve push, deploy, restart, alteração de `/data`, de credenciais ou de controles LIVE/PAPER nesta etapa. Custo de build/deploy não foi confirmado como zero.
