@@ -21,6 +21,95 @@ OPEN_ORDER_ID = "2078483751332171776"
 CLOSE_ORDER_ID = "XRP-MANUAL-CLOSE-ORDER"
 
 
+def test_fetch_recent_orders_marks_partial_read_incomplete(monkeypatch):
+    class FakeExchange:
+        def fetch_orders(self, *_args):
+            return [{"id": "SYNTHETIC-ORDER"}]
+
+        def fetch_closed_orders(self, *_args):
+            raise RuntimeError("synthetic closed-order read failure")
+
+        def fetch_open_orders(self, *_args):
+            return []
+
+    monkeypatch.setattr(broker, "exchange", lambda: FakeExchange())
+
+    result = broker.fetch_recent_orders("BTCUSDT")
+
+    assert result["ok"] is False
+    assert result["complete"] is False
+    assert result["orders"] == [
+        {"id": "SYNTHETIC-ORDER", "_source_method": "fetch_orders"}
+    ]
+    assert result["successful_methods"] == ["fetch_orders", "fetch_open_orders"]
+    assert [error["method"] for error in result["errors"]] == ["fetch_closed_orders"]
+
+
+def test_fetch_recent_orders_rejects_non_list_reader_payload(monkeypatch):
+    class FakeExchange:
+        def fetch_orders(self, *_args):
+            return {"unexpected": "mapping"}
+
+        def fetch_closed_orders(self, *_args):
+            return []
+
+        def fetch_open_orders(self, *_args):
+            return []
+
+    monkeypatch.setattr(broker, "exchange", lambda: FakeExchange())
+
+    result = broker.fetch_recent_orders("BTCUSDT")
+
+    assert result["ok"] is False
+    assert result["complete"] is False
+    assert result["orders"] == []
+    assert result["errors"][0]["method"] == "fetch_orders"
+
+
+def test_fetch_recent_my_trades_rejects_non_list_payload(monkeypatch):
+    class FakeExchange:
+        def fetch_my_trades(self, *_args):
+            return {"unexpected": "mapping"}
+
+    monkeypatch.setattr(broker, "exchange", lambda: FakeExchange())
+
+    result = broker.fetch_recent_my_trades("BTCUSDT")
+
+    assert result["ok"] is False
+    assert result["complete"] is False
+    assert result["trades"] == []
+    assert "non-list" in result["error"]
+
+
+def test_reconcile_order_does_not_claim_complete_on_partial_order_read(monkeypatch):
+    order = {"id": "SYNTHETIC-ORDER", "symbol": "BTC/USDT:USDT"}
+    monkeypatch.setattr(
+        broker,
+        "fetch_recent_orders",
+        lambda **_kwargs: {
+            "ok": False,
+            "complete": False,
+            "orders": [order],
+            "errors": [{"method": "fetch_open_orders", "error": "synthetic"}],
+            "successful_methods": ["fetch_orders"],
+        },
+    )
+    monkeypatch.setattr(
+        broker,
+        "fetch_recent_my_trades",
+        lambda **_kwargs: {"ok": True, "complete": True, "trades": [], "count": 0},
+    )
+
+    result = broker.reconcile_order_from_bingx(
+        "BTCUSDT", order_id="SYNTHETIC-ORDER"
+    )
+
+    assert result["matched_orders_count"] == 1
+    assert result["ok"] is False
+    assert result["complete"] is False
+    assert result["successful_order_methods"] == ["fetch_orders"]
+
+
 def test_fetch_order_by_client_id_uses_documented_bingx_parameter(monkeypatch):
     def blocked(*_args, **_kwargs):
         raise AssertionError("network access is blocked in this contract test")

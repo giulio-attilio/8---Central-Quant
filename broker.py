@@ -4665,23 +4665,38 @@ def fetch_recent_orders(symbol=None, since=None, limit=100):
     ex = exchange()
     rows = []
     errors = []
+    successful_methods = []
     for method_name in ["fetch_orders", "fetch_closed_orders", "fetch_open_orders"]:
         method = getattr(ex, method_name, None)
         if not callable(method):
+            errors.append({"method": method_name, "error": "reader_unavailable"})
             continue
         try:
             try:
                 data = method(sym, since, limit) if sym else method(None, since, limit)
             except TypeError:
                 data = method(sym) if sym else method()
-            for item in data or []:
+            if not isinstance(data, list):
+                raise TypeError("order reader returned a non-list payload")
+            successful_methods.append(method_name)
+            for item in data:
                 if isinstance(item, dict):
                     item = dict(item)
                     item.setdefault("_source_method", method_name)
                     rows.append(item)
         except Exception as exc:
             errors.append({"method": method_name, "error": str(exc)})
-    return {"ok": True, "version": BINGX_REAL_RECONCILIATION_HELPERS_VERSION, "symbol": sym, "count": len(rows), "orders": rows[-int(limit or 100):], "errors": errors}
+    complete = bool(successful_methods) and not errors
+    return {
+        "ok": complete,
+        "complete": complete,
+        "version": BINGX_REAL_RECONCILIATION_HELPERS_VERSION,
+        "symbol": sym,
+        "count": len(rows),
+        "orders": rows[-int(limit or 100):],
+        "successful_methods": successful_methods,
+        "errors": errors,
+    }
 
 
 def fetch_recent_my_trades(symbol=None, since=None, limit=100):
@@ -4693,9 +4708,25 @@ def fetch_recent_my_trades(symbol=None, since=None, limit=100):
             data = ex.fetch_my_trades(sym, since, limit) if sym else ex.fetch_my_trades(None, since, limit)
         except TypeError:
             data = ex.fetch_my_trades(sym) if sym else ex.fetch_my_trades()
-        return {"ok": True, "version": BINGX_REAL_RECONCILIATION_HELPERS_VERSION, "symbol": sym, "count": len(data or []), "trades": data or []}
+        if not isinstance(data, list):
+            raise TypeError("trade reader returned a non-list payload")
+        return {
+            "ok": True,
+            "complete": True,
+            "version": BINGX_REAL_RECONCILIATION_HELPERS_VERSION,
+            "symbol": sym,
+            "count": len(data),
+            "trades": data,
+        }
     except Exception as exc:
-        return {"ok": False, "version": BINGX_REAL_RECONCILIATION_HELPERS_VERSION, "symbol": sym, "error": str(exc), "trades": []}
+        return {
+            "ok": False,
+            "complete": False,
+            "version": BINGX_REAL_RECONCILIATION_HELPERS_VERSION,
+            "symbol": sym,
+            "error": str(exc),
+            "trades": [],
+        }
 
 
 def reconcile_order_from_bingx(symbol=None, order_id=None, client_order_id=None, since=None, limit=150):
@@ -4716,8 +4747,13 @@ def reconcile_order_from_bingx(symbol=None, order_id=None, client_order_id=None,
 
     matched_orders = [o for o in (orders_payload.get("orders") or []) if match_item(o)]
     matched_trades = [t for t in (trades_payload.get("trades") or []) if match_item(t)]
+    complete = bool(
+        orders_payload.get("complete", orders_payload.get("ok")) is True
+        and trades_payload.get("complete", trades_payload.get("ok")) is True
+    )
     return {
-        "ok": True,
+        "ok": complete,
+        "complete": complete,
         "version": BINGX_REAL_RECONCILIATION_HELPERS_VERSION,
         "symbol": normalize_symbol(symbol) if symbol else None,
         "order_id": order_id,
@@ -4727,6 +4763,7 @@ def reconcile_order_from_bingx(symbol=None, order_id=None, client_order_id=None,
         "matched_orders": matched_orders,
         "matched_trades": matched_trades,
         "orders_errors": orders_payload.get("errors"),
+        "successful_order_methods": orders_payload.get("successful_methods"),
         "trades_error": trades_payload.get("error") if not trades_payload.get("ok") else None,
     }
 
